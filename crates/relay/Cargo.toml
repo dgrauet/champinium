@@ -1,0 +1,15 @@
+[package]
+name = "champinium-relay"
+description = "Relay NAT (circuit relay v2 + DCUtR) SANS ÉTAT. Multipliable trivialement par un tiers."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "champinium-relay"
+path = "src/main.rs"
+
+[dependencies]
+champinium-core.workspace = true

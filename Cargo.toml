@@ -1,0 +1,23 @@
+# Champinium — Cargo workspace (noyau Rust + infra stateless + front Linux/GTK).
+# Les fronts macOS (Swift) et Windows (C#) vivent hors du workspace Cargo
+# (voir apps/macos, apps/windows) et consomment des bindings UniFFI générés.
+[workspace]
+resolver = "2"
+members = [
+    "crates/champinium-core",
+    "crates/champinium-cli",
+    "crates/bootstrap",
+    "crates/relay",
+    "apps/linux",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Champinium contributors"]
+repository = "https://github.com/champinium/champinium"
+
+[workspace.dependencies]
+champinium-core = { path = "crates/champinium-core" }
+uniffi = "0.28"

@@ -1,0 +1,15 @@
+[package]
+name = "champinium-bootstrap"
+description = "Nœud de rendez-vous initial SANS ÉTAT. Multipliable trivialement par un tiers."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "champinium-bootstrap"
+path = "src/main.rs"
+
+[dependencies]
+champinium-core.workspace = true
