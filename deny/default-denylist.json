@@ -1,0 +1,17 @@
+{
+  "$comment": "Denylist Champinium par DÉFAUT, active à l'installation et NON désactivable. Format signé inspiré des denylists IPFS. Chaque nœud peut souscrire à des listes additionnelles (modèle fédéré, modération subjective par nœud). Voir CLAUDE.md > Modération.",
+  "schema": "champinium-denylist/v1",
+  "name": "champinium-default",
+  "description": "Liste de blocage par défaut. Les CIDs et hashes listés ne sont ni acceptés à l'ingestion (checkpoint #1) ni reseedés à la réception (checkpoint #2).",
+  "issuer": {
+    "did": "TODO:did-de-l-editeur",
+    "comment": "Identité Ed25519 (DID/PeerID) de l'émetteur de la liste."
+  },
+  "updated": "2026-06-24T00:00:00Z",
+  "entries": [],
+  "signature": {
+    "alg": "ed25519",
+    "comment": "Signature détachée de l'objet (hors champ signature). VIDE dans ce squelette — la signature et la vérification seront implémentées Phase 2/5.",
+    "value": null
+  }
+}
