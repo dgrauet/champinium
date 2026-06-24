@@ -1,23 +1,31 @@
 // swift-tools-version:5.9
-// Champinium — front macOS natif (SwiftUI). SQUELETTE.
+// Champinium — front macOS natif (SwiftUI). Présentation uniquement.
 //
-// Présentation UNIQUEMENT. Toute la logique vit dans champinium-core (Rust),
-// consommé via les bindings UniFFI générés (XCFramework "ChampiniumCoreFFI" +
-// fichier Swift "ChampiniumCore"), produits par `just gen-swift`.
-// Lecture média cible : AVPlayer / AVFoundation.
+// Consomme le noyau Rust via les bindings UniFFI générés :
+//   - ChampiniumCoreFFI.xcframework : la lib native + le module C (généré par
+//     `just macos-prepare`, gitignoré) ;
+//   - Sources/ChampiniumCore/ChampiniumCore.swift : le wrapper Swift généré
+//     (copié par `just macos-prepare`, gitignoré).
+// Lecture média : AVPlayer / AVFoundation.
 import PackageDescription
 
 let package = Package(
     name: "Champinium",
     platforms: [.macOS(.v13)],
     targets: [
-        // Cible applicative SwiftUI. Quand les bindings seront générés, on ajoutera
-        // ici la dépendance vers le binaryTarget XCFramework + le wrapper Swift :
-        //   .binaryTarget(name: "ChampiniumCoreFFI", path: "../../bindings/swift/ChampiniumCoreFFI.xcframework")
-        //   .target(name: "ChampiniumCore", dependencies: ["ChampiniumCoreFFI"], path: "Generated")
+        .binaryTarget(
+            name: "ChampiniumCoreFFI",
+            path: "Frameworks/ChampiniumCoreFFI.xcframework"
+        ),
+        .target(
+            name: "ChampiniumCore",
+            dependencies: ["ChampiniumCoreFFI"],
+            path: "Sources/ChampiniumCore"
+        ),
         .executableTarget(
             name: "Champinium",
+            dependencies: ["ChampiniumCore"],
             path: "Sources/Champinium"
-        )
+        ),
     ]
 )

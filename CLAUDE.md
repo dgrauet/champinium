@@ -132,9 +132,12 @@ Kademlia (provider records), identify, ping et un protocole request-response
 (`open_node`, `listen`, `connect`, `catalog`, `ingest_file`, `publish_feed`,
 `fetch_hls` — async sauf `peer_id`/`catalog`), record `FfiCatalogEntry`, erreur
 `FfiError`. Bindings Swift **et** C# générés et vérifiés pour toute la surface.
-Reste : UI SwiftUI (catalogue + lecture AVPlayer du HLS reconstruit). Voir
-[`AGENTS.md`](AGENTS.md) pour le tableau du contrat.
+**UI macOS (SwiftUI) ✔ (compile)** : `apps/macos` consomme l'XCFramework + le
+wrapper généré (`just macos-prepare`) ; `ContentView` fait openNode → listen →
+connect → catalogue → `fetchHls` → lecture **AVPlayer**. `swift build` OK
+(compile + link contre le binding réel). Lecture GUI à valider hors headless.
+Voir [`AGENTS.md`](AGENTS.md) pour le tableau du contrat.
 
 Phasing : 0 (spike async FFI ✔ contrat) → **1 (P2P nu CLI ✔)** → **2 (modération ✔,
-feeds/gossipsub/catalogue ✔, ingestion ffmpeg ✔)** → 3 (contrat UniFFI v1 ✔, puis
-UI macOS). Voir le spec.
+feeds/gossipsub/catalogue ✔, ingestion ffmpeg ✔)** → **3 (contrat UniFFI v1 ✔,
+UI macOS compile ✔)**. MVP macOS jouable atteint au niveau build. Voir le spec.
