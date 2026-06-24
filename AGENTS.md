@@ -20,16 +20,31 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
   capacité absente, ils **ouvrent une demande de changement de contrat** (voir
   protocole plus bas) — ils ne contournent pas via du code natif ad hoc.
 
-### Contrat actuel — v0 (`CONTRACT_VERSION = 0`)
+### Contrat actuel — v1 (`CONTRACT_VERSION = 1`)
+
+Fonctions libres (smoke test async, conservées de v0) :
 
 | Fonction (Rust) | Swift | C# | Sémantique |
 |---|---|---|---|
 | `core_version() -> String` | `coreVersion()` | `CoreVersion()` | version du paquet noyau |
 | `contract_version() -> u32` | `contractVersion()` | `ContractVersion()` | version de la surface de contrat |
-| `core_handshake(client: String) -> String` (**async**) | `coreHandshake(_:) async` | `CoreHandshake(...) -> Task<string>` | coup de sonde async de bout en bout (risque #1) |
+| `core_handshake(client) -> String` (**async**) | `coreHandshake(_:) async` | `CoreHandshake(...)` | coup de sonde async (risque #1) |
+| `open_node(data_dir) -> ChampiniumNode` (**async**) | `openNode(_:) async` | `OpenNode(...)` | ouvre/crée un nœud (modération par défaut active) |
 
-C'est un **stub de contrat** destiné à débloquer les agents UI en parallèle. Il
-sera étendu par l'agent NOYAU aux phases 0+ (vraies fonctions async + streams).
+Objet **`ChampiniumNode`** (méthodes) :
+
+| Méthode (Rust) | Type | Sémantique |
+|---|---|---|
+| `peer_id() -> String` | sync | PeerId du nœud |
+| `catalog() -> Vec<FfiCatalogEntry>` | sync | catalogue reconstruit (instantané) |
+| `listen(addr) -> String` | **async** | écoute, renvoie l'adresse liée |
+| `connect(peer) -> ()` | **async** | se connecte à `/…/p2p/<id>` |
+| `ingest_file(path) -> String` | **async** | ffmpeg → HLS, renvoie le CID du manifeste |
+| `publish_feed(cids) -> ()` | **async** | publie un feed signé |
+| `fetch_hls(manifest_cid, out_dir) -> String` | **async** | reconstruit un HLS jouable, renvoie le playlist |
+
+Record `FfiCatalogEntry { issuer, seq, cids }`. Erreur `FfiError` (message aplati).
+Validé : bindings Swift **et** C# générés pour toute cette surface (objet + async).
 
 ## Mapping périmètre d'agent → répertoires du repo
 
