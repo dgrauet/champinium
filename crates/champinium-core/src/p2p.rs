@@ -16,6 +16,7 @@ use crate::content::{cid_for, verify};
 use crate::error::{CoreError, Result as CoreResult};
 use crate::feed::Feed;
 use crate::identity;
+use crate::ingest::{self, HlsManifest, HlsSegment};
 use crate::moderation::Moderation;
 use cid::Cid;
 use futures::StreamExt;
@@ -27,6 +28,7 @@ use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::{HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -236,6 +238,45 @@ impl Node {
         let (tx, rx) = oneshot::channel();
         self.send(Command::PublishFeed { data, tx }).await?;
         rx.await.map_err(|_| CoreError::Shutdown)?
+    }
+
+    /// Ingestion : segmente `input` en HLS via ffmpeg, stocke chaque segment
+    /// (CID, checkpoint modération #1 via `add`) et un manifeste, puis renvoie le
+    /// CID du manifeste (l'identité du « contenu »).
+    pub async fn ingest_file(&self, input: &Path) -> CoreResult<Cid> {
+        let work = tempfile::tempdir().map_err(CoreError::Io)?;
+        let playlist = ingest::run_ffmpeg_hls(input, work.path(), 4).await?;
+        let m3u8 = tokio::fs::read_to_string(&playlist).await?;
+        let (target, segs) = ingest::parse_playlist(&m3u8, work.path())?;
+
+        let mut segments = Vec::with_capacity(segs.len());
+        for (path, duration) in segs {
+            let bytes = tokio::fs::read(&path).await?;
+            let cid = self.add(&bytes).await?; // modération #1 + store + provide
+            segments.push(HlsSegment {
+                cid: cid.to_string(),
+                duration,
+            });
+        }
+        let manifest = HlsManifest::new(target, segments);
+        self.add(manifest.to_json()?.as_bytes()).await
+    }
+
+    /// Reconstruit un HLS jouable depuis un manifeste : récupère le manifeste et
+    /// tous ses segments (checkpoint #2 via `get`), les écrit dans `out_dir` et
+    /// génère un `index.m3u8`. Renvoie le chemin du playlist.
+    pub async fn fetch_hls(&self, manifest_cid: Cid, out_dir: &Path) -> CoreResult<PathBuf> {
+        let bytes = self.get(manifest_cid).await?;
+        let manifest = HlsManifest::from_json(&bytes)?;
+        tokio::fs::create_dir_all(out_dir).await?;
+        for seg in &manifest.segments {
+            let cid: Cid = seg.cid.parse().map_err(CoreError::Cid)?;
+            let data = self.get(cid).await?;
+            tokio::fs::write(out_dir.join(format!("{}.ts", seg.cid)), &data).await?;
+        }
+        let playlist = out_dir.join("index.m3u8");
+        tokio::fs::write(&playlist, manifest.to_m3u8()).await?;
+        Ok(playlist)
     }
 
     /// Instantané des entrées du catalogue reconstruit (un feed par émetteur).

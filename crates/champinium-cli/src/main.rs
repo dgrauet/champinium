@@ -73,6 +73,22 @@ enum Cmd {
         #[arg(long, default_value = "6")]
         wait: u64,
     },
+    /// Ingère un média (ffmpeg → HLS), publie son manifeste et reste en ligne.
+    Ingest {
+        path: PathBuf,
+        #[arg(long, default_value = "/ip4/0.0.0.0/tcp/0")]
+        listen: String,
+    },
+    /// Reconstruit un HLS jouable depuis un manifeste, récupéré depuis un pair.
+    FetchHls {
+        /// CID du manifeste HLS.
+        manifest: String,
+        #[arg(long)]
+        peer: String,
+        /// Répertoire de sortie (recevra index.m3u8 + segments).
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -101,7 +117,7 @@ async fn main() -> Result<()> {
             if !all.is_empty() {
                 node.publish_feed(&all).await?;
             }
-            spawn_feed_republisher(node.clone());
+            spawn_feed_republisher(node.clone(), all);
             print_identity(&node, &addr);
             println!("nœud en ligne — Ctrl-C pour arrêter.");
             tokio::signal::ctrl_c().await?;
@@ -120,7 +136,7 @@ async fn main() -> Result<()> {
             // périodiquement pour les pairs qui se connectent plus tard.
             let all = node.blockstore().list()?;
             node.publish_feed(&all).await?;
-            spawn_feed_republisher(node.clone());
+            spawn_feed_republisher(node.clone(), all);
             print_identity(&node, &addr);
             println!("contenu publié + feed annoncé — ce nœud le sert. Ctrl-C pour arrêter.");
             tokio::signal::ctrl_c().await?;
@@ -171,20 +187,60 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Cmd::Ingest { path, listen } => {
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let addr = node
+                .listen(listen.parse().context("multiaddr d'écoute invalide")?)
+                .await?;
+            let manifest_cid = node.ingest_file(&path).await?;
+            println!("Manifeste HLS: {manifest_cid}");
+            node.publish_feed(&[manifest_cid]).await?;
+            spawn_feed_republisher(node.clone(), vec![manifest_cid]);
+            print_identity(&node, &addr);
+            println!("média ingéré + feed annoncé — ce nœud le sert. Ctrl-C pour arrêter.");
+            tokio::signal::ctrl_c().await?;
+        }
+        Cmd::FetchHls {
+            manifest,
+            peer,
+            out,
+        } => {
+            let manifest_cid: Cid = manifest.parse().context("CID de manifeste invalide")?;
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            node.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await?;
+            connect_peer(&node, &peer).await?;
+            let playlist = fetch_hls_with_retry(&node, manifest_cid, &out).await?;
+            println!("HLS reconstruit: {}", playlist.display());
+        }
     }
     Ok(())
 }
 
-/// Rediffuse périodiquement le feed du contenu local (pour les pairs tardifs).
-fn spawn_feed_republisher(node: Node) {
+/// Reconstruit un HLS en retentant le temps que le réseau converge.
+async fn fetch_hls_with_retry(node: &Node, manifest: Cid, out: &Path) -> Result<PathBuf> {
+    let deadline = std::time::Duration::from_secs(60);
+    let start = std::time::Instant::now();
+    loop {
+        match node.fetch_hls(manifest, out).await {
+            Ok(p) => return Ok(p),
+            Err(e) if start.elapsed() < deadline => {
+                tracing::debug!("fetch-hls en attente ({e}) — nouvelle tentative");
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Rediffuse périodiquement un feed listant `cids` (pour les pairs tardifs).
+fn spawn_feed_republisher(node: Node, cids: Vec<Cid>) {
+    if cids.is_empty() {
+        return;
+    }
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            if let Ok(cids) = node.blockstore().list() {
-                if !cids.is_empty() {
-                    let _ = node.publish_feed(&cids).await;
-                }
-            }
+            let _ = node.publish_feed(&cids).await;
         }
     });
 }

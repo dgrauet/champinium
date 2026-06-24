@@ -24,6 +24,7 @@ pub mod content;
 pub mod error;
 pub mod feed;
 pub mod identity;
+pub mod ingest;
 pub mod moderation;
 pub mod p2p;
 
@@ -31,6 +32,7 @@ pub use blockstore::Blockstore;
 pub use catalog::{Catalog, CatalogEntry};
 pub use error::{CoreError, Result};
 pub use feed::Feed;
+pub use ingest::HlsManifest;
 pub use moderation::{Denylist, Moderation};
 pub use p2p::Node;
 

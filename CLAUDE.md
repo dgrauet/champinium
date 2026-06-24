@@ -121,12 +121,16 @@ Kademlia (provider records), identify, ping et un protocole request-response
   signé Ed25519, versionné par `seq`), diffusé en **gossipsub** ; `catalog` (CRDT
   maison last-writer-wins par émetteur) reconstruit en écoutant. Node :
   `publish_feed` / `catalog_entries`. CLI : `catalog --peer …`.
-- **Reste** : ingestion ffmpeg → HLS (checkpoint #1 sur le chemin réel), feed
-  records dans la DHT (PUT/GET), IPNS durable (différé).
+- **Ingestion ffmpeg → HLS ✔** : `ingest` orchestre ffmpeg (segments alignés sur
+  keyframes), chaque segment = un bloc CID (checkpoint #1 via `add`), un manifeste
+  `champinium-hls/v1` mappe l'ordre/durée aux CIDs. `Node::ingest_file` →
+  CID du manifeste ; `Node::fetch_hls` reconstruit un `index.m3u8` jouable. CLI :
+  `ingest <fichier>` / `fetch-hls <manifest> --peer … --out …`.
+- **Reste** : feed records dans la DHT (PUT/GET), IPNS durable (différé).
 
 La surface **UniFFI reste en v0** (les fronts ne sont pas concernés par les
 phases 1-2 côté noyau).
 
-Phasing : 0 (spike async FFI ✔ contrat) → **1 (P2P nu CLI ✔)** → 2 (modération ✔,
-feeds/gossipsub/catalogue ✔, puis ingestion ffmpeg) → 3 (MVP jouable macOS).
+Phasing : 0 (spike async FFI ✔ contrat) → **1 (P2P nu CLI ✔)** → **2 (modération ✔,
+feeds/gossipsub/catalogue ✔, ingestion ffmpeg ✔)** → 3 (MVP jouable macOS).
 Voir le spec.

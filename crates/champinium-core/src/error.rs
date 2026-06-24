@@ -29,6 +29,9 @@ pub enum CoreError {
     #[error("denylist: {0}")]
     Moderation(String),
 
+    #[error("ingestion: {0}")]
+    Ingest(String),
+
     #[error("contenu refusé par la modération: {0}")]
     Moderated(String),
 
