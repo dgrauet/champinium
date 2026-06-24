@@ -18,15 +18,33 @@
 
 uniffi::setup_scaffolding!();
 
-/// Version du noyau. Première fonction exposée : sert à valider de bout en bout
-/// la chaîne de génération et de chargement des bindings sur les 3 fronts.
+/// Version de la SURFACE de contrat UniFFI (distincte de la version du paquet).
+/// Tout changement de la surface exportée incrémente cette constante ET est
+/// annoncé dans AGENTS.md (voir « Protocole de changement de contrat »).
+pub const CONTRACT_VERSION: u32 = 0;
+
+/// CONTRAT v0 — version du noyau. Première fonction exposée : valide de bout en
+/// bout la chaîne de génération et de chargement des bindings sur les 3 fronts.
 #[uniffi::export]
 pub fn core_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
-// PHASE 0 (de-risking) viendra ici : une `async fn` et un `Stream<Event>` tokio
-// exposés via UniFFI, à consommer depuis un vrai binaire Swift ET C#.
+/// CONTRAT v0 — surface du contrat exposée aux fronts (pour vérif de compat).
+#[uniffi::export]
+pub fn contract_version() -> u32 {
+    CONTRACT_VERSION
+}
+
+/// CONTRAT v0 — coup de sonde ASYNC. Attend brièvement puis répond, prouvant que
+/// l'async traverse FFI de bout en bout vers Swift ET C# (risque technique #1).
+/// Sert de stub de contrat pour débloquer les agents UI en parallèle ; sera
+/// remplacé par les vraies fonctions async/streams du noyau aux phases 0+.
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn core_handshake(client: String) -> String {
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    format!("champinium-core v{} ↔ {client}", env!("CARGO_PKG_VERSION"))
+}
 
 #[cfg(test)]
 mod tests {
@@ -35,5 +53,12 @@ mod tests {
     #[test]
     fn core_version_matches_package() {
         assert_eq!(core_version(), env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn handshake_echoes_client() {
+        let out = core_handshake("test".to_string()).await;
+        assert!(out.contains("test"));
+        assert!(out.contains("champinium-core"));
     }
 }
