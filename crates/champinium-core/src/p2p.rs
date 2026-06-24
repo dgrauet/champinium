@@ -219,6 +219,16 @@ impl Node {
     }
 }
 
+/// Sépare une multiaddr terminée par `/p2p/<peerid>` en `(PeerId, addr de base)`.
+pub fn split_peer_id(mut addr: Multiaddr) -> CoreResult<(PeerId, Multiaddr)> {
+    match addr.pop() {
+        Some(libp2p::multiaddr::Protocol::P2p(peer)) => Ok((peer, addr)),
+        _ => Err(CoreError::Network(
+            "adresse sans composant /p2p/<peerid>".into(),
+        )),
+    }
+}
+
 fn build_swarm(keypair: Keypair) -> CoreResult<Swarm<Behaviour>> {
     let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
