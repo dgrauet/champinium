@@ -28,6 +28,7 @@ pub mod identity;
 pub mod ingest;
 pub mod moderation;
 pub mod p2p;
+pub mod relay;
 
 pub use blockstore::Blockstore;
 pub use catalog::{Catalog, CatalogEntry};
@@ -36,6 +37,7 @@ pub use feed::Feed;
 pub use ingest::HlsManifest;
 pub use moderation::{Denylist, Moderation};
 pub use p2p::Node;
+pub use relay::{start_relay, RelayHandle};
 
 // Réexports pratiques pour les consommateurs Rust du crate (cli, front Linux).
 pub use cid::Cid;
