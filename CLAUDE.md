@@ -138,15 +138,20 @@ connect → catalogue → `fetchHls` → lecture **AVPlayer**. `swift build` OK
 (compile + link contre le binding réel). Lecture GUI à valider hors headless.
 Voir [`AGENTS.md`](AGENTS.md) pour le tableau du contrat.
 
-**Phase 4 — en cours. Front Linux GTK4 (feature `gui`)** : `apps/linux` consomme
-le crate directement ; UI = ouverture nœud → listen → connect → catalogue →
-lecture **GStreamer** (`playbin`), pont tokio ↔ thread GTK. L'UI est **gatée par
-la feature `gui`** pour garder le build workspace vert sans GTK. Build « stub »
-(sans feature) et workspace : verts ✔. Compilation `--features gui` non vérifiée
-en dev macOS (pas de GTK4/GStreamer) — à compiler sur Linux. Reste Phase 4 :
-fronts Windows, relay NAT, seeding en arrière-plan par OS.
+**Phase 4 — en cours.**
+- **Front Linux GTK4 (feature `gui`)** : `apps/linux` consomme le crate ; UI =
+  ouverture nœud → listen → connect → catalogue → lecture **GStreamer**
+  (`playbin`), pont tokio ↔ thread GTK. Gatée par `gui` pour garder le workspace
+  vert sans GTK. Compilation `--features gui` non vérifiée en dev macOS.
+- **Relay NAT ✔** : circuit relay v2 + DCUtR côté client dans le noyau
+  (`with_relay_client`), serveur de relais stateless `relay::start_relay` (qui
+  déclare son adresse externe via `add_external_address` — sinon les réservations
+  sont acceptées sans adresse). `infra/relay` = binaire réel. **Testé** : un nœud
+  derrière « NAT » écoute via circuit, un autre l'atteint *via le relais* et
+  récupère un bloc (`block_transfer_over_relay_circuit`).
+- **Reste** : front Windows, seeding en arrière-plan par OS, feed records DHT.
 
 Phasing : 0 (spike async FFI ✔ contrat) → **1 (P2P nu CLI ✔)** → **2 (modération ✔,
 feeds/gossipsub/catalogue ✔, ingestion ffmpeg ✔)** → **3 (contrat UniFFI v1 ✔,
-UI macOS compile ✔)** → 4 (front Linux GTK4 ✔ code, Windows/relay/seeding à venir).
+UI macOS compile ✔)** → 4 (Linux GTK4 ✔ code, **relay NAT ✔**, Windows/seeding à venir).
 Voir le spec.

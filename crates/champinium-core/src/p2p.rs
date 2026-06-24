@@ -23,7 +23,7 @@ use futures::StreamExt;
 use libp2p::kad::{self, store::MemoryStore, GetProvidersOk, QueryId, QueryResult, RecordKey};
 use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{gossipsub, identify, identity::Keypair, noise, ping, tcp, yamux};
+use libp2p::{dcutr, gossipsub, identify, identity::Keypair, noise, ping, relay, tcp, yamux};
 use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -53,10 +53,13 @@ struct Behaviour {
     ping: ping::Behaviour,
     blocks: request_response::cbor::Behaviour<BlockRequest, BlockResponse>,
     gossipsub: gossipsub::Behaviour,
+    // NAT traversal : client de circuit relay v2 + hole punching DCUtR.
+    relay_client: relay::client::Behaviour,
+    dcutr: dcutr::Behaviour,
 }
 
 impl Behaviour {
-    fn new(key: &Keypair) -> Self {
+    fn new(key: &Keypair, relay_client: relay::client::Behaviour) -> Self {
         let peer_id = key.public().to_peer_id();
         let kademlia = kad::Behaviour::new(peer_id, MemoryStore::new(peer_id));
         let identify = identify::Behaviour::new(identify::Config::new(
@@ -79,6 +82,8 @@ impl Behaviour {
             ping: ping::Behaviour::default(),
             blocks,
             gossipsub,
+            relay_client,
+            dcutr: dcutr::Behaviour::new(peer_id),
         }
     }
 }
@@ -375,8 +380,10 @@ fn build_swarm(keypair: Keypair) -> CoreResult<Swarm<Behaviour>> {
             yamux::Config::default,
         )
         .map_err(|e| CoreError::Network(e.to_string()))?
-        .with_behaviour(|key| {
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Behaviour::new(key))
+        .with_relay_client(noise::Config::new, yamux::Config::default)
+        .map_err(|e| CoreError::Network(e.to_string()))?
+        .with_behaviour(|key, relay_client| {
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Behaviour::new(key, relay_client))
         })
         .map_err(|e| CoreError::Network(e.to_string()))?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
