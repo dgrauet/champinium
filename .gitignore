@@ -1,5 +1,7 @@
 # Rust
 /target
+# Artefacts de build intermédiaires (ex. en-têtes pour l'XCFramework)
+/build
 **/*.rs.bk
 Cargo.lock.orig
 
@@ -13,6 +15,9 @@ apps/macos/.build/
 apps/macos/.swiftpm/
 apps/macos/DerivedData/
 *.xcuserstate
+# Artefacts générés au build (bindings + framework), jamais commités.
+apps/macos/Frameworks/
+apps/macos/Sources/ChampiniumCore/
 
 # C# / WinUI / .NET
 apps/windows/**/bin/

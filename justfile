@@ -36,6 +36,20 @@ gen-swift: build-core
     cargo run --release -p champinium-core --bin uniffi-bindgen -- \
         generate --library {{dylib}} --language swift --out-dir bindings/swift
 
+# Prépare le front macOS : bindings Swift + XCFramework + copie dans le package.
+macos-prepare: gen-swift
+    rm -rf apps/macos/Frameworks apps/macos/Sources/ChampiniumCore build/macos-headers
+    mkdir -p apps/macos/Sources/ChampiniumCore apps/macos/Frameworks build/macos-headers
+    cp bindings/swift/ChampiniumCore.swift apps/macos/Sources/ChampiniumCore/
+    cp bindings/swift/ChampiniumCoreFFI.h build/macos-headers/
+    cp bindings/swift/ChampiniumCoreFFI.modulemap build/macos-headers/module.modulemap
+    xcodebuild -create-xcframework -library {{dylib}} -headers build/macos-headers \
+        -output apps/macos/Frameworks/ChampiniumCoreFFI.xcframework
+
+# Build du front macOS (nécessite macos-prepare au préalable).
+macos-build: macos-prepare
+    cd apps/macos && swift build
+
 # Génère les bindings C# (Windows) dans bindings/csharp/.
 # Requiert : cargo install uniffi-bindgen-cs
 gen-csharp: build-core

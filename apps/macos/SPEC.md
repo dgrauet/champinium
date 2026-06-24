@@ -14,19 +14,19 @@ UI. Consomme les bindings Swift générés à partir du contrat UniFFI.
 
 ## Interfaces
 
-- **Consomme** : module Swift `ChampiniumCore` généré par `just gen-swift`
-  (`bindings/swift/`, **non commité**). Contrat actuel v0 : `coreVersion()`,
-  `contractVersion()`, `coreHandshake(_:) async`.
+- **Consomme** : module Swift `ChampiniumCore` + `ChampiniumCoreFFI.xcframework`
+  générés par `just macos-prepare` (**non commités**). Contrat **v1** : objet
+  `ChampiniumNode` (`openNode`, `listen`, `connect`, `catalog`, `ingestFile`,
+  `publishFeed`, `fetchHls`) + record `FfiCatalogEntry`.
 - **Produit** : rien pour les autres agents (feuille de l'arbre).
 
-## Definition of Done — phase courante (stub contre contrat)
+## Definition of Done — Phase 3 (MVP macOS)
 
-- [ ] L'app lie le binding Swift généré et appelle `coreVersion()` +
-  `coreHandshake(_:)` (async) avec succès.
-- [ ] Vérifie `contractVersion()` au démarrage (détection d'incompat).
-- [ ] Aucune logique métier dans le code Swift.
-
-> La vraie UI (catalogue + lecture AVPlayer) arrive en **Phase 3 (MVP)**.
+- [x] Package SwiftPM lie l'XCFramework + le wrapper généré ; `swift build` OK.
+- [x] UI SwiftUI : `openNode` → `listen` → `connect` → liste du `catalog` → `fetchHls`
+  → lecture **AVPlayer**.
+- [x] Aucune logique métier dans le code Swift (orchestration d'appels UniFFI).
+- [ ] Exécution/lecture validée sur une vraie session graphique (hors CI headless).
 
 ## Ce que l'agent macOS NE doit PAS toucher
 
