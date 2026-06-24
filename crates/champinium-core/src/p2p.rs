@@ -11,9 +11,10 @@
 //! boucle d'évènements tourne dans une tâche tokio dédiée.
 
 use crate::blockstore::Blockstore;
-use crate::content::verify;
+use crate::content::{cid_for, verify};
 use crate::error::{CoreError, Result as CoreResult};
 use crate::identity;
+use crate::moderation::Moderation;
 use cid::Cid;
 use futures::StreamExt;
 use libp2p::kad::{self, store::MemoryStore, GetProvidersOk, QueryId, QueryResult, RecordKey};
@@ -24,6 +25,7 @@ use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
@@ -104,12 +106,23 @@ enum Command {
 pub struct Node {
     peer_id: PeerId,
     blockstore: Blockstore,
+    moderation: Arc<Moderation>,
     cmd_tx: mpsc::Sender<Command>,
 }
 
 impl Node {
-    /// Construit un nœud et démarre sa boucle d'évènements (tâche tokio).
+    /// Construit un nœud avec la modération par défaut active (non désactivable).
     pub async fn new(keypair: Keypair, blockstore: Blockstore) -> CoreResult<Self> {
+        Self::with_moderation(keypair, blockstore, Moderation::with_default()?).await
+    }
+
+    /// Construit un nœud avec un moteur de modération explicite (tests, opérateurs
+    /// qui souscrivent à des denylists tierces). Démarre la boucle d'évènements.
+    pub async fn with_moderation(
+        keypair: Keypair,
+        blockstore: Blockstore,
+        moderation: Moderation,
+    ) -> CoreResult<Self> {
         let peer_id = identity::peer_id(&keypair);
         let mut swarm = build_swarm(keypair)?;
         // Mode serveur : stocke et sert les provider records (pas seulement client).
@@ -118,13 +131,15 @@ impl Node {
             .kademlia
             .set_mode(Some(kad::Mode::Server));
 
+        let moderation = Arc::new(moderation);
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
-        let event_loop = EventLoop::new(swarm, blockstore.clone(), cmd_rx);
+        let event_loop = EventLoop::new(swarm, blockstore.clone(), moderation.clone(), cmd_rx);
         tokio::spawn(event_loop.run());
 
         Ok(Self {
             peer_id,
             blockstore,
+            moderation,
             cmd_tx,
         })
     }
@@ -165,8 +180,20 @@ impl Node {
         self.send(Command::AddAddress { peer, addr }).await
     }
 
+    /// Accès au moteur de modération.
+    pub fn moderation(&self) -> &Moderation {
+        &self.moderation
+    }
+
     /// Stocke un bloc localement et l'annonce dans la DHT (provider record).
+    ///
+    /// CHECKPOINT MODÉRATION #1 (ingestion) : un contenu matché est refusé — ni
+    /// stocké, ni annoncé.
     pub async fn add(&self, bytes: &[u8]) -> CoreResult<Cid> {
+        let cid = cid_for(bytes);
+        if self.moderation.is_blocked(&cid) {
+            return Err(CoreError::Moderated(cid.to_string()));
+        }
         let cid = self.blockstore.put(bytes)?;
         self.provide(cid).await?;
         Ok(cid)
@@ -188,7 +215,13 @@ impl Node {
 
     /// Récupère un bloc : cache local → sinon découverte DHT + transfert + vérif.
     /// Applique seed-what-you-consume (le bloc récupéré est remis en cache).
+    ///
+    /// CHECKPOINT MODÉRATION #2 (réception) : un contenu matché n'est ni récupéré,
+    /// ni mis en cache, ni reseedé.
     pub async fn get(&self, cid: Cid) -> CoreResult<Vec<u8>> {
+        if self.moderation.is_blocked(&cid) {
+            return Err(CoreError::Moderated(cid.to_string()));
+        }
         if self.blockstore.has(&cid) {
             return self.blockstore.get(&cid);
         }
@@ -250,6 +283,7 @@ fn build_swarm(keypair: Keypair) -> CoreResult<Swarm<Behaviour>> {
 struct EventLoop {
     swarm: Swarm<Behaviour>,
     blockstore: Blockstore,
+    moderation: Arc<Moderation>,
     cmd_rx: mpsc::Receiver<Command>,
     pending_listen: VecDeque<oneshot::Sender<CoreResult<Multiaddr>>>,
     pending_provide: HashMap<QueryId, oneshot::Sender<CoreResult<()>>>,
@@ -261,11 +295,13 @@ impl EventLoop {
     fn new(
         swarm: Swarm<Behaviour>,
         blockstore: Blockstore,
+        moderation: Arc<Moderation>,
         cmd_rx: mpsc::Receiver<Command>,
     ) -> Self {
         Self {
             swarm,
             blockstore,
+            moderation,
             cmd_rx,
             pending_listen: VecDeque::new(),
             pending_provide: HashMap::new(),
@@ -410,9 +446,14 @@ impl EventLoop {
             request_response::Message::Request {
                 request, channel, ..
             } => {
-                let data = Cid::try_from(request.0.as_slice())
-                    .ok()
-                    .and_then(|cid| self.blockstore.get(&cid).ok());
+                // CHECKPOINT MODÉRATION : ne jamais servir un contenu matché.
+                let data = Cid::try_from(request.0.as_slice()).ok().and_then(|cid| {
+                    if self.moderation.is_blocked(&cid) {
+                        None
+                    } else {
+                        self.blockstore.get(&cid).ok()
+                    }
+                });
                 let _ = self
                     .swarm
                     .behaviour_mut()

@@ -1,0 +1,7 @@
+# Denylist par DÉFAUT de Champinium — CIDs bloqués, NON désactivable.
+# Compilée dans le binaire du noyau (include_str!), donc inaltérable à l'exécution.
+# Format : un CID (CIDv1) par ligne. Lignes vides et lignes « # » ignorées.
+#
+# Vide à ce stade : aucune base de hash de contenu illégal connu n'est intégrée
+# par défaut. Les opérateurs ajoutent des CIDs ici (rebuild) et/ou souscrivent à
+# des denylists signées tierces (modèle fédéré). Voir deny/README.md.
