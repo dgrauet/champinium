@@ -1,0 +1,8 @@
+# Configuration des bindings UniFFI pour champinium-core.
+[bindings.swift]
+module_name = "ChampiniumCore"
+cdylib_name = "champinium_core"
+
+# uniffi-bindgen-cs lit cette section pour la génération C# (Windows/WinUI 3).
+[bindings.csharp]
+namespace = "Champinium.Core"

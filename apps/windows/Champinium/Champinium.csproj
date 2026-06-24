@@ -1,0 +1,23 @@
+<!-- Champinium — front Windows WinUI 3 (SQUELETTE).
+     Présentation UNIQUEMENT. La logique vit dans champinium-core (Rust),
+     consommée via les bindings UniFFI C# (namespace Champinium.Core) générés
+     par `just gen-csharp` dans ../../bindings/csharp/ (non commités).
+     Projet volontairement minimal : la configuration WinUI 3 complète
+     (App.xaml, MainWindow, MediaPlayerElement) sera ajoutée en Phase 4. -->
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <RootNamespace>Champinium</RootNamespace>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <!-- TODO Phase 4 : <UseWinUI>true</UseWinUI> + WindowsAppSDK + Microsoft.WindowsAppSDK -->
+  </PropertyGroup>
+
+  <!-- TODO Phase 4 : référencer les bindings C# générés -->
+  <!-- <ItemGroup>
+         <Compile Include="..\..\..\bindings\csharp\**\*.cs" />
+       </ItemGroup> -->
+
+</Project>

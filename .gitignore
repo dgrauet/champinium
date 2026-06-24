@@ -1,0 +1,24 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Bindings générés au build — source unique de vérité = champinium-core.
+# JAMAIS commités (régénérés par le justfile).
+/bindings/
+**/*.xcframework
+
+# Swift / Xcode
+apps/macos/.build/
+apps/macos/.swiftpm/
+apps/macos/DerivedData/
+*.xcuserstate
+
+# C# / WinUI / .NET
+apps/windows/**/bin/
+apps/windows/**/obj/
+apps/windows/**/*.user
+
+# OS
+.DS_Store
+Thumbs.db

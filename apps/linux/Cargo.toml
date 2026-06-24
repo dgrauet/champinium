@@ -1,0 +1,19 @@
+[package]
+name = "champinium-linux"
+description = "Front Linux natif (GTK4 / gtk-rs). Présentation uniquement — consomme champinium-core en direct."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "champinium"
+path = "src/main.rs"
+
+[dependencies]
+champinium-core.workspace = true
+# Front GTK4 : décommenter quand on attaque la présentation (Phase 4).
+# Requiert les libs système GTK4 (libgtk-4-dev). Laissé commenté pour garder
+# le squelette buildable sans dépendance système.
+# gtk = { package = "gtk4", version = "0.9" }

@@ -1,0 +1,23 @@
+[package]
+name = "champinium-core"
+description = "Noyau Rust partagé de Champinium (P2P, content-addressing, modération), exposé aux fronts via UniFFI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+# cdylib : pour le chargement par les fronts (Swift/C#) + génération de bindings
+#          en library-mode. lib : pour la consommation directe par GTK (Rust).
+crate-type = ["cdylib", "lib"]
+name = "champinium_core"
+
+[[bin]]
+# Binaire de génération des bindings (library-mode UniFFI).
+# Utilisé par le justfile : `cargo run --bin uniffi-bindgen -- generate ...`.
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+uniffi = { workspace = true, features = ["cli"] }
