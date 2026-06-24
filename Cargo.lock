@@ -553,6 +553,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "champinium-seed"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "champinium-core",
+ "clap",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "cid"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

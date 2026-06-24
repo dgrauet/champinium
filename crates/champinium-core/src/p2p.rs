@@ -308,6 +308,18 @@ impl Node {
         Ok(cid)
     }
 
+    /// Réannonce dans la DHT TOUS les CIDs détenus localement (provider records).
+    /// Indispensable au démarrage d'un seeder : le store de providers Kademlia est
+    /// volatile, donc après un redémarrage les blocs détenus ne sont plus annoncés
+    /// tant qu'on ne les republie pas. Renvoie le nombre de CIDs réannoncés.
+    pub async fn reprovide_all(&self) -> CoreResult<usize> {
+        let cids = self.blockstore.list()?;
+        for cid in &cids {
+            self.provide(*cid).await?;
+        }
+        Ok(cids.len())
+    }
+
     /// Annonce que ce nœud fournit `cid`.
     pub async fn provide(&self, cid: Cid) -> CoreResult<()> {
         let (tx, rx) = oneshot::channel();
