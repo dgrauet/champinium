@@ -9,3 +9,8 @@ repository.workspace = true
 
 [dependencies]
 champinium-core.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "fs"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

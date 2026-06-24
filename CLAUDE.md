@@ -100,5 +100,18 @@ Voir le `justfile` à la racine.
 
 ## État actuel
 
-Squelette mono-repo, **sans logique métier**. Phasing : 0 (spike async FFI) →
-1 (P2P nu CLI) → 2 (publication signée) → 3 (MVP jouable macOS). Voir le spec.
+**Phase 1 (noyau P2P nu) — faite.** Le noyau implémente : CID content-addressed
+(CIDv1 raw/sha2-256, compatible IPFS), blockstore sur disque avec vérification
+d'intégrité, identité Ed25519 persistée, et un nœud libp2p (TCP/Noise/Yamux) avec
+Kademlia (provider records), identify, ping et un protocole request-response
+`/champinium/block/1.0.0` pour le transfert de blocs. `champinium-cli` et le nœud
+`champinium-bootstrap` stateless pilotent ce noyau. Démo deux nœuds : voir
+[`docs/phase1-demo.md`](docs/phase1-demo.md).
+
+> Note transfert : Phase 1 utilise **request-response** comme transport de blocs
+> (interim) ; le passage à **bitswap** est prévu pour une phase ultérieure.
+
+La surface **UniFFI reste en v0** (les fronts ne sont pas concernés par la Phase 1).
+
+Phasing : 0 (spike async FFI ✔ contrat) → **1 (P2P nu CLI ✔)** → 2 (publication
+signée) → 3 (MVP jouable macOS). Voir le spec.

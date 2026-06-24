@@ -18,6 +18,20 @@
 
 uniffi::setup_scaffolding!();
 
+pub mod blockstore;
+pub mod content;
+pub mod error;
+pub mod identity;
+pub mod p2p;
+
+pub use blockstore::Blockstore;
+pub use error::{CoreError, Result};
+pub use p2p::Node;
+
+// Réexports pratiques pour les consommateurs Rust du crate (cli, front Linux).
+pub use cid::Cid;
+pub use libp2p::{Multiaddr, PeerId};
+
 /// Version de la SURFACE de contrat UniFFI (distincte de la version du paquet).
 /// Tout changement de la surface exportée incrémente cette constante ET est
 /// annoncé dans AGENTS.md (voir « Protocole de changement de contrat »).
