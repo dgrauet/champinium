@@ -20,4 +20,8 @@ name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
 
 [dependencies]
-uniffi = { workspace = true, features = ["cli"] }
+uniffi = { workspace = true, features = ["cli", "tokio"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

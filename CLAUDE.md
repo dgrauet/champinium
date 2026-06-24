@@ -6,6 +6,7 @@ décentralisé jusque dans la découverte, pas d'API centrale.**
 
 > Spec d'architecture complet : `~/Work/.superpowers/champinium/specs/2026-06-24-bootstrap-architecture.md`
 > (hors repo — artefact de design local).
+> Équipe d'agents, contrat UniFFI et garde-fous : [`AGENTS.md`](AGENTS.md).
 
 ## Principes directeurs NON négociables
 
@@ -81,8 +82,8 @@ La suppression centrale est impossible par construction → modération côté n
 ```
 crates/champinium-core/   noyau Rust partagé (UniFFI) — TOUTE la logique
 crates/champinium-cli/    outil debug (Phase 1+)
-crates/bootstrap/         nœud rendez-vous stateless
-crates/relay/             relay NAT stateless
+infra/bootstrap/          nœud rendez-vous stateless
+infra/relay/              relay NAT stateless
 apps/macos/               SwiftUI (SwiftPM/Xcode)
 apps/windows/             WinUI 3 (.sln, C#)
 apps/linux/               GTK4 (gtk-rs)

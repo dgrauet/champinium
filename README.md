@@ -25,8 +25,8 @@ pour le détail (P2P, feeds signés, catalogue CRDT, modération, risques).
 ```
 crates/champinium-core/   noyau Rust partagé (UniFFI) — TOUTE la logique
 crates/champinium-cli/    outil debug
-crates/bootstrap/         nœud rendez-vous stateless
-crates/relay/             relay NAT stateless
+infra/bootstrap/          nœud rendez-vous stateless
+infra/relay/              relay NAT stateless
 apps/{macos,windows,linux}/  fronts natifs (présentation uniquement)
 deny/                     denylist par défaut (modération)
 ```
