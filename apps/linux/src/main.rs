@@ -1,12 +1,21 @@
-//! Champinium — front Linux natif GTK4 (SQUELETTE).
+//! Champinium — front Linux natif GTK4 (Phase 4).
 //!
-//! Présentation UNIQUEMENT. Aucune logique métier : tout passe par champinium-core
-//! (consommé directement, sans FFI, puisque le front Linux est en Rust).
-//! Lecture média cible : GStreamer (hlsdemux). UI cible : GTK4 via gtk-rs.
+//! Présentation UNIQUEMENT : toute la logique vit dans `champinium-core`, consommé
+//! directement (Rust → Rust, pas de FFI). L'UI GTK4 + la lecture GStreamer sont
+//! derrière la feature `gui` (libs système requises). Sans cette feature, le
+//! binaire reste compilable partout (utile pour le build du workspace en CI).
+
+#[cfg(feature = "gui")]
+mod gui;
+
 fn main() {
-    println!(
-        "Champinium Linux (squelette GTK4) — noyau v{}",
+    #[cfg(feature = "gui")]
+    gui::run();
+
+    #[cfg(not(feature = "gui"))]
+    eprintln!(
+        "Champinium Linux — recompilez avec `--features gui` (GTK4 + GStreamer requis) \
+         pour l'interface. Noyau v{}.",
         champinium_core::core_version()
     );
-    println!("TODO Phase 4 : fenêtre GTK4 (catalogue + lecture GStreamer).");
 }
