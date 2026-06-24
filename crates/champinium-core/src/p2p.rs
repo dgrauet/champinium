@@ -20,7 +20,9 @@ use crate::ingest::{self, HlsManifest, HlsSegment};
 use crate::moderation::Moderation;
 use cid::Cid;
 use futures::StreamExt;
-use libp2p::kad::{self, store::MemoryStore, GetProvidersOk, QueryId, QueryResult, RecordKey};
+use libp2p::kad::{
+    self, store::MemoryStore, GetProvidersOk, GetRecordOk, QueryId, QueryResult, RecordKey,
+};
 use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{dcutr, gossipsub, identify, identity::Keypair, noise, ping, relay, tcp, yamux};
@@ -121,6 +123,15 @@ enum Command {
     PublishFeed {
         data: Vec<u8>,
         tx: oneshot::Sender<CoreResult<()>>,
+    },
+    PutRecord {
+        key: RecordKey,
+        value: Vec<u8>,
+        tx: oneshot::Sender<CoreResult<()>>,
+    },
+    GetRecord {
+        key: RecordKey,
+        tx: oneshot::Sender<Vec<Vec<u8>>>,
     },
 }
 
@@ -240,9 +251,54 @@ impl Node {
             .expect("catalog mutex")
             .apply(feed.clone())?;
         let data = feed.to_json()?.into_bytes();
+        // PUT du feed dans la DHT (best-effort) : permet la découverte hors gossip.
+        let (put_tx, _put_rx) = oneshot::channel();
+        let _ = self
+            .cmd_tx
+            .send(Command::PutRecord {
+                key: feed_record_key(&self.peer_id),
+                value: data.clone(),
+                tx: put_tx,
+            })
+            .await;
+        // Diffusion live en gossipsub.
         let (tx, rx) = oneshot::channel();
         self.send(Command::PublishFeed { data, tx }).await?;
         rx.await.map_err(|_| CoreError::Shutdown)?
+    }
+
+    /// Récupère le feed d'un créateur depuis la DHT (découverte hors gossip).
+    /// Vérifie la signature et l'émetteur, retient le `seq` le plus élevé, et
+    /// l'applique au catalogue local. Renvoie `None` si aucun feed valide trouvé.
+    pub async fn fetch_feed(&self, issuer: PeerId) -> CoreResult<Option<Feed>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Command::GetRecord {
+            key: feed_record_key(&issuer),
+            tx,
+        })
+        .await?;
+        let values = rx.await.map_err(|_| CoreError::Shutdown)?;
+
+        let mut best: Option<Feed> = None;
+        for value in values {
+            let Ok(feed) = Feed::from_json(&value) else {
+                continue;
+            };
+            if feed.verify().is_err() || feed.issuer_peer_id().ok() != Some(issuer) {
+                continue;
+            }
+            if best.as_ref().is_none_or(|b| feed.seq > b.seq) {
+                best = Some(feed);
+            }
+        }
+        if let Some(feed) = &best {
+            let _ = self
+                .catalog
+                .lock()
+                .expect("catalog mutex")
+                .apply(feed.clone());
+        }
+        Ok(best)
     }
 
     /// Ingestion : segmente `input` en HLS via ffmpeg, stocke chaque segment
@@ -373,6 +429,13 @@ impl Node {
     }
 }
 
+/// Clé DHT du feed d'un créateur : `/champinium/feed/<peerid>`.
+fn feed_record_key(peer: &PeerId) -> RecordKey {
+    let mut key = b"/champinium/feed/".to_vec();
+    key.extend_from_slice(&peer.to_bytes());
+    RecordKey::new(&key)
+}
+
 /// Sépare une multiaddr terminée par `/p2p/<peerid>` en `(PeerId, addr de base)`.
 pub fn split_peer_id(mut addr: Multiaddr) -> CoreResult<(PeerId, Multiaddr)> {
     match addr.pop() {
@@ -414,7 +477,12 @@ struct EventLoop {
     pending_provide: HashMap<QueryId, oneshot::Sender<CoreResult<()>>>,
     pending_get_providers: HashMap<QueryId, (oneshot::Sender<HashSet<PeerId>>, HashSet<PeerId>)>,
     pending_request: HashMap<OutboundRequestId, oneshot::Sender<CoreResult<Vec<u8>>>>,
+    pending_put_record: HashMap<QueryId, oneshot::Sender<CoreResult<()>>>,
+    pending_get_record: HashMap<QueryId, PendingGetRecord>,
 }
+
+/// Émetteur de résultat + valeurs accumulées pour une requête GET de record DHT.
+type PendingGetRecord = (oneshot::Sender<Vec<Vec<u8>>>, Vec<Vec<u8>>);
 
 impl EventLoop {
     fn new(
@@ -436,6 +504,8 @@ impl EventLoop {
             pending_provide: HashMap::new(),
             pending_get_providers: HashMap::new(),
             pending_request: HashMap::new(),
+            pending_put_record: HashMap::new(),
+            pending_get_record: HashMap::new(),
         }
     }
 
@@ -510,6 +580,26 @@ impl EventLoop {
                     Err(e) => Err(CoreError::Network(format!("gossipsub publish: {e}"))),
                 };
                 let _ = tx.send(res);
+            }
+            Command::PutRecord { key, value, tx } => {
+                let record = kad::Record::new(key, value);
+                match self
+                    .swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .put_record(record, kad::Quorum::One)
+                {
+                    Ok(qid) => {
+                        self.pending_put_record.insert(qid, tx);
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(CoreError::Network(e.to_string())));
+                    }
+                }
+            }
+            Command::GetRecord { key, tx } => {
+                let qid = self.swarm.behaviour_mut().kademlia.get_record(key);
+                self.pending_get_record.insert(qid, (tx, Vec::new()));
             }
         }
     }
@@ -591,6 +681,26 @@ impl EventLoop {
                 }
                 if last {
                     if let Some((tx, acc)) = self.pending_get_providers.remove(&id) {
+                        let _ = tx.send(acc);
+                    }
+                }
+            }
+            QueryResult::PutRecord(res) => {
+                if let Some(tx) = self.pending_put_record.remove(&id) {
+                    let _ = tx.send(
+                        res.map(|_| ())
+                            .map_err(|e| CoreError::Network(e.to_string())),
+                    );
+                }
+            }
+            QueryResult::GetRecord(res) => {
+                if let Ok(GetRecordOk::FoundRecord(peer_record)) = &res {
+                    if let Some((_, acc)) = self.pending_get_record.get_mut(&id) {
+                        acc.push(peer_record.record.value.clone());
+                    }
+                }
+                if last {
+                    if let Some((tx, acc)) = self.pending_get_record.remove(&id) {
                         let _ = tx.send(acc);
                     }
                 }

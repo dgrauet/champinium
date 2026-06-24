@@ -73,6 +73,15 @@ enum Cmd {
         #[arg(long, default_value = "6")]
         wait: u64,
     },
+    /// Récupère le feed d'un créateur depuis la DHT (hors gossip).
+    FetchFeed {
+        /// Pair auquel se connecter `/ip4/.../tcp/.../p2p/<peerid>`.
+        #[arg(long)]
+        peer: String,
+        /// PeerId du créateur dont on veut le feed.
+        #[arg(long)]
+        issuer: String,
+    },
     /// Ingère un média (ffmpeg → HLS), publie son manifeste et reste en ligne.
     Ingest {
         path: PathBuf,
@@ -187,6 +196,22 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Cmd::FetchFeed { peer, issuer } => {
+            let issuer: champinium_core::PeerId =
+                issuer.parse().context("PeerId d'émetteur invalide")?;
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            node.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await?;
+            connect_peer(&node, &peer).await?;
+            match fetch_feed_with_retry(&node, issuer).await? {
+                Some(feed) => {
+                    println!("feed de {issuer} (seq {}) :", feed.seq);
+                    for c in feed.cids()? {
+                        println!("  {c}");
+                    }
+                }
+                None => println!("aucun feed trouvé dans la DHT pour {issuer}"),
+            }
+        }
         Cmd::Ingest { path, listen } => {
             let node = build_node(&cli.data_dir, &cli.denylist).await?;
             let addr = node
@@ -258,6 +283,24 @@ async fn fetch_with_retry(node: &Node, cid: Cid) -> Result<Vec<u8>> {
             }
             Err(e) => return Err(e.into()),
         }
+    }
+}
+
+/// Récupère un feed via la DHT en retentant le temps que le réseau converge.
+async fn fetch_feed_with_retry(
+    node: &Node,
+    issuer: champinium_core::PeerId,
+) -> Result<Option<champinium_core::Feed>> {
+    let deadline = std::time::Duration::from_secs(20);
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(feed) = node.fetch_feed(issuer).await? {
+            return Ok(Some(feed));
+        }
+        if start.elapsed() >= deadline {
+            return Ok(None);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     }
 }
 
