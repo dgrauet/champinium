@@ -154,7 +154,12 @@ Voir [`AGENTS.md`](AGENTS.md) pour le tableau du contrat.
   redémarrage). Démon `champinium-seed` (réannonce + republication périodiques,
   hors UI) ; fichiers de service par OS dans `infra/services/` (launchd / systemd
   user / Windows). Testé : `reprovide_makes_stored_blocks_discoverable`.
-- **Reste** : front Windows, feed records DHT (PUT/GET), bitswap.
+- **Feed records DHT (PUT/GET) ✔** : `publish_feed` PUT le feed signé dans la
+  Kademlia sous `/champinium/feed/<peerid>` ; `Node::fetch_feed` GET + vérifie
+  (signature + émetteur) + alimente le catalogue → découverte de feed **hors
+  gossip**. CLI : `fetch-feed --issuer <peerid>`. Testé :
+  `feed_is_discoverable_via_dht_without_gossip`.
+- **Reste** : front Windows, bitswap (remplacer request-response).
 
 Phasing : 0 (spike async FFI ✔ contrat) → **1 (P2P nu CLI ✔)** → **2 (modération ✔,
 feeds/gossipsub/catalogue ✔, ingestion ffmpeg ✔)** → **3 (contrat UniFFI v1 ✔,
