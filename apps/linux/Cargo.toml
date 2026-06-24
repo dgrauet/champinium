@@ -11,9 +11,15 @@ repository.workspace = true
 name = "champinium"
 path = "src/main.rs"
 
+[features]
+default = []
+# Interface GTK4 + lecture GStreamer. Requiert les libs système GTK4 et
+# GStreamer. Gardée derrière une feature pour que `cargo build` du workspace
+# reste vert sur les machines sans ces dépendances (ex. CI macOS).
+gui = ["dep:gtk", "dep:gstreamer", "dep:tokio"]
+
 [dependencies]
 champinium-core.workspace = true
-# Front GTK4 : décommenter quand on attaque la présentation (Phase 4).
-# Requiert les libs système GTK4 (libgtk-4-dev). Laissé commenté pour garder
-# le squelette buildable sans dépendance système.
-# gtk = { package = "gtk4", version = "0.9" }
+gtk = { package = "gtk4", version = "0.9", optional = true }
+gstreamer = { version = "0.23", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"], optional = true }

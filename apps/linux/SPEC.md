@@ -20,13 +20,14 @@ pas de FFI).
   `champinium_core::core_version()`, `contract_version()`, `core_handshake(...)`.
 - **Produit** : rien pour les autres agents (feuille de l'arbre).
 
-## Definition of Done — phase courante (stub contre contrat)
+## Definition of Done — Phase 4 (UI GTK4)
 
-- [ ] Le binaire appelle `core_version()` + `core_handshake(...).await` via le
-  crate, avec un runtime tokio côté front.
-- [ ] Aucune logique métier dans le front (tout passe par le noyau).
-
-> La vraie UI (fenêtre GTK4 catalogue + lecture GStreamer) arrive en **Phase 4**.
+- [x] UI GTK4 (feature `gui`) : ouverture nœud → `listen` → `connect` → catalogue
+  → lecture GStreamer (`playbin`), via un pont tokio ↔ thread GTK.
+- [x] Aucune logique métier dans le front (tout passe par le noyau).
+- [x] Build « stub » sans feature reste vert (workspace CI sans GTK).
+- [ ] Compilation `--features gui` validée sur Linux (non vérifiée en dev macOS).
+- [ ] systemd user service de seeding (à venir).
 
 ## Ce que l'agent Linux NE doit PAS toucher
 

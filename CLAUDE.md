@@ -138,6 +138,15 @@ connect → catalogue → `fetchHls` → lecture **AVPlayer**. `swift build` OK
 (compile + link contre le binding réel). Lecture GUI à valider hors headless.
 Voir [`AGENTS.md`](AGENTS.md) pour le tableau du contrat.
 
+**Phase 4 — en cours. Front Linux GTK4 (feature `gui`)** : `apps/linux` consomme
+le crate directement ; UI = ouverture nœud → listen → connect → catalogue →
+lecture **GStreamer** (`playbin`), pont tokio ↔ thread GTK. L'UI est **gatée par
+la feature `gui`** pour garder le build workspace vert sans GTK. Build « stub »
+(sans feature) et workspace : verts ✔. Compilation `--features gui` non vérifiée
+en dev macOS (pas de GTK4/GStreamer) — à compiler sur Linux. Reste Phase 4 :
+fronts Windows, relay NAT, seeding en arrière-plan par OS.
+
 Phasing : 0 (spike async FFI ✔ contrat) → **1 (P2P nu CLI ✔)** → **2 (modération ✔,
 feeds/gossipsub/catalogue ✔, ingestion ffmpeg ✔)** → **3 (contrat UniFFI v1 ✔,
-UI macOS compile ✔)**. MVP macOS jouable atteint au niveau build. Voir le spec.
+UI macOS compile ✔)** → 4 (front Linux GTK4 ✔ code, Windows/relay/seeding à venir).
+Voir le spec.
