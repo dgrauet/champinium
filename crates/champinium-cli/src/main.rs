@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use champinium_core::identity::{load_or_generate, peer_id};
 use champinium_core::p2p::split_peer_id;
-use champinium_core::{Blockstore, Cid, Node};
+use champinium_core::{Blockstore, Cid, Denylist, Moderation, Node};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -22,6 +22,10 @@ struct Cli {
     /// Répertoire de données du nœud (clé d'identité + blocs).
     #[arg(long, default_value = ".champinium")]
     data_dir: PathBuf,
+    /// Denylists signées à souscrire (JSON `champinium-denylist/v1`), répétable.
+    /// La denylist par défaut reste toujours active (non désactivable).
+    #[arg(long)]
+    denylist: Vec<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -78,7 +82,7 @@ async fn main() -> Result<()> {
             println!("{}", peer_id(&kp));
         }
         Cmd::Serve { listen, bootstrap } => {
-            let node = build_node(&cli.data_dir).await?;
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
             let addr = node
                 .listen(listen.parse().context("multiaddr d'écoute invalide")?)
                 .await?;
@@ -88,7 +92,7 @@ async fn main() -> Result<()> {
             tokio::signal::ctrl_c().await?;
         }
         Cmd::Add { path, listen } => {
-            let node = build_node(&cli.data_dir).await?;
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
             let addr = node
                 .listen(listen.parse().context("multiaddr d'écoute invalide")?)
                 .await?;
@@ -103,7 +107,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Get { cid, peer, out } => {
             let cid: Cid = cid.parse().context("CID invalide")?;
-            let node = build_node(&cli.data_dir).await?;
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
             node.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await?;
             connect_peer(&node, &peer).await?;
             let bytes = fetch_with_retry(&node, cid).await?;
@@ -117,7 +121,7 @@ async fn main() -> Result<()> {
         }
         Cmd::FindProviders { cid, peer } => {
             let cid: Cid = cid.parse().context("CID invalide")?;
-            let node = build_node(&cli.data_dir).await?;
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
             node.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await?;
             connect_peer(&node, &peer).await?;
             let providers = node.get_providers(cid).await?;
@@ -149,10 +153,20 @@ async fn fetch_with_retry(node: &Node, cid: Cid) -> Result<Vec<u8>> {
     }
 }
 
-async fn build_node(data_dir: &Path) -> Result<Node> {
+async fn build_node(data_dir: &Path, denylists: &[PathBuf]) -> Result<Node> {
     let kp = load_or_generate(data_dir.join("node.key"))?;
     let bs = Blockstore::open(data_dir.join("blocks"))?;
-    Ok(Node::new(kp, bs).await?)
+    // Modération par défaut TOUJOURS active ; on ajoute les souscriptions signées.
+    let mut moderation = Moderation::with_default()?;
+    for path in denylists {
+        let json = std::fs::read_to_string(path)
+            .with_context(|| format!("lecture de la denylist {}", path.display()))?;
+        let dl = Denylist::from_json(&json)?;
+        moderation
+            .subscribe(&dl)
+            .with_context(|| format!("denylist refusée (signature ?) : {}", path.display()))?;
+    }
+    Ok(Node::with_moderation(kp, bs, moderation).await?)
 }
 
 async fn connect_peer(node: &Node, peer: &str) -> Result<()> {

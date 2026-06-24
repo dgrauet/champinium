@@ -22,10 +22,12 @@ pub mod blockstore;
 pub mod content;
 pub mod error;
 pub mod identity;
+pub mod moderation;
 pub mod p2p;
 
 pub use blockstore::Blockstore;
 pub use error::{CoreError, Result};
+pub use moderation::{Denylist, Moderation};
 pub use p2p::Node;
 
 // Réexports pratiques pour les consommateurs Rust du crate (cli, front Linux).

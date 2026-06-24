@@ -483,11 +483,13 @@ dependencies = [
 name = "champinium-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "cid",
  "futures",
  "libp2p",
  "multihash",
  "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror 1.0.69",

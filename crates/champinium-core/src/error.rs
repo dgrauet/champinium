@@ -26,6 +26,12 @@ pub enum CoreError {
     #[error("réseau: {0}")]
     Network(String),
 
+    #[error("denylist: {0}")]
+    Moderation(String),
+
+    #[error("contenu refusé par la modération: {0}")]
+    Moderated(String),
+
     #[error("le noyau s'est arrêté")]
     Shutdown,
 }
