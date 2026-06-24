@@ -5,13 +5,14 @@
 //! + un canal oneshot. Aucune logique métier ici.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use champinium_core::identity::load_or_generate;
 use champinium_core::p2p::split_peer_id;
 use champinium_core::{Blockstore, Cid, Node};
+use gstreamer::prelude::*;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
@@ -135,7 +136,7 @@ fn build_ui(app: &Application) {
             status.set_text(&format!("catalogue : {} créateur(s)", entries.len()));
             for entry in entries {
                 for cid in entry.cids {
-                    list.append(&catalog_row(&ui, &status, &cid));
+                    list.append(&catalog_row(&ui, &status, &cid.to_string()));
                 }
             }
         });
@@ -195,7 +196,7 @@ fn catalog_row(ui: &Rc<Ui>, status: &Label, cid: &str) -> GtkBox {
 }
 
 /// Démarre une lecture GStreamer (playbin + fenêtre vidéo par défaut).
-fn start_playback(playlist: &PathBuf) -> Result<gstreamer::Element, String> {
+fn start_playback(playlist: &Path) -> Result<gstreamer::Element, String> {
     let uri = format!("file://{}", playlist.display());
     let playbin = gstreamer::ElementFactory::make("playbin")
         .property("uri", &uri)
