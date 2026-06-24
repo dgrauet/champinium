@@ -111,7 +111,15 @@ Kademlia (provider records), identify, ping et un protocole request-response
 > Note transfert : Phase 1 utilise **request-response** comme transport de blocs
 > (interim) ; le passage à **bitswap** est prévu pour une phase ultérieure.
 
-La surface **UniFFI reste en v0** (les fronts ne sont pas concernés par la Phase 1).
+**Phase 2 — modération (en cours, faite en premier).** Moteur `moderation` :
+denylist par défaut compilée dans le binaire (non désactivable) + denylists
+signées Ed25519 souscrites (modèle fédéré, signature vérifiée). Enforcement aux
+trois points : ingestion (`add`), réception (`get`), service (requête entrante).
+CLI : `--denylist <fichier>` pour souscrire. Voir [`deny/README.md`](deny/README.md).
+
+La surface **UniFFI reste en v0** (les fronts ne sont pas concernés par les
+phases 1-2 côté noyau).
 
 Phasing : 0 (spike async FFI ✔ contrat) → **1 (P2P nu CLI ✔)** → 2 (publication
-signée) → 3 (MVP jouable macOS). Voir le spec.
+signée — **modération ✔**, puis ingestion ffmpeg/feeds/CRDT) → 3 (MVP jouable
+macOS). Voir le spec.
