@@ -1,0 +1,22 @@
+# systemd user service (Linux) — seeding en arrière-plan.
+# Installer :
+#   mkdir -p ~/.config/systemd/user
+#   cp champinium-seed.service ~/.config/systemd/user/
+#   (adapter ExecStart / chemins)
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now champinium-seed.service
+#   loginctl enable-linger "$USER"   # pour seeder même déconnecté
+# Logs : journalctl --user -u champinium-seed -f
+
+[Unit]
+Description=Champinium background seeder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/champinium-seed --data-dir %h/.local/share/champinium --reprovide-interval 3600
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

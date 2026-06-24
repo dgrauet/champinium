@@ -149,9 +149,14 @@ Voir [`AGENTS.md`](AGENTS.md) pour le tableau du contrat.
   sont acceptées sans adresse). `infra/relay` = binaire réel. **Testé** : un nœud
   derrière « NAT » écoute via circuit, un autre l'atteint *via le relais* et
   récupère un bloc (`block_transfer_over_relay_circuit`).
-- **Reste** : front Windows, seeding en arrière-plan par OS, feed records DHT.
+- **Seeding en arrière-plan ✔** : `Node::reprovide_all` réannonce tous les CIDs
+  détenus (le store de providers Kademlia est volatile → indispensable au
+  redémarrage). Démon `champinium-seed` (réannonce + republication périodiques,
+  hors UI) ; fichiers de service par OS dans `infra/services/` (launchd / systemd
+  user / Windows). Testé : `reprovide_makes_stored_blocks_discoverable`.
+- **Reste** : front Windows, feed records DHT (PUT/GET), bitswap.
 
 Phasing : 0 (spike async FFI ✔ contrat) → **1 (P2P nu CLI ✔)** → **2 (modération ✔,
 feeds/gossipsub/catalogue ✔, ingestion ffmpeg ✔)** → **3 (contrat UniFFI v1 ✔,
-UI macOS compile ✔)** → 4 (Linux GTK4 ✔ code, **relay NAT ✔**, Windows/seeding à venir).
+UI macOS compile ✔)** → 4 (Linux GTK4 ✔, **relay NAT ✔**, **seeding ✔**, Windows à venir).
 Voir le spec.

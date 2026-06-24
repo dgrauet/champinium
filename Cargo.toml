@@ -6,6 +6,7 @@ resolver = "2"
 members = [
     "crates/champinium-core",
     "crates/champinium-cli",
+    "crates/champinium-seed",
     "infra/bootstrap",
     "infra/relay",
     "apps/linux",

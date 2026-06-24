@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- launchd (macOS) — seeding en arrière-plan.
+     Installer : copier dans ~/Library/LaunchAgents/, adapter les chemins, puis
+       launchctl load ~/Library/LaunchAgents/com.champinium.seed.plist
+     Désinstaller : launchctl unload ~/Library/LaunchAgents/com.champinium.seed.plist -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.champinium.seed</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/champinium-seed</string>
+        <string>--data-dir</string>
+        <string>/Users/CHANGEME/Library/Application Support/Champinium</string>
+        <string>--reprovide-interval</string>
+        <string>3600</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/champinium-seed.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/champinium-seed.err.log</string>
+</dict>
+</plist>
