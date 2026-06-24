@@ -1,21 +1,45 @@
 # Denylists
 
 Modération **côté nœud, fédérée** — le seul mécanisme possible sur un réseau
-décentralisé où la suppression centrale n'existe pas par construction.
+décentralisé où la suppression centrale n'existe pas par construction. Deux
+niveaux, tous deux appliqués par le moteur du noyau ([`crate::moderation`]).
 
-- `default-denylist.json` — liste **par défaut**, active à l'installation,
-  **non désactivable**. Chargée par le moteur de modération du noyau.
-- Format `champinium-denylist/v1` : objet **signé** (Ed25519) listant des CIDs /
-  hashes bloqués. Inspiré du format de denylist IPFS.
-- **Modèle fédéré** : chaque nœud peut souscrire à des listes additionnelles
-  (modération subjective par nœud). La liste par défaut reste toujours active.
+## 1. Denylist par défaut — `default.cids` (non désactivable)
 
-## Application (deux checkpoints — voir CLAUDE.md)
+- Un CID par ligne (`#` = commentaire). **Compilée dans le binaire** du noyau via
+  `include_str!`, donc inaltérable à l'exécution → **non désactivable**.
+- Toujours active, quel que soit le front. Vide à ce stade (aucune base de hash
+  intégrée par défaut) ; les opérateurs y ajoutent des CIDs puis recompilent.
 
-1. **Ingestion locale** : tout média matché est refusé à la publication.
-2. **Réception (avant reseed)** : tout bloc matché est droppé, jamais reseedé,
-   et peut déclencher un signalement P2P. S'applique quelle que soit la source.
+## 2. Denylists signées souscrites — format `champinium-denylist/v1`
 
-> Squelette : structure et format figés ici. La signature, la vérification et
-> le hash-matching seront implémentés en Phase 2 (checkpoint #1) et Phase 5
-> (multi-listes, signalement).
+- Modèle **fédéré** : un nœud choisit de suivre une ou plusieurs listes tierces
+  (modération subjective). Leur **signature Ed25519 est vérifiée** avant prise en
+  compte (`Moderation::subscribe`). Une liste non signée ou altérée est rejetée.
+- Format (voir `default-denylist.json` comme gabarit) :
+
+  ```json
+  {
+    "schema": "champinium-denylist/v1",
+    "name": "...",
+    "issuer_pubkey": "<clé publique Ed25519, protobuf libp2p, base64>",
+    "updated": "<RFC 3339>",
+    "entries": ["<cid>", "..."],
+    "signature": "<signature Ed25519 base64 des octets canoniques>"
+  }
+  ```
+
+- Octets signés (déterministes) : `schema \n name \n updated \n` puis les CIDs
+  **triés**, séparés par `\n`. La signature ne dépend donc pas de la mise en forme
+  JSON.
+- Souscription côté CLI : `champinium-cli --denylist liste.json <commande>`.
+
+## Application (checkpoints — voir CLAUDE.md / SPEC noyau)
+
+1. **Ingestion** (`Node::add`) : un contenu matché est refusé — ni stocké, ni annoncé.
+2. **Réception** (`Node::get`) : un contenu matché n'est ni récupéré, ni mis en
+   cache, ni reseedé.
+3. **Service** (requête entrante) : un nœud refuse de servir un contenu matché.
+
+> Publication d'une denylist signée : outil `champinium-denylist` côté agent INFRA
+> (à venir). En attendant, `Denylist::build_signed` (noyau) produit le format.
