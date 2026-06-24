@@ -128,9 +128,13 @@ Kademlia (provider records), identify, ping et un protocole request-response
   `ingest <fichier>` / `fetch-hls <manifest> --peer … --out …`.
 - **Reste** : feed records dans la DHT (PUT/GET), IPNS durable (différé).
 
-La surface **UniFFI reste en v0** (les fronts ne sont pas concernés par les
-phases 1-2 côté noyau).
+**Phase 3 — en cours.** **Contrat UniFFI étendu v0 → v1** : objet `ChampiniumNode`
+(`open_node`, `listen`, `connect`, `catalog`, `ingest_file`, `publish_feed`,
+`fetch_hls` — async sauf `peer_id`/`catalog`), record `FfiCatalogEntry`, erreur
+`FfiError`. Bindings Swift **et** C# générés et vérifiés pour toute la surface.
+Reste : UI SwiftUI (catalogue + lecture AVPlayer du HLS reconstruit). Voir
+[`AGENTS.md`](AGENTS.md) pour le tableau du contrat.
 
 Phasing : 0 (spike async FFI ✔ contrat) → **1 (P2P nu CLI ✔)** → **2 (modération ✔,
-feeds/gossipsub/catalogue ✔, ingestion ffmpeg ✔)** → 3 (MVP jouable macOS).
-Voir le spec.
+feeds/gossipsub/catalogue ✔, ingestion ffmpeg ✔)** → 3 (contrat UniFFI v1 ✔, puis
+UI macOS). Voir le spec.
