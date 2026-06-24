@@ -23,7 +23,7 @@ path = "src/bin/uniffi-bindgen.rs"
 uniffi = { workspace = true, features = ["cli", "tokio"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "macros", "fs", "io-util"] }
 futures = "0.3"
-libp2p = { version = "0.54", features = ["tokio", "tcp", "noise", "yamux", "kad", "identify", "ping", "request-response", "cbor", "macros"] }
+libp2p = { version = "0.54", features = ["tokio", "tcp", "noise", "yamux", "kad", "identify", "ping", "request-response", "cbor", "gossipsub", "macros"] }
 cid = "0.11"
 multihash = "0.19"
 sha2 = "0.10"

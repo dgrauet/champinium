@@ -11,8 +11,10 @@
 //! boucle d'évènements tourne dans une tâche tokio dédiée.
 
 use crate::blockstore::Blockstore;
+use crate::catalog::{Catalog, CatalogEntry};
 use crate::content::{cid_for, verify};
 use crate::error::{CoreError, Result as CoreResult};
+use crate::feed::Feed;
 use crate::identity;
 use crate::moderation::Moderation;
 use cid::Cid;
@@ -20,17 +22,19 @@ use futures::StreamExt;
 use libp2p::kad::{self, store::MemoryStore, GetProvidersOk, QueryId, QueryResult, RecordKey};
 use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{identify, identity::Keypair, noise, ping, tcp, yamux};
+use libp2p::{gossipsub, identify, identity::Keypair, noise, ping, tcp, yamux};
 use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::{HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 const BLOCK_PROTOCOL: &str = "/champinium/block/1.0.0";
 const IDENTIFY_PROTOCOL: &str = "/champinium/0.1.0";
+const FEEDS_TOPIC: &str = "champinium/feeds/v1";
 
 /// Demande d'un bloc par CID (octets du CID).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +50,7 @@ struct Behaviour {
     identify: identify::Behaviour,
     ping: ping::Behaviour,
     blocks: request_response::cbor::Behaviour<BlockRequest, BlockResponse>,
+    gossipsub: gossipsub::Behaviour,
 }
 
 impl Behaviour {
@@ -60,11 +65,18 @@ impl Behaviour {
             [(StreamProtocol::new(BLOCK_PROTOCOL), ProtocolSupport::Full)],
             request_response::Config::default(),
         );
+        // Feeds signés diffusés en gossipsub. Messages signés par l'identité libp2p.
+        let gossipsub = gossipsub::Behaviour::new(
+            gossipsub::MessageAuthenticity::Signed(key.clone()),
+            gossipsub::Config::default(),
+        )
+        .expect("config gossipsub par défaut valide");
         Self {
             kademlia,
             identify,
             ping: ping::Behaviour::default(),
             blocks,
+            gossipsub,
         }
     }
 }
@@ -99,14 +111,21 @@ enum Command {
     ListenAddrs {
         tx: oneshot::Sender<Vec<Multiaddr>>,
     },
+    PublishFeed {
+        data: Vec<u8>,
+        tx: oneshot::Sender<CoreResult<()>>,
+    },
 }
 
 /// Poignée vers un nœud P2P en fonctionnement.
 #[derive(Clone)]
 pub struct Node {
     peer_id: PeerId,
+    keypair: Keypair,
     blockstore: Blockstore,
     moderation: Arc<Moderation>,
+    catalog: Arc<Mutex<Catalog>>,
+    feed_seq: Arc<AtomicU64>,
     cmd_tx: mpsc::Sender<Command>,
 }
 
@@ -124,22 +143,40 @@ impl Node {
         moderation: Moderation,
     ) -> CoreResult<Self> {
         let peer_id = identity::peer_id(&keypair);
-        let mut swarm = build_swarm(keypair)?;
+        let mut swarm = build_swarm(keypair.clone())?;
         // Mode serveur : stocke et sert les provider records (pas seulement client).
         swarm
             .behaviour_mut()
             .kademlia
             .set_mode(Some(kad::Mode::Server));
+        // Souscription au topic des feeds.
+        let topic = gossipsub::IdentTopic::new(FEEDS_TOPIC);
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .subscribe(&topic)
+            .map_err(|e| CoreError::Network(format!("gossipsub subscribe: {e}")))?;
 
         let moderation = Arc::new(moderation);
+        let catalog = Arc::new(Mutex::new(Catalog::new()));
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
-        let event_loop = EventLoop::new(swarm, blockstore.clone(), moderation.clone(), cmd_rx);
+        let event_loop = EventLoop::new(
+            swarm,
+            blockstore.clone(),
+            moderation.clone(),
+            catalog.clone(),
+            topic,
+            cmd_rx,
+        );
         tokio::spawn(event_loop.run());
 
         Ok(Self {
             peer_id,
+            keypair,
             blockstore,
             moderation,
+            catalog,
+            feed_seq: Arc::new(AtomicU64::new(0)),
             cmd_tx,
         })
     }
@@ -183,6 +220,32 @@ impl Node {
     /// Accès au moteur de modération.
     pub fn moderation(&self) -> &Moderation {
         &self.moderation
+    }
+
+    /// Publie un feed signé listant `cids` : l'ajoute au catalogue local puis le
+    /// diffuse en gossipsub. Le `seq` est incrémenté à chaque appel.
+    pub async fn publish_feed(&self, cids: &[Cid]) -> CoreResult<()> {
+        let seq = self.feed_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let feed = Feed::build_signed(&self.keypair, seq, cids)?;
+        // Le créateur figure dans son propre catalogue.
+        self.catalog
+            .lock()
+            .expect("catalog mutex")
+            .apply(feed.clone())?;
+        let data = feed.to_json()?.into_bytes();
+        let (tx, rx) = oneshot::channel();
+        self.send(Command::PublishFeed { data, tx }).await?;
+        rx.await.map_err(|_| CoreError::Shutdown)?
+    }
+
+    /// Instantané des entrées du catalogue reconstruit (un feed par émetteur).
+    pub fn catalog_entries(&self) -> Vec<CatalogEntry> {
+        self.catalog.lock().expect("catalog mutex").entries()
+    }
+
+    /// Tous les CIDs connus du catalogue.
+    pub fn catalog_cids(&self) -> HashSet<Cid> {
+        self.catalog.lock().expect("catalog mutex").all_cids()
     }
 
     /// Stocke un bloc localement et l'annonce dans la DHT (provider record).
@@ -284,6 +347,8 @@ struct EventLoop {
     swarm: Swarm<Behaviour>,
     blockstore: Blockstore,
     moderation: Arc<Moderation>,
+    catalog: Arc<Mutex<Catalog>>,
+    feeds_topic: gossipsub::IdentTopic,
     cmd_rx: mpsc::Receiver<Command>,
     pending_listen: VecDeque<oneshot::Sender<CoreResult<Multiaddr>>>,
     pending_provide: HashMap<QueryId, oneshot::Sender<CoreResult<()>>>,
@@ -296,12 +361,16 @@ impl EventLoop {
         swarm: Swarm<Behaviour>,
         blockstore: Blockstore,
         moderation: Arc<Moderation>,
+        catalog: Arc<Mutex<Catalog>>,
+        feeds_topic: gossipsub::IdentTopic,
         cmd_rx: mpsc::Receiver<Command>,
     ) -> Self {
         Self {
             swarm,
             blockstore,
             moderation,
+            catalog,
+            feeds_topic,
             cmd_rx,
             pending_listen: VecDeque::new(),
             pending_provide: HashMap::new(),
@@ -367,6 +436,21 @@ impl EventLoop {
             Command::ListenAddrs { tx } => {
                 let _ = tx.send(self.swarm.listeners().cloned().collect());
             }
+            Command::PublishFeed { data, tx } => {
+                let res = match self
+                    .swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .publish(self.feeds_topic.clone(), data)
+                {
+                    Ok(_) => Ok(()),
+                    // Pas encore de pairs dans le mesh : pas une erreur fatale, le
+                    // feed reste dans le catalogue local et sera rediffusé.
+                    Err(gossipsub::PublishError::InsufficientPeers) => Ok(()),
+                    Err(e) => Err(CoreError::Network(format!("gossipsub publish: {e}"))),
+                };
+                let _ = tx.send(res);
+            }
         }
     }
 
@@ -408,7 +492,24 @@ impl EventLoop {
                     let _ = tx.send(Err(CoreError::Network(error.to_string())));
                 }
             }
+            SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                message,
+                ..
+            })) => self.handle_feed_message(&message.data),
             _ => {}
+        }
+    }
+
+    /// Applique un feed reçu en gossipsub au catalogue local (signature vérifiée
+    /// dans `Catalog::apply`). Les feeds invalides sont ignorés silencieusement.
+    fn handle_feed_message(&self, data: &[u8]) {
+        match Feed::from_json(data) {
+            Ok(feed) => {
+                if let Err(e) = self.catalog.lock().expect("catalog mutex").apply(feed) {
+                    tracing::debug!("feed rejeté: {e}");
+                }
+            }
+            Err(e) => tracing::debug!("feed illisible: {e}"),
         }
     }
 

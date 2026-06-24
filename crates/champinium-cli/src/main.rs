@@ -64,6 +64,15 @@ enum Cmd {
         #[arg(long)]
         peer: String,
     },
+    /// Reconstruit et affiche le catalogue en écoutant les feeds d'un pair.
+    Catalog {
+        /// Pair auquel se connecter `/ip4/.../tcp/.../p2p/<peerid>`.
+        #[arg(long)]
+        peer: String,
+        /// Durée d'écoute des feeds (secondes).
+        #[arg(long, default_value = "6")]
+        wait: u64,
+    },
 }
 
 #[tokio::main]
@@ -87,6 +96,12 @@ async fn main() -> Result<()> {
                 .listen(listen.parse().context("multiaddr d'écoute invalide")?)
                 .await?;
             connect_bootstraps(&node, &bootstrap).await?;
+            // Annonce un feed du contenu déjà détenu, rediffusé périodiquement.
+            let all = node.blockstore().list()?;
+            if !all.is_empty() {
+                node.publish_feed(&all).await?;
+            }
+            spawn_feed_republisher(node.clone());
             print_identity(&node, &addr);
             println!("nœud en ligne — Ctrl-C pour arrêter.");
             tokio::signal::ctrl_c().await?;
@@ -101,8 +116,13 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("lecture de {}", path.display()))?;
             let cid = node.add(&bytes).await?;
             println!("CID: {cid}");
+            // Annonce un feed signé listant tout le contenu local, rediffusé
+            // périodiquement pour les pairs qui se connectent plus tard.
+            let all = node.blockstore().list()?;
+            node.publish_feed(&all).await?;
+            spawn_feed_republisher(node.clone());
             print_identity(&node, &addr);
-            println!("contenu publié — ce nœud le sert. Ctrl-C pour arrêter.");
+            println!("contenu publié + feed annoncé — ce nœud le sert. Ctrl-C pour arrêter.");
             tokio::signal::ctrl_c().await?;
         }
         Cmd::Get { cid, peer, out } => {
@@ -133,8 +153,40 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Cmd::Catalog { peer, wait } => {
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            node.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await?;
+            connect_peer(&node, &peer).await?;
+            // Écoute les feeds diffusés en gossipsub pendant `wait` secondes.
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            let entries = node.catalog_entries();
+            if entries.is_empty() {
+                println!("catalogue vide (aucun feed reçu)");
+            } else {
+                for e in entries {
+                    println!("créateur {} (seq {}) :", e.issuer, e.seq);
+                    for c in e.cids {
+                        println!("  {c}");
+                    }
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Rediffuse périodiquement le feed du contenu local (pour les pairs tardifs).
+fn spawn_feed_republisher(node: Node) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            if let Ok(cids) = node.blockstore().list() {
+                if !cids.is_empty() {
+                    let _ = node.publish_feed(&cids).await;
+                }
+            }
+        }
+    });
 }
 
 /// Récupère un bloc en retentant le temps que la connexion et Kademlia convergent.

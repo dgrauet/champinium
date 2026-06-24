@@ -111,15 +111,22 @@ Kademlia (provider records), identify, ping et un protocole request-response
 > Note transfert : Phase 1 utilise **request-response** comme transport de blocs
 > (interim) ; le passage à **bitswap** est prévu pour une phase ultérieure.
 
-**Phase 2 — modération (en cours, faite en premier).** Moteur `moderation` :
-denylist par défaut compilée dans le binaire (non désactivable) + denylists
-signées Ed25519 souscrites (modèle fédéré, signature vérifiée). Enforcement aux
-trois points : ingestion (`add`), réception (`get`), service (requête entrante).
-CLI : `--denylist <fichier>` pour souscrire. Voir [`deny/README.md`](deny/README.md).
+**Phase 2 — en cours.**
+- **Modération ✔** (faite en premier) : moteur `moderation` — denylist par défaut
+  compilée dans le binaire (non désactivable) + denylists signées Ed25519
+  souscrites (modèle fédéré, signature vérifiée). Enforcement aux trois points :
+  ingestion (`add`), réception (`get`), service (requête entrante). CLI :
+  `--denylist <fichier>`. Voir [`deny/README.md`](deny/README.md).
+- **Feeds signés + gossipsub + catalogue ✔** : `feed` (record `champinium-feed/v1`
+  signé Ed25519, versionné par `seq`), diffusé en **gossipsub** ; `catalog` (CRDT
+  maison last-writer-wins par émetteur) reconstruit en écoutant. Node :
+  `publish_feed` / `catalog_entries`. CLI : `catalog --peer …`.
+- **Reste** : ingestion ffmpeg → HLS (checkpoint #1 sur le chemin réel), feed
+  records dans la DHT (PUT/GET), IPNS durable (différé).
 
 La surface **UniFFI reste en v0** (les fronts ne sont pas concernés par les
 phases 1-2 côté noyau).
 
-Phasing : 0 (spike async FFI ✔ contrat) → **1 (P2P nu CLI ✔)** → 2 (publication
-signée — **modération ✔**, puis ingestion ffmpeg/feeds/CRDT) → 3 (MVP jouable
-macOS). Voir le spec.
+Phasing : 0 (spike async FFI ✔ contrat) → **1 (P2P nu CLI ✔)** → 2 (modération ✔,
+feeds/gossipsub/catalogue ✔, puis ingestion ffmpeg) → 3 (MVP jouable macOS).
+Voir le spec.
