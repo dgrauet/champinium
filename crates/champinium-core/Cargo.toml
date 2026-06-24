@@ -21,7 +21,16 @@ path = "src/bin/uniffi-bindgen.rs"
 
 [dependencies]
 uniffi = { workspace = true, features = ["cli", "tokio"] }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "macros", "fs", "io-util"] }
+futures = "0.3"
+libp2p = { version = "0.54", features = ["tokio", "tcp", "noise", "yamux", "kad", "identify", "ping", "request-response", "cbor", "macros"] }
+cid = "0.11"
+multihash = "0.19"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+tracing = "0.1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tempfile = "3"
