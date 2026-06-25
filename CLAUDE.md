@@ -165,9 +165,19 @@ Voir [`AGENTS.md`](AGENTS.md) pour le tableau du contrat.
   parallèle** (première réponse valide gagne) et **réannonce** le bloc consommé
   (le consommateur devient fournisseur → réplication). Testé :
   `consumer_reseeds_to_other_peers`.
-- **Reste** : front Windows (en cours), bitswap (remplacer request-response).
+- **Front Windows ✔ (code)** : `apps/windows` WinUI 3 / C# (catalogue +
+  MediaPlayerElement) contre les bindings UniFFI C#. Compilation à valider sur un
+  runner .NET Windows (non buildable en dev macOS).
+- **libp2p 0.56 ✔** : socle réseau remonté à la version courante (38 tests verts).
+- **bitswap — bloqué en amont (différé)** : l'implémentation maintenue (beetswap)
+  cible libp2p 0.56 (d'où l'upgrade) mais sa dépendance transitive `core2` est
+  **entièrement yankée et sans source git** → graphe non résoluble actuellement.
+  Le **fetch concurrent multi-fournisseurs** (ci-dessus) couvre déjà le bénéfice
+  pratique de bitswap ; à reprendre quand `core2`/`multihash-codetable` amont
+  seront réparés (ou via vendoring si réellement nécessaire). Le transport reste
+  `request-response` en attendant.
 
 Phasing : 0 (spike async FFI ✔ contrat) → **1 (P2P nu CLI ✔)** → **2 (modération ✔,
 feeds/gossipsub/catalogue ✔, ingestion ffmpeg ✔)** → **3 (contrat UniFFI v1 ✔,
-UI macOS compile ✔)** → 4 (Linux GTK4 ✔, **relay NAT ✔**, **seeding ✔**, Windows à venir).
-Voir le spec.
+UI macOS compile ✔)** → 4 (Linux GTK4 ✔, relay NAT ✔, seeding ✔, **Windows ✔ code**,
+feed DHT ✔, fetch concurrent ✔ ; bitswap différé). Voir le spec.
