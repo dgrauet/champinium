@@ -1,5 +1,6 @@
 # Rust
 /target
+target/
 # Artefacts de build intermédiaires (ex. en-têtes pour l'XCFramework)
 /build
 **/*.rs.bk
