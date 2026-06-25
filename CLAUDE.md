@@ -161,7 +161,11 @@ Voir [`AGENTS.md`](AGENTS.md) pour le tableau du contrat.
   (signature + émetteur) + alimente le catalogue → découverte de feed **hors
   gossip**. CLI : `fetch-feed --issuer <peerid>`. Testé :
   `feed_is_discoverable_via_dht_without_gossip`.
-- **Reste** : front Windows, bitswap (remplacer request-response).
+- **Robustesse fetch ✔** : `get()` interroge **tous les fournisseurs en
+  parallèle** (première réponse valide gagne) et **réannonce** le bloc consommé
+  (le consommateur devient fournisseur → réplication). Testé :
+  `consumer_reseeds_to_other_peers`.
+- **Reste** : front Windows (en cours), bitswap (remplacer request-response).
 
 Phasing : 0 (spike async FFI ✔ contrat) → **1 (P2P nu CLI ✔)** → **2 (modération ✔,
 feeds/gossipsub/catalogue ✔, ingestion ffmpeg ✔)** → **3 (contrat UniFFI v1 ✔,
