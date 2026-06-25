@@ -188,13 +188,17 @@ impl Node {
         );
         tokio::spawn(event_loop.run());
 
+        // Reprend le seq de feed là où il s'était arrêté (sinon un nœud redémarré
+        // republierait un seq plus petit, ignoré par le LWW des catalogues pairs).
+        let feed_seq = Arc::new(AtomicU64::new(load_feed_seq(&blockstore)));
+
         Ok(Self {
             peer_id,
             keypair,
             blockstore,
             moderation,
             catalog,
-            feed_seq: Arc::new(AtomicU64::new(0)),
+            feed_seq,
             cmd_tx,
         })
     }
@@ -244,6 +248,8 @@ impl Node {
     /// diffuse en gossipsub. Le `seq` est incrémenté à chaque appel.
     pub async fn publish_feed(&self, cids: &[Cid]) -> CoreResult<()> {
         let seq = self.feed_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        // Persiste le seq pour le conserver à travers les redémarrages (best-effort).
+        let _ = std::fs::write(feed_seq_path(&self.blockstore), seq.to_string());
         let feed = Feed::build_signed(&self.keypair, seq, cids)?;
         // Le créateur figure dans son propre catalogue.
         self.catalog
@@ -427,6 +433,20 @@ impl Node {
     async fn send(&self, cmd: Command) -> CoreResult<()> {
         self.cmd_tx.send(cmd).await.map_err(|_| CoreError::Shutdown)
     }
+}
+
+/// Chemin du compteur de `seq` de feed persisté (à côté des blocs ; ignoré par
+/// `Blockstore::list` car ce n'est pas un nom de CID valide).
+fn feed_seq_path(blockstore: &Blockstore) -> PathBuf {
+    blockstore.root().join(".feed_seq")
+}
+
+/// Charge le dernier `seq` de feed persisté (0 si absent/illisible).
+fn load_feed_seq(blockstore: &Blockstore) -> u64 {
+    std::fs::read_to_string(feed_seq_path(blockstore))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 /// Clé DHT du feed d'un créateur : `/champinium/feed/<peerid>`.

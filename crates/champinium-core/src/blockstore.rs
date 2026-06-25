@@ -26,6 +26,11 @@ impl Blockstore {
         })
     }
 
+    /// Répertoire racine du magasin (pour stocker de l'état adjacent au nœud).
+    pub fn root(&self) -> &Path {
+        self.root.as_path()
+    }
+
     fn path_for(&self, cid: &Cid) -> PathBuf {
         self.root.join(cid.to_string())
     }
