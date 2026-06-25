@@ -608,7 +608,7 @@ impl EventLoop {
                     Ok(_) => Ok(()),
                     // Pas encore de pairs dans le mesh : pas une erreur fatale, le
                     // feed reste dans le catalogue local et sera rediffusé.
-                    Err(gossipsub::PublishError::InsufficientPeers) => Ok(()),
+                    Err(gossipsub::PublishError::NoPeersSubscribedToTopic) => Ok(()),
                     Err(e) => Err(CoreError::Network(format!("gossipsub publish: {e}"))),
                 };
                 let _ = tx.send(res);
