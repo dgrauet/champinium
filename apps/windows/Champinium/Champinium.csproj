@@ -1,23 +1,47 @@
-<!-- Champinium — front Windows WinUI 3 (SQUELETTE).
-     Présentation UNIQUEMENT. La logique vit dans champinium-core (Rust),
+<!-- Champinium — front Windows WinUI 3.
+     Présentation UNIQUEMENT. Toute la logique vit dans champinium-core (Rust),
      consommée via les bindings UniFFI C# (namespace Champinium.Core) générés
-     par `just gen-csharp` dans ../../bindings/csharp/ (non commités).
-     Projet volontairement minimal : la configuration WinUI 3 complète
-     (App.xaml, MainWindow, MediaPlayerElement) sera ajoutée en Phase 4. -->
+     par `just gen-csharp` dans ../../bindings/csharp/ (NON commités) +
+     la champinium_core.dll native, qui doit se trouver à côté de l'exe.
+     Voir README.md pour les étapes de build. -->
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
+    <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
     <RootNamespace>Champinium</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Platforms>x64;arm64</Platforms>
+    <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
-    <!-- TODO Phase 4 : <UseWinUI>true</UseWinUI> + WindowsAppSDK + Microsoft.WindowsAppSDK -->
+    <UseWinUI>true</UseWinUI>
+    <!-- Application non empaquetée (unpackaged) : déploiement simple en Phase 4.
+         Le packaging MSIX/MSI + Authenticode est piloté par l'agent INFRA (Phase 6). -->
+    <WindowsPackageType>None</WindowsPackageType>
+    <EnableMsixTooling>true</EnableMsixTooling>
   </PropertyGroup>
 
-  <!-- TODO Phase 4 : référencer les bindings C# générés -->
-  <!-- <ItemGroup>
-         <Compile Include="..\..\..\bindings\csharp\**\*.cs" />
-       </ItemGroup> -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.6.250108002" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.1742" />
+  </ItemGroup>
+
+  <!-- Bindings C# générés par `just gen-csharp` (namespace Champinium.Core),
+       NON commités : il faut donc lancer `just gen-csharp` avant `dotnet build`. -->
+  <ItemGroup>
+    <Compile Include="..\..\..\bindings\csharp\**\*.cs" />
+  </ItemGroup>
+
+  <!-- Copie la dll native champinium_core.dll à côté de l'exe.
+       Produite par `just build-core` dans target/release/. -->
+  <ItemGroup>
+    <None Include="..\..\..\target\release\champinium_core.dll"
+          Condition="Exists('..\..\..\target\release\champinium_core.dll')">
+      <Link>champinium_core.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
 
 </Project>
