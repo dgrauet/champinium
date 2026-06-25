@@ -19,6 +19,7 @@ use crate::identity;
 use crate::ingest::{self, HlsManifest, HlsSegment};
 use crate::moderation::Moderation;
 use cid::Cid;
+use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use libp2p::kad::{
     self, store::MemoryStore, GetProvidersOk, GetRecordOk, QueryId, QueryResult, RecordKey,
@@ -397,7 +398,9 @@ impl Node {
     }
 
     /// Récupère un bloc : cache local → sinon découverte DHT + transfert + vérif.
-    /// Applique seed-what-you-consume (le bloc récupéré est remis en cache).
+    /// Interroge **tous les fournisseurs en parallèle** et retient la première
+    /// réponse valide. Applique seed-what-you-consume : le bloc est mis en cache
+    /// **et réannoncé** (le consommateur devient fournisseur → réplication).
     ///
     /// CHECKPOINT MODÉRATION #2 (réception) : un contenu matché n'est ni récupéré,
     /// ni mis en cache, ni reseedé.
@@ -412,10 +415,19 @@ impl Node {
         if providers.is_empty() {
             return Err(CoreError::NoProviders(cid.to_string()));
         }
-        for peer in providers {
-            if let Ok(bytes) = self.request_block(peer, cid).await {
+
+        // Requêtes concurrentes vers tous les fournisseurs ; première réponse
+        // valide (CID vérifié) gagne, les autres sont abandonnées.
+        let mut inflight: FuturesUnordered<_> = providers
+            .into_iter()
+            .map(|peer| self.request_block(peer, cid))
+            .collect();
+        while let Some(result) = inflight.next().await {
+            if let Ok(bytes) = result {
                 if verify(&cid, &bytes) {
-                    self.blockstore.put(&bytes)?; // seed-what-you-consume
+                    self.blockstore.put(&bytes)?;
+                    // seed-what-you-consume : devient fournisseur (best-effort).
+                    let _ = self.provide(cid).await;
                     return Ok(bytes);
                 }
             }
