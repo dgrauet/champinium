@@ -1,0 +1,5 @@
+# Épingle la toolchain Rust pour que tous les contributeurs (et la CI) utilisent
+# le même compilateur et les mêmes composants. (RUST_QU001)
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

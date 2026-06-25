@@ -10,6 +10,23 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  commits:
+    name: conventional commits
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install commitizen
+      - name: Validate commit messages (Conventional Commits)
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: cz check --rev-range "origin/${BASE_REF}..HEAD"
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
