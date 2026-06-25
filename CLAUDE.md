@@ -120,7 +120,9 @@ Kademlia (provider records), identify, ping et un protocole request-response
 - **Feeds signés + gossipsub + catalogue ✔** : `feed` (record `champinium-feed/v1`
   signé Ed25519, versionné par `seq`), diffusé en **gossipsub** ; `catalog` (CRDT
   maison last-writer-wins par émetteur) reconstruit en écoutant. Node :
-  `publish_feed` / `catalog_entries`. CLI : `catalog --peer …`.
+  `publish_feed` / `catalog_entries`. CLI : `catalog --peer …`. Le `seq` est
+  **persisté** (à côté des blocs) : un créateur qui redémarre reprend son `seq`,
+  sinon ses nouveaux feeds seraient ignorés par le LWW des pairs.
 - **Ingestion ffmpeg → HLS ✔** : `ingest` orchestre ffmpeg (segments alignés sur
   keyframes), chaque segment = un bloc CID (checkpoint #1 via `add`), un manifeste
   `champinium-hls/v1` mappe l'ordre/durée aux CIDs. `Node::ingest_file` →
