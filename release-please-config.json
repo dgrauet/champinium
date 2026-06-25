@@ -1,7 +1,8 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
-  "release-type": "rust",
+  "release-type": "simple",
   "include-component-in-tag": false,
+  "bootstrap-sha": "8967ca8b6d7879581b98b3c340a38ec05ba9238f",
   "packages": {
     ".": {
       "component": "champinium"
