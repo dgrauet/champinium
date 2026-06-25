@@ -6,6 +6,13 @@ versionnage : [SemVer](https://semver.org/lang/fr/). À partir de la 0.2.0, ce
 fichier est maintenu automatiquement par release-please (voir
 [ADR-0005](docs/adr/0005-release-please.md)).
 
+## [0.1.0](https://github.com/dgrauet/champinium/compare/v0.1.0...v0.1.0) (2026-06-25)
+
+
+### Miscellaneous Chores
+
+* fix release-please for initial release ([#1](https://github.com/dgrauet/champinium/issues/1)) ([7f677b5](https://github.com/dgrauet/champinium/commit/7f677b54078b1622dea62fb7d59e25ea712d7581))
+
 ## [Non publié]
 
 ### Ajouté
