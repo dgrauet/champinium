@@ -36,13 +36,16 @@ impl Blockstore {
     }
 
     /// Stocke un bloc et renvoie son CID (calculé sur le contenu).
+    ///
+    /// L'écriture est **atomique** (fichier temporaire + rename) : un crash en
+    /// cours d'écriture ne laisse jamais de bloc partiel sous son nom de CID, et
+    /// re-stocker un contenu **répare** un fichier corrompu préexistant.
     pub fn put(&self, bytes: &[u8]) -> Result<Cid> {
         let cid = cid_for(bytes);
         let path = self.path_for(&cid);
-        // Content-addressed : si déjà présent, rien à réécrire (dédup).
-        if !path.exists() {
-            std::fs::write(&path, bytes)?;
-        }
+        let mut tmp = tempfile::NamedTempFile::new_in(self.root.as_path())?;
+        std::io::Write::write_all(&mut tmp, bytes)?;
+        tmp.persist(&path).map_err(|e| CoreError::Io(e.error))?;
         Ok(cid)
     }
 
@@ -118,6 +121,29 @@ mod tests {
         // Corrompt le fichier sur disque sous le même nom de CID.
         std::fs::write(bs.path_for(&cid), b"evil").unwrap();
         assert!(matches!(bs.get(&cid), Err(CoreError::IntegrityMismatch)));
+    }
+
+    #[test]
+    fn put_repairs_corrupted_block() {
+        let (bs, _d) = store();
+        let cid = bs.put(b"trusted").unwrap();
+        // Corruption sur disque (ex. écriture interrompue par un crash).
+        std::fs::write(bs.path_for(&cid), b"evil").unwrap();
+        assert!(matches!(bs.get(&cid), Err(CoreError::IntegrityMismatch)));
+        // Re-stocker le même contenu doit réparer le bloc, pas le sauter.
+        bs.put(b"trusted").unwrap();
+        assert_eq!(bs.get(&cid).unwrap(), b"trusted");
+    }
+
+    #[test]
+    fn put_leaves_no_stray_files() {
+        let (bs, _d) = store();
+        let cid = bs.put(b"payload").unwrap();
+        let names: Vec<String> = std::fs::read_dir(bs.root())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, vec![cid.to_string()]);
     }
 
     #[test]

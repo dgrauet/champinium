@@ -22,7 +22,9 @@ use cid::Cid;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use libp2p::kad::{
-    self, store::MemoryStore, GetProvidersOk, GetRecordOk, QueryId, QueryResult, RecordKey,
+    self,
+    store::{MemoryStore, RecordStore},
+    GetProvidersOk, GetRecordOk, QueryId, QueryResult, RecordKey,
 };
 use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
@@ -64,7 +66,13 @@ struct Behaviour {
 impl Behaviour {
     fn new(key: &Keypair, relay_client: relay::client::Behaviour) -> Self {
         let peer_id = key.public().to_peer_id();
-        let kademlia = kad::Behaviour::new(peer_id, MemoryStore::new(peer_id));
+        // Filtrage des stores entrants : sans lui, n'importe quel pair peut
+        // écraser le record de feed d'autrui chez les nœuds stockeurs (déni de
+        // découverte). Les records sont validés dans la boucle d'évènements
+        // (voir `EventLoop::handle_inbound_kad_request`).
+        let mut kad_cfg = kad::Config::default();
+        kad_cfg.set_record_filtering(kad::StoreInserts::FilterBoth);
+        let kademlia = kad::Behaviour::with_config(peer_id, MemoryStore::new(peer_id), kad_cfg);
         let identify = identify::Behaviour::new(identify::Config::new(
             IDENTIFY_PROTOCOL.to_string(),
             key.public(),
@@ -409,7 +417,16 @@ impl Node {
             return Err(CoreError::Moderated(cid.to_string()));
         }
         if self.blockstore.has(&cid) {
-            return self.blockstore.get(&cid);
+            match self.blockstore.get(&cid) {
+                Ok(bytes) => return Ok(bytes),
+                // Cache local corrompu (ex. crash pendant l'écriture) : on
+                // retombe sur le réseau au lieu de rendre le CID irrécupérable ;
+                // le `put` en fin de fetch réparera le fichier.
+                Err(CoreError::IntegrityMismatch) => {
+                    tracing::warn!("bloc local corrompu, re-téléchargement: {cid}");
+                }
+                Err(e) => return Err(e),
+            }
         }
         let providers = self.get_providers(cid).await?;
         if providers.is_empty() {
@@ -417,9 +434,11 @@ impl Node {
         }
 
         // Requêtes concurrentes vers tous les fournisseurs ; première réponse
-        // valide (CID vérifié) gagne, les autres sont abandonnées.
+        // valide (CID vérifié) gagne, les autres sont abandonnées. On s'exclut
+        // soi-même (on peut être fournisseur annoncé d'un bloc local corrompu).
         let mut inflight: FuturesUnordered<_> = providers
             .into_iter()
+            .filter(|peer| *peer != self.peer_id)
             .map(|peer| self.request_block(peer, cid))
             .collect();
         while let Some(result) = inflight.next().await {
@@ -461,11 +480,30 @@ fn load_feed_seq(blockstore: &Blockstore) -> u64 {
         .unwrap_or(0)
 }
 
+/// Préfixe des clés DHT de feeds.
+const FEED_KEY_PREFIX: &[u8] = b"/champinium/feed/";
+
 /// Clé DHT du feed d'un créateur : `/champinium/feed/<peerid>`.
 fn feed_record_key(peer: &PeerId) -> RecordKey {
-    let mut key = b"/champinium/feed/".to_vec();
+    let mut key = FEED_KEY_PREFIX.to_vec();
     key.extend_from_slice(&peer.to_bytes());
     RecordKey::new(&key)
+}
+
+/// Valide un record DHT entrant avant stockage : la clé doit être une clé de
+/// feed, la valeur un feed signé dont l'émetteur correspond au `<peerid>` de la
+/// clé. Toute autre clé est refusée (aucun autre type de record applicatif).
+fn is_valid_feed_record(record: &kad::Record) -> bool {
+    let Some(peer_bytes) = record.key.as_ref().strip_prefix(FEED_KEY_PREFIX) else {
+        return false;
+    };
+    let Ok(expected_issuer) = PeerId::from_bytes(peer_bytes) else {
+        return false;
+    };
+    let Ok(feed) = Feed::from_json(&record.value) else {
+        return false;
+    };
+    feed.verify().is_ok() && feed.issuer_peer_id().ok() == Some(expected_issuer)
 }
 
 /// Sépare une multiaddr terminée par `/p2p/<peerid>` en `(PeerId, addr de base)`.
@@ -661,6 +699,9 @@ impl EventLoop {
                     id, result, step, ..
                 },
             )) => self.handle_kad_result(id, result, step.last),
+            SwarmEvent::Behaviour(BehaviourEvent::Kademlia(kad::Event::InboundRequest {
+                request,
+            })) => self.handle_inbound_kad_request(request),
             SwarmEvent::Behaviour(BehaviourEvent::Blocks(request_response::Event::Message {
                 message,
                 ..
@@ -678,6 +719,42 @@ impl EventLoop {
                 message,
                 ..
             })) => self.handle_feed_message(&message.data),
+            _ => {}
+        }
+    }
+
+    /// Stores DHT entrants (mode `StoreInserts::FilterBoth` : rien n'est stocké
+    /// automatiquement). Seul un record de feed **valide** (signé, cohérent avec
+    /// la clé `/champinium/feed/<peerid>`) est stocké — un tiers ne peut donc pas
+    /// écraser le record d'un créateur. Les provider records sont de simples
+    /// annonces (le contenu est vérifié par CID au téléchargement) : acceptés.
+    fn handle_inbound_kad_request(&mut self, request: kad::InboundRequest) {
+        match request {
+            kad::InboundRequest::PutRecord {
+                record: Some(record),
+                ..
+            } => {
+                if is_valid_feed_record(&record) {
+                    if let Err(e) = self.swarm.behaviour_mut().kademlia.store_mut().put(record) {
+                        tracing::debug!("record DHT refusé par le store: {e}");
+                    }
+                } else {
+                    tracing::debug!("record DHT invalide ignoré");
+                }
+            }
+            kad::InboundRequest::AddProvider {
+                record: Some(record),
+            } => {
+                if let Err(e) = self
+                    .swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .store_mut()
+                    .add_provider(record)
+                {
+                    tracing::debug!("provider record refusé par le store: {e}");
+                }
+            }
             _ => {}
         }
     }
@@ -776,5 +853,84 @@ impl EventLoop {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blockstore::Blockstore;
+    use crate::content::cid_for;
+
+    async fn spawn_node(dir: &Path, name: &str) -> Node {
+        let bs = Blockstore::open(dir.join(name)).unwrap();
+        Node::new(Keypair::generate_ed25519(), bs).await.unwrap()
+    }
+
+    /// Un tiers ne doit pas pouvoir écraser le record DHT du feed d'un créateur
+    /// avec des octets arbitraires : les nœuds stockeurs valident (signature +
+    /// correspondance clé/émetteur) avant de stocker.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stored_feed_record_survives_overwrite_by_third_party() {
+        let dir = tempfile::tempdir().unwrap();
+        let storer = spawn_node(dir.path(), "s").await;
+        let victim = spawn_node(dir.path(), "v").await;
+        let attacker = spawn_node(dir.path(), "a").await;
+
+        let addr_s = storer
+            .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        for node in [&victim, &attacker] {
+            node.add_address(storer.peer_id(), addr_s.clone())
+                .await
+                .unwrap();
+            node.dial(addr_s.clone()).await.unwrap();
+        }
+
+        let victim_peer = victim.peer_id();
+        let published = vec![cid_for(b"contenu du feed de la victime")];
+
+        // La victime publie son feed jusqu'à ce qu'il soit découvrable par
+        // l'attaquant (le temps que la table de routage converge).
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                victim.publish_feed(&published).await.unwrap();
+                if attacker.fetch_feed(victim_peer).await.unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+        .await
+        .expect("le feed légitime doit être découvrable avant l'attaque");
+
+        // Attaque : PUT d'octets arbitraires sous la clé du feed de la victime.
+        // Sans filtrage des records, les nœuds stockeurs remplacent le record
+        // légitime et la découverte du feed est cassée.
+        let (tx, rx) = oneshot::channel();
+        attacker
+            .cmd_tx
+            .send(Command::PutRecord {
+                key: feed_record_key(&victim_peer),
+                value: b"pas un feed valide".to_vec(),
+                tx,
+            })
+            .await
+            .unwrap();
+        let _ = rx.await;
+
+        // Le feed légitime doit toujours être découvrable après l'attaque.
+        let feed = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(feed) = attacker.fetch_feed(victim_peer).await.unwrap() {
+                    break feed;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+        .await
+        .expect("le feed légitime doit survivre à la tentative d'écrasement");
+        assert_eq!(feed.cids().unwrap(), published);
     }
 }
