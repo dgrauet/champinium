@@ -28,6 +28,7 @@ pub mod identity;
 pub mod ingest;
 pub mod moderation;
 pub mod p2p;
+pub mod paths;
 pub mod relay;
 
 pub use blockstore::Blockstore;
@@ -46,7 +47,7 @@ pub use libp2p::{Multiaddr, PeerId};
 /// Version de la SURFACE de contrat UniFFI (distincte de la version du paquet).
 /// Tout changement de la surface exportée incrémente cette constante ET est
 /// annoncé dans AGENTS.md (voir « Protocole de changement de contrat »).
-pub const CONTRACT_VERSION: u32 = 1;
+pub const CONTRACT_VERSION: u32 = 2;
 
 /// CONTRAT v0 — version du noyau. Première fonction exposée : valide de bout en
 /// bout la chaîne de génération et de chargement des bindings sur les 3 fronts.

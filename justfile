@@ -20,10 +20,17 @@ build-rust:
     cargo build --release
 
 # fmt + clippy strict + tests : à passer avant tout commit.
+# NB : pas de `--all-features` — la feature `gui` du front Linux exige GTK4 +
+# GStreamer et casserait sur une machine sans ces libs. Le front GTK est vérifié
+# à part (recette `check-linux-gui`, comme le job `linux-gui` de la CI).
 check:
     cargo fmt --all -- --check
-    cargo clippy --all-targets --all-features -- -D warnings
-    cargo test --all
+    cargo clippy --workspace --all-targets -- -D warnings
+    cargo test --workspace
+
+# Clippy + build du front Linux GTK4 (requiert les libs système GTK4/GStreamer).
+check-linux-gui:
+    cargo clippy -p champinium-linux --features gui -- -D warnings
 
 fmt:
     cargo fmt --all

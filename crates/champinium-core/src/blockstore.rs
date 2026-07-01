@@ -67,6 +67,17 @@ impl Blockstore {
         self.path_for(cid).exists()
     }
 
+    /// Retire un bloc du magasin (idempotent : l'absence n'est pas une erreur).
+    /// Utilisé par la purge de modération quand une denylist couvre un contenu
+    /// déjà stocké.
+    pub fn remove(&self, cid: &Cid) -> Result<()> {
+        match std::fs::remove_file(self.path_for(cid)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(CoreError::Io(e)),
+        }
+    }
+
     /// CIDs actuellement détenus (pour réannoncer les provider records).
     pub fn list(&self) -> Result<Vec<Cid>> {
         let mut out = Vec::new();

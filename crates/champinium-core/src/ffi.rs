@@ -7,9 +7,7 @@
 //! Le risque #1 (async via FFI) est éprouvé ici : la plupart des méthodes sont
 //! `async` (runtime tokio) et exposées vers Swift ET C#.
 
-use crate::identity::load_or_generate;
-use crate::p2p::split_peer_id;
-use crate::{Blockstore, Node};
+use crate::{Denylist, Node};
 use cid::Cid;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -50,11 +48,18 @@ pub struct ChampiniumNode {
 /// modération par défaut active (non désactivable).
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn open_node(data_dir: String) -> Result<Arc<ChampiniumNode>, FfiError> {
-    let dir = PathBuf::from(data_dir);
-    let keypair = load_or_generate(dir.join("node.key"))?;
-    let blockstore = Blockstore::open(dir.join("blocks"))?;
-    let inner = Node::new(keypair, blockstore).await?;
+    let inner = Node::open(&PathBuf::from(data_dir)).await?;
     Ok(Arc::new(ChampiniumNode { inner }))
+}
+
+/// Répertoire de données durable par défaut selon l'OS (identité + blocs). Les
+/// fronts DOIVENT l'utiliser plutôt qu'un répertoire temporaire (sinon perte du
+/// PeerId et régression du `seq` au nettoyage du tmp).
+#[uniffi::export]
+pub fn default_data_dir() -> String {
+    crate::paths::default_data_dir()
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[uniffi::export]
@@ -93,9 +98,7 @@ impl ChampiniumNode {
         let addr = peer
             .parse()
             .map_err(|e| FfiError::Failed(format!("multiaddr invalide: {e}")))?;
-        let (pid, base) = split_peer_id(addr)?;
-        self.inner.add_address(pid, base.clone()).await?;
-        self.inner.dial(base).await?;
+        self.inner.connect(addr).await?;
         Ok(())
     }
 
@@ -110,6 +113,16 @@ impl ChampiniumNode {
         let parsed = parse_cids(&cids)?;
         self.inner.publish_feed(&parsed).await?;
         Ok(())
+    }
+
+    /// Souscrit à une denylist signée (JSON `champinium-denylist/v1`) : active une
+    /// modération fédérée côté front (au-delà de la denylist par défaut). La
+    /// signature est vérifiée ; les blocs déjà en cache que la liste couvre sont
+    /// purgés. Renvoie le nombre de blocs purgés.
+    pub async fn subscribe_denylist(&self, denylist_json: String) -> Result<u64, FfiError> {
+        let dl = Denylist::from_json(&denylist_json)?;
+        let purged = self.inner.subscribe_denylist(&dl).await?;
+        Ok(purged as u64)
     }
 
     /// Récupère et reconstruit un HLS depuis un manifeste, dans `out_dir`.

@@ -68,14 +68,14 @@ public sealed class NodeViewModel : INotifyPropertyChanged
     /// </summary>
     public event Action<string>? PlaybackReady;
 
-    /// <summary>Ouvre le nœud sous %LocalAppData%\Champinium et commence à écouter.</summary>
+    /// <summary>Ouvre le nœud sous le répertoire de données durable de l'OS et commence à écouter.</summary>
     public async Task StartAsync()
     {
         try
         {
-            var dir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "Champinium");
+            // Répertoire durable choisi par le noyau (%LocalAppData%\Champinium
+            // sur Windows) — jamais un temporaire, pour préserver le PeerId.
+            var dir = ChampiniumCoreMethods.DefaultDataDir();
             Directory.CreateDirectory(dir);
 
             // Fonction libre `open_node` du contrat : exposée par uniffi-bindgen-cs

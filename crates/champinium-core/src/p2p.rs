@@ -17,7 +17,7 @@ use crate::error::{CoreError, Result as CoreResult};
 use crate::feed::Feed;
 use crate::identity;
 use crate::ingest::{self, HlsManifest, HlsSegment};
-use crate::moderation::Moderation;
+use crate::moderation::{Denylist, Moderation};
 use cid::Cid;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -32,16 +32,29 @@ use libp2p::{dcutr, gossipsub, identify, identity::Keypair, noise, ping, relay, 
 use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 const BLOCK_PROTOCOL: &str = "/champinium/block/1.0.0";
 const IDENTIFY_PROTOCOL: &str = "/champinium/0.1.0";
 const FEEDS_TOPIC: &str = "champinium/feeds/v1";
+
+/// Taille max d'un bloc servi via request-response (un segment HLS = un bloc).
+/// Le défaut cbor (10 MiB) est trop bas pour un segment vidéo haute qualité.
+const MAX_BLOCK_SIZE: u64 = 64 * 1024 * 1024;
+/// Taille max d'une requête de bloc (un CID) — le défaut (1 MiB) suffit large.
+const MAX_BLOCK_REQUEST_SIZE: u64 = 4 * 1024;
+/// Taille max d'un feed diffusé en gossipsub. Le défaut (64 KiB) plafonne à
+/// ~1000 CIDs ; on vise beaucoup plus haut pour un créateur prolifique.
+const MAX_FEED_SIZE: usize = 4 * 1024 * 1024;
+/// Nombre max de provider records annoncés (le défaut 1024 est atteint par un
+/// seeder réel — des heures de vidéo = des milliers de segments).
+const MAX_PROVIDED_KEYS: usize = 1_000_000;
+/// Nombre max de records DHT stockés localement (feeds d'autres créateurs).
+const MAX_DHT_RECORDS: usize = 100_000;
 
 /// Demande d'un bloc par CID (octets du CID).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,21 +85,37 @@ impl Behaviour {
         // (voir `EventLoop::handle_inbound_kad_request`).
         let mut kad_cfg = kad::Config::default();
         kad_cfg.set_record_filtering(kad::StoreInserts::FilterBoth);
-        let kademlia = kad::Behaviour::with_config(peer_id, MemoryStore::new(peer_id), kad_cfg);
+        let store_cfg = kad::store::MemoryStoreConfig {
+            max_provided_keys: MAX_PROVIDED_KEYS,
+            max_records: MAX_DHT_RECORDS,
+            max_value_bytes: MAX_FEED_SIZE,
+            ..Default::default()
+        };
+        let store = MemoryStore::with_config(peer_id, store_cfg);
+        let kademlia = kad::Behaviour::with_config(peer_id, store, kad_cfg);
         let identify = identify::Behaviour::new(identify::Config::new(
             IDENTIFY_PROTOCOL.to_string(),
             key.public(),
         ));
-        let blocks = request_response::cbor::Behaviour::new(
+        // Codec cbor avec des plafonds relevés pour la cible média (segments HLS).
+        let block_codec = request_response::cbor::codec::Codec::default()
+            .set_request_size_maximum(MAX_BLOCK_REQUEST_SIZE)
+            .set_response_size_maximum(MAX_BLOCK_SIZE);
+        let blocks = request_response::Behaviour::with_codec(
+            block_codec,
             [(StreamProtocol::new(BLOCK_PROTOCOL), ProtocolSupport::Full)],
             request_response::Config::default(),
         );
         // Feeds signés diffusés en gossipsub. Messages signés par l'identité libp2p.
+        let gossipsub_cfg = gossipsub::ConfigBuilder::default()
+            .max_transmit_size(MAX_FEED_SIZE)
+            .build()
+            .expect("config gossipsub valide");
         let gossipsub = gossipsub::Behaviour::new(
             gossipsub::MessageAuthenticity::Signed(key.clone()),
-            gossipsub::Config::default(),
+            gossipsub_cfg,
         )
-        .expect("config gossipsub par défaut valide");
+        .expect("config gossipsub valide");
         Self {
             kademlia,
             identify,
@@ -150,9 +179,9 @@ pub struct Node {
     peer_id: PeerId,
     keypair: Keypair,
     blockstore: Blockstore,
-    moderation: Arc<Moderation>,
+    moderation: Arc<RwLock<Moderation>>,
     catalog: Arc<Mutex<Catalog>>,
-    feed_seq: Arc<AtomicU64>,
+    feed_seq: Arc<Mutex<u64>>,
     cmd_tx: mpsc::Sender<Command>,
 }
 
@@ -160,6 +189,24 @@ impl Node {
     /// Construit un nœud avec la modération par défaut active (non désactivable).
     pub async fn new(keypair: Keypair, blockstore: Blockstore) -> CoreResult<Self> {
         Self::with_moderation(keypair, blockstore, Moderation::with_default()?).await
+    }
+
+    /// Ouvre (ou crée) un nœud sous `data_dir` : identité Ed25519 persistée +
+    /// magasin de blocs, avec la modération par défaut active. Point d'entrée
+    /// commun aux fronts (via FFI) et aux consommateurs Rust directs (GTK).
+    pub async fn open(data_dir: &Path) -> CoreResult<Self> {
+        let keypair = identity::load_or_generate(data_dir.join("node.key"))?;
+        let blockstore = Blockstore::open(data_dir.join("blocks"))?;
+        Self::new(keypair, blockstore).await
+    }
+
+    /// Se connecte à un pair désigné par une multiaddr terminée par
+    /// `/p2p/<peerid>` : enregistre son adresse dans la table de routage puis
+    /// compose. Logique d'orchestration partagée (ne pas dupliquer côté front).
+    pub async fn connect(&self, addr: Multiaddr) -> CoreResult<()> {
+        let (peer, base) = split_peer_id(addr)?;
+        self.add_address(peer, base.clone()).await?;
+        self.dial(base).await
     }
 
     /// Construit un nœud avec un moteur de modération explicite (tests, opérateurs
@@ -184,7 +231,7 @@ impl Node {
             .subscribe(&topic)
             .map_err(|e| CoreError::Network(format!("gossipsub subscribe: {e}")))?;
 
-        let moderation = Arc::new(moderation);
+        let moderation = Arc::new(RwLock::new(moderation));
         let catalog = Arc::new(Mutex::new(Catalog::new()));
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let event_loop = EventLoop::new(
@@ -199,7 +246,7 @@ impl Node {
 
         // Reprend le seq de feed là où il s'était arrêté (sinon un nœud redémarré
         // republierait un seq plus petit, ignoré par le LWW des catalogues pairs).
-        let feed_seq = Arc::new(AtomicU64::new(load_feed_seq(&blockstore)));
+        let feed_seq = Arc::new(Mutex::new(load_feed_seq(&blockstore)));
 
         Ok(Self {
             peer_id,
@@ -248,17 +295,52 @@ impl Node {
         self.send(Command::AddAddress { peer, addr }).await
     }
 
-    /// Accès au moteur de modération.
-    pub fn moderation(&self) -> &Moderation {
-        &self.moderation
+    /// Indique si un CID est actuellement bloqué par la modération.
+    pub fn is_blocked(&self, cid: &Cid) -> bool {
+        self.moderation
+            .read()
+            .expect("moderation lock")
+            .is_blocked(cid)
+    }
+
+    /// Nombre de CIDs actuellement bloqués.
+    pub fn blocked_count(&self) -> usize {
+        self.moderation.read().expect("moderation lock").len()
+    }
+
+    /// Souscrit **à chaud** à une denylist signée : vérifie la signature, ajoute
+    /// ses CIDs au moteur, puis **purge** du magasin local tout bloc désormais
+    /// interdit (checkpoint rétroactif). Renvoie le nombre de blocs purgés.
+    pub async fn subscribe_denylist(&self, list: &Denylist) -> CoreResult<usize> {
+        {
+            let mut mod_guard = self.moderation.write().expect("moderation lock");
+            mod_guard.subscribe(list)?;
+        }
+        // Purge des blocs déjà stockés que la nouvelle liste couvre.
+        let mut purged = 0;
+        for cid in self.blockstore.list()? {
+            if self.is_blocked(&cid) {
+                self.blockstore.remove(&cid)?;
+                purged += 1;
+            }
+        }
+        Ok(purged)
     }
 
     /// Publie un feed signé listant `cids` : l'ajoute au catalogue local puis le
     /// diffuse en gossipsub. Le `seq` est incrémenté à chaque appel.
     pub async fn publish_feed(&self, cids: &[Cid]) -> CoreResult<()> {
-        let seq = self.feed_seq.fetch_add(1, Ordering::SeqCst) + 1;
-        // Persiste le seq pour le conserver à travers les redémarrages (best-effort).
-        let _ = std::fs::write(feed_seq_path(&self.blockstore), seq.to_string());
+        // Incrément et persistance sous le même verrou : deux publications
+        // concurrentes ne peuvent pas réordonner le seq écrit sur disque (sinon,
+        // au redémarrage, on republierait un seq déjà vu, ignoré par le LWW).
+        let seq = {
+            let mut guard = self.feed_seq.lock().expect("feed_seq mutex");
+            *guard += 1;
+            if let Err(e) = std::fs::write(feed_seq_path(&self.blockstore), guard.to_string()) {
+                tracing::warn!("persistance du seq de feed échouée: {e}");
+            }
+            *guard
+        };
         let feed = Feed::build_signed(&self.keypair, seq, cids)?;
         // Le créateur figure dans son propre catalogue.
         self.catalog
@@ -371,7 +453,7 @@ impl Node {
     /// stocké, ni annoncé.
     pub async fn add(&self, bytes: &[u8]) -> CoreResult<Cid> {
         let cid = cid_for(bytes);
-        if self.moderation.is_blocked(&cid) {
+        if self.is_blocked(&cid) {
             return Err(CoreError::Moderated(cid.to_string()));
         }
         let cid = self.blockstore.put(bytes)?;
@@ -391,8 +473,13 @@ impl Node {
         Ok(cids.len())
     }
 
-    /// Annonce que ce nœud fournit `cid`.
+    /// Annonce que ce nœud fournit `cid`. **Ne fait rien** si le CID est bloqué :
+    /// s'annoncer fournisseur d'un contenu qu'on refuse de servir serait à la
+    /// fois incohérent et un signal au réseau qu'on le détient.
     pub async fn provide(&self, cid: Cid) -> CoreResult<()> {
+        if self.is_blocked(&cid) {
+            return Ok(());
+        }
         let (tx, rx) = oneshot::channel();
         self.send(Command::Provide { cid, tx }).await?;
         rx.await.map_err(|_| CoreError::Shutdown)?
@@ -413,7 +500,7 @@ impl Node {
     /// CHECKPOINT MODÉRATION #2 (réception) : un contenu matché n'est ni récupéré,
     /// ni mis en cache, ni reseedé.
     pub async fn get(&self, cid: Cid) -> CoreResult<Vec<u8>> {
-        if self.moderation.is_blocked(&cid) {
+        if self.is_blocked(&cid) {
             return Err(CoreError::Moderated(cid.to_string()));
         }
         if self.blockstore.has(&cid) {
@@ -441,24 +528,32 @@ impl Node {
             .filter(|peer| *peer != self.peer_id)
             .map(|peer| self.request_block(peer, cid))
             .collect();
+        // `request_block` a déjà vérifié le CID : la première réponse OK est bonne.
         while let Some(result) = inflight.next().await {
-            if let Ok(bytes) = result {
-                if verify(&cid, &bytes) {
+            match result {
+                Ok(bytes) => {
                     self.blockstore.put(&bytes)?;
                     // seed-what-you-consume : devient fournisseur (best-effort).
                     let _ = self.provide(cid).await;
                     return Ok(bytes);
                 }
+                Err(e) => tracing::debug!("fournisseur rejeté pour {cid}: {e}"),
             }
         }
         Err(CoreError::BlockNotFound(cid.to_string()))
     }
 
-    /// Demande un bloc précis à un pair précis.
+    /// Demande un bloc précis à un pair précis. Les octets reçus sont **vérifiés
+    /// contre le CID** avant d'être renvoyés : un pair ne peut pas faire passer un
+    /// contenu arbitraire (tout appelant, pas seulement `get`, est protégé).
     pub async fn request_block(&self, peer: PeerId, cid: Cid) -> CoreResult<Vec<u8>> {
         let (tx, rx) = oneshot::channel();
         self.send(Command::RequestBlock { peer, cid, tx }).await?;
-        rx.await.map_err(|_| CoreError::Shutdown)?
+        let bytes = rx.await.map_err(|_| CoreError::Shutdown)??;
+        if !verify(&cid, &bytes) {
+            return Err(CoreError::IntegrityMismatch);
+        }
+        Ok(bytes)
     }
 
     async fn send(&self, cmd: Command) -> CoreResult<()> {
@@ -539,11 +634,12 @@ fn build_swarm(keypair: Keypair) -> CoreResult<Swarm<Behaviour>> {
 struct EventLoop {
     swarm: Swarm<Behaviour>,
     blockstore: Blockstore,
-    moderation: Arc<Moderation>,
+    moderation: Arc<RwLock<Moderation>>,
     catalog: Arc<Mutex<Catalog>>,
     feeds_topic: gossipsub::IdentTopic,
     cmd_rx: mpsc::Receiver<Command>,
-    pending_listen: VecDeque<oneshot::Sender<CoreResult<Multiaddr>>>,
+    pending_listen:
+        HashMap<libp2p::core::transport::ListenerId, oneshot::Sender<CoreResult<Multiaddr>>>,
     pending_provide: HashMap<QueryId, oneshot::Sender<CoreResult<()>>>,
     pending_get_providers: HashMap<QueryId, (oneshot::Sender<HashSet<PeerId>>, HashSet<PeerId>)>,
     pending_request: HashMap<OutboundRequestId, oneshot::Sender<CoreResult<Vec<u8>>>>,
@@ -558,7 +654,7 @@ impl EventLoop {
     fn new(
         swarm: Swarm<Behaviour>,
         blockstore: Blockstore,
-        moderation: Arc<Moderation>,
+        moderation: Arc<RwLock<Moderation>>,
         catalog: Arc<Mutex<Catalog>>,
         feeds_topic: gossipsub::IdentTopic,
         cmd_rx: mpsc::Receiver<Command>,
@@ -570,7 +666,7 @@ impl EventLoop {
             catalog,
             feeds_topic,
             cmd_rx,
-            pending_listen: VecDeque::new(),
+            pending_listen: HashMap::new(),
             pending_provide: HashMap::new(),
             pending_get_providers: HashMap::new(),
             pending_request: HashMap::new(),
@@ -594,7 +690,12 @@ impl EventLoop {
     fn handle_command(&mut self, cmd: Command) {
         match cmd {
             Command::Listen { addr, tx } => match self.swarm.listen_on(addr) {
-                Ok(_) => self.pending_listen.push_back(tx),
+                // Corréler par ListenerId : un `listen_on` sur 0.0.0.0 émet
+                // plusieurs NewListenAddr (une par interface) et deux `listen`
+                // concurrents ne doivent pas croiser leurs réponses.
+                Ok(listener_id) => {
+                    self.pending_listen.insert(listener_id, tx);
+                }
                 Err(e) => {
                     let _ = tx.send(Err(CoreError::Network(e.to_string())));
                 }
@@ -676,8 +777,13 @@ impl EventLoop {
 
     fn handle_event(&mut self, event: SwarmEvent<BehaviourEvent>) {
         match event {
-            SwarmEvent::NewListenAddr { address, .. } => {
-                if let Some(tx) = self.pending_listen.pop_front() {
+            SwarmEvent::NewListenAddr {
+                listener_id,
+                address,
+            } => {
+                // Répond au premier NewListenAddr de ce listener (les suivants,
+                // autres interfaces, n'ont plus d'attente à satisfaire).
+                if let Some(tx) = self.pending_listen.remove(&listener_id) {
                     let _ = tx.send(Ok(address));
                 }
             }
@@ -827,8 +933,9 @@ impl EventLoop {
                 request, channel, ..
             } => {
                 // CHECKPOINT MODÉRATION : ne jamais servir un contenu matché.
+                let blocked = self.moderation.read().expect("moderation lock");
                 let data = Cid::try_from(request.0.as_slice()).ok().and_then(|cid| {
-                    if self.moderation.is_blocked(&cid) {
+                    if blocked.is_blocked(&cid) {
                         None
                     } else {
                         self.blockstore.get(&cid).ok()
