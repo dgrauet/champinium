@@ -98,9 +98,8 @@ public sealed class NodeViewModel : INotifyPropertyChanged
         {
             Directory.Delete(PlayRoot, recursive: true);
         }
-        catch (IOException) { }
+        catch (IOException) { } // couvre aussi DirectoryNotFoundException
         catch (UnauthorizedAccessException) { }
-        catch (DirectoryNotFoundException) { }
 
         try
         {
