@@ -130,10 +130,16 @@ Kademlia (provider records), identify, ping et un protocole request-response
   `ingest <fichier>` / `fetch-hls <manifest> --peer … --out …`.
 - **Reste** : feed records dans la DHT (PUT/GET), IPNS durable (différé).
 
-**Phase 3 — en cours.** **Contrat UniFFI étendu v0 → v1** : objet `ChampiniumNode`
+**Phase 3 — en cours.** **Contrat UniFFI v3** : objet `ChampiniumNode`
 (`open_node`, `listen`, `connect`, `catalog`, `ingest_file`, `publish_feed`,
-`fetch_hls` — async sauf `peer_id`/`catalog`), record `FfiCatalogEntry`, erreur
-`FfiError`. Bindings Swift **et** C# générés et vérifiés pour toute la surface.
+`fetch_hls`, `subscribe_denylist`, `set_catalog_listener` — async sauf
+`peer_id`/`catalog`), record `FfiCatalogEntry`, erreur **`FfiError` typée**
+(`Moderated`/`Network`/`NotFound`/`InvalidInput`/`Internal` — les fronts
+branchent une UX par catégorie), callback interface **`CatalogListener`**
+(`on_catalog_updated`) : le noyau notifie chaque changement effectif du
+catalogue, les fronts rafraîchissent réactivement (plus de délai gossip codé en
+dur — le risque #1, async/callbacks via FFI, est éprouvé vers Swift ET C#).
+Bindings Swift **et** C# générés et vérifiés pour toute la surface.
 **UI macOS (SwiftUI) ✔ (compile)** : `apps/macos` consomme l'XCFramework + le
 wrapper généré (`just macos-prepare`) ; `ContentView` fait openNode → listen →
 connect → catalogue → `fetchHls` → lecture **AVPlayer**. `swift build` OK
@@ -141,10 +147,11 @@ connect → catalogue → `fetchHls` → lecture **AVPlayer**. `swift build` OK
 Voir [`AGENTS.md`](AGENTS.md) pour le tableau du contrat.
 
 **Phase 4 — en cours.**
-- **Front Linux GTK4 (feature `gui`)** : `apps/linux` consomme le crate ; UI =
-  ouverture nœud → listen → connect → catalogue → lecture **GStreamer**
-  (`playbin`), pont tokio ↔ thread GTK. Gatée par `gui` pour garder le workspace
-  vert sans GTK. Compilation `--features gui` non vérifiée en dev macOS.
+- **Front Linux GTK4 ✔ (feature `gui`)** : `apps/linux` consomme le crate ; UI =
+  ouverture nœud → listen → connect → catalogue (refresh **réactif** via
+  `subscribe_catalog`, en-tête « créateur X — seq N » par émetteur) → lecture
+  **GStreamer** (`playbin`), pont tokio ↔ thread GTK. Gatée par `gui` pour garder
+  le workspace vert sans GTK. Compilation vérifiée par le job CI `linux-gui`.
 - **Relay NAT ✔** : circuit relay v2 + DCUtR côté client dans le noyau
   (`with_relay_client`), serveur de relais stateless `relay::start_relay` (qui
   déclare son adresse externe via `add_external_address` — sinon les réservations
@@ -165,10 +172,23 @@ Voir [`AGENTS.md`](AGENTS.md) pour le tableau du contrat.
   parallèle** (première réponse valide gagne) et **réannonce** le bloc consommé
   (le consommateur devient fournisseur → réplication). Testé :
   `consumer_reseeds_to_other_peers`.
-- **Front Windows ✔ (code)** : `apps/windows` WinUI 3 / C# (catalogue +
-  MediaPlayerElement) contre les bindings UniFFI C#. Compilation à valider sur un
-  runner .NET Windows (non buildable en dev macOS).
-- **libp2p 0.56 ✔** : socle réseau remonté à la version courante (38 tests verts).
+- **Front Windows ✔** : `apps/windows` WinUI 3 / C# (catalogue +
+  MediaPlayerElement) contre les bindings UniFFI C#. Compilation vérifiée par le
+  job CI `windows-app` (runner .NET Windows — non buildable en dev macOS).
+- **libp2p 0.56 ✔** : socle réseau remonté à la version courante.
+- **Peer scoring gossipsub ✔** : validation applicative des feeds
+  (`validate_messages` — Accept/Ignore/Reject rapportés par la boucle
+  d'évènements) + scoring : un pair qui inonde le topic de feeds invalides voit
+  son score chuter, n'est plus relayé puis est graylisté. Complète la borne du
+  catalogue (1024 émetteurs, refus-quand-plein) posée au durcissement.
+  `Node::gossip_peer_score` pour l'observabilité. Testé (score négatif observé +
+  régression : un feed valide traverse toujours un saut de relais gossip).
+- **Durcissement post-audit ✔** : écriture atomique du blockstore (réparation
+  des blocs corrompus + re-fetch réseau), catalogue borné anti-DoS, plafonds de
+  tailles réseau, souscription de denylist à chaud avec purge rétroactive
+  (`subscribe_denylist`), clé privée en 0600, `paths::default_data_dir()` durable
+  par OS, signatures par champs préfixés par longueur (anti-malléabilité),
+  nettoyage des répertoires de lecture temporaires dans les 3 fronts.
 - **bitswap — bloqué en amont (différé)** : l'implémentation maintenue (beetswap)
   cible libp2p 0.56 (d'où l'upgrade) mais sa dépendance transitive `core2` est
   **entièrement yankée et sans source git** → graphe non résoluble actuellement.
@@ -178,6 +198,12 @@ Voir [`AGENTS.md`](AGENTS.md) pour le tableau du contrat.
   `request-response` en attendant.
 
 Phasing : 0 (spike async FFI ✔ contrat) → **1 (P2P nu CLI ✔)** → **2 (modération ✔,
-feeds/gossipsub/catalogue ✔, ingestion ffmpeg ✔)** → **3 (contrat UniFFI v1 ✔,
-UI macOS compile ✔)** → 4 (Linux GTK4 ✔, relay NAT ✔, seeding ✔, **Windows ✔ code**,
-feed DHT ✔, fetch concurrent ✔ ; bitswap différé). Voir le spec.
+feeds/gossipsub/catalogue ✔, ingestion ffmpeg ✔)** → **3 (contrat UniFFI v3 ✔ —
+erreurs typées + événements catalogue, UI macOS compile ✔)** → 4 (Linux GTK4 ✔,
+relay NAT ✔, seeding ✔, Windows ✔, feed DHT ✔, fetch concurrent ✔, peer scoring ✔,
+durcissement audit ✔ ; bitswap différé). Voir le spec.
+
+**Dernière release : v0.2.0** (release-please, `bump-minor-pre-major` actif :
+un breaking change bumpe la mineure tant qu'on est < 1.0.0 — la 1.0 sera un
+choix délibéré de stabilisation d'API). Versionnement du contrat FFI distinct :
+`CONTRACT_VERSION = 3` (voir `AGENTS.md`).
