@@ -20,10 +20,17 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
   capacité absente, ils **ouvrent une demande de changement de contrat** (voir
   protocole plus bas) — ils ne contournent pas via du code natif ad hoc.
 
-### Contrat actuel — v2 (`CONTRACT_VERSION = 2`)
+### Contrat actuel — v3 (`CONTRACT_VERSION = 3`)
 
 > v1 → v2 : ajout de `subscribe_denylist(json) -> u64` sur `ChampiniumNode`
 > (modération fédérée activable depuis les fronts). Purement additif.
+>
+> v2 → v3 : **`FfiError` typé** (variantes `Moderated`, `Network`, `NotFound`,
+> `InvalidInput`, `Internal` — les fronts branchent une UX par catégorie ;
+> rupture : l'erreur n'est plus une chaîne aplatie) + **callback interface
+> `CatalogListener`** (`on_catalog_updated()`) enregistrée via
+> `set_catalog_listener(listener)` (async) — remplace le délai gossip codé en
+> dur dans les fronts par un rafraîchissement réactif du catalogue.
 
 
 Fonctions libres (smoke test async, conservées de v0) :
@@ -47,8 +54,12 @@ Objet **`ChampiniumNode`** (méthodes) :
 | `publish_feed(cids) -> ()` | **async** | publie un feed signé |
 | `fetch_hls(manifest_cid, out_dir) -> String` | **async** | reconstruit un HLS jouable, renvoie le playlist |
 | `subscribe_denylist(json) -> u64` | **async** | souscrit une denylist signée, renvoie le nb de blocs purgés |
+| `set_catalog_listener(listener) -> ()` | **async** | enregistre un `CatalogListener` (rafraîchissement réactif) |
 
-Record `FfiCatalogEntry { issuer, seq, cids }`. Erreur `FfiError` (message aplati).
+Record `FfiCatalogEntry { issuer, seq, cids }`. Erreur **`FfiError` typée**
+(`Moderated` / `Network` / `NotFound` / `InvalidInput` / `Internal`, chacune avec
+`msg`). Callback interface **`CatalogListener`** : `on_catalog_updated()` —
+rappelé hors du thread UI, le front re-dispatche puis relit `catalog()`.
 Validé : bindings Swift **et** C# générés pour toute cette surface (objet + async).
 
 ## Mapping périmètre d'agent → répertoires du repo

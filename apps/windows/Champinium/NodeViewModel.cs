@@ -28,7 +28,22 @@ public sealed class CatalogCid
 /// </summary>
 public sealed class NodeViewModel : INotifyPropertyChanged
 {
+    /// <summary>
+    /// Pont vers le callback du contrat : le noyau rappelle hors du thread UI ;
+    /// on re-dispatche vers le thread principal, où le VM relit le catalogue.
+    /// </summary>
+    private sealed class CatalogRefresher : CatalogListener
+    {
+        private readonly Action _onUpdate;
+
+        public CatalogRefresher(Action onUpdate) => _onUpdate = onUpdate;
+
+        public void OnCatalogUpdated() => _onUpdate();
+    }
+
     private ChampiniumNode? _node;
+    private Microsoft.UI.Dispatching.DispatcherQueue? _dispatcher;
+    private CatalogRefresher? _listener;
 
     private string _status = "démarrage…";
     public string Status
@@ -85,6 +100,15 @@ public sealed class NodeViewModel : INotifyPropertyChanged
             _node = node;
             PeerId = node.PeerId();
             ListenAddr = await node.Listen("/ip4/0.0.0.0/tcp/0");
+
+            // Rafraîchissement réactif : le noyau notifie chaque changement du
+            // catalogue (plus de délai gossip codé en dur). StartAsync est
+            // appelé depuis le thread UI, dont on capture le dispatcher ici.
+            _dispatcher = Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread();
+            _listener = new CatalogRefresher(
+                () => _dispatcher?.TryEnqueue(RefreshCatalog));
+            await node.SetCatalogListener(_listener);
+
             Status = "nœud en ligne";
         }
         catch (Exception ex)
@@ -93,7 +117,10 @@ public sealed class NodeViewModel : INotifyPropertyChanged
         }
     }
 
-    /// <summary>Se connecte au pair saisi, puis rafraîchit le catalogue.</summary>
+    /// <summary>
+    /// Se connecte au pair saisi ; le catalogue se rafraîchit tout seul quand
+    /// les feeds arrivent (voir <see cref="CatalogRefresher"/>).
+    /// </summary>
     public async Task ConnectAsync()
     {
         if (_node is null || string.IsNullOrWhiteSpace(PeerField))
@@ -105,9 +132,6 @@ public sealed class NodeViewModel : INotifyPropertyChanged
         {
             await _node.Connect(PeerField);
             Status = "connecté à un pair";
-            // Laisse au gossip le temps de propager les feeds avant de relire.
-            await Task.Delay(2000);
-            RefreshCatalog();
         }
         catch (Exception ex)
         {
@@ -156,6 +180,12 @@ public sealed class NodeViewModel : INotifyPropertyChanged
             var playlist = await _node.FetchHls(manifestCid, outDir);
             Status = "lecture en cours";
             PlaybackReady?.Invoke(playlist);
+        }
+        // Erreur typée du contrat : un refus de modération est un blocage
+        // volontaire, présenté comme tel (pas comme une panne technique).
+        catch (FfiException.Moderated)
+        {
+            Status = "contenu bloqué par la modération";
         }
         catch (Exception ex)
         {

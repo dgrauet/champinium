@@ -181,6 +181,7 @@ pub struct Node {
     blockstore: Blockstore,
     moderation: Arc<RwLock<Moderation>>,
     catalog: Arc<Mutex<Catalog>>,
+    catalog_events: tokio::sync::broadcast::Sender<()>,
     feed_seq: Arc<Mutex<u64>>,
     cmd_tx: mpsc::Sender<Command>,
 }
@@ -233,12 +234,17 @@ impl Node {
 
         let moderation = Arc::new(RwLock::new(moderation));
         let catalog = Arc::new(Mutex::new(Catalog::new()));
+        // Canal d'événements « catalogue mis à jour » : capacité large car un
+        // abonné lent ne doit pas perdre le signal (les tics sont fusionnables :
+        // rater un tic mais en recevoir un plus tard suffit à se resynchroniser).
+        let (catalog_events, _) = tokio::sync::broadcast::channel(64);
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let event_loop = EventLoop::new(
             swarm,
             blockstore.clone(),
             moderation.clone(),
             catalog.clone(),
+            catalog_events.clone(),
             topic,
             cmd_rx,
         );
@@ -254,9 +260,18 @@ impl Node {
             blockstore,
             moderation,
             catalog,
+            catalog_events,
             feed_seq,
             cmd_tx,
         })
+    }
+
+    /// S'abonne aux mises à jour du catalogue : un tic est émis à chaque
+    /// changement effectif (feed gossip appliqué, publication locale, feed DHT).
+    /// Les tics sont fusionnables : un abonné qui prend du retard peut en
+    /// manquer, un tic ultérieur suffit à relire l'instantané (`catalog_entries`).
+    pub fn subscribe_catalog(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.catalog_events.subscribe()
     }
 
     /// `PeerId` du nœud.
@@ -352,10 +367,14 @@ impl Node {
         };
         let feed = Feed::build_signed(&self.keypair, seq, cids)?;
         // Le créateur figure dans son propre catalogue.
-        self.catalog
+        let changed = self
+            .catalog
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .apply(feed.clone())?;
+        if changed {
+            let _ = self.catalog_events.send(());
+        }
         let data = feed.to_json()?.into_bytes();
         // PUT du feed dans la DHT (best-effort) : permet la découverte hors gossip.
         let (put_tx, _put_rx) = oneshot::channel();
@@ -398,11 +417,14 @@ impl Node {
             }
         }
         if let Some(feed) = &best {
-            let _ = self
+            let changed = self
                 .catalog
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .apply(feed.clone());
+            if changed.unwrap_or(false) {
+                let _ = self.catalog_events.send(());
+            }
         }
         Ok(best)
     }
@@ -663,6 +685,7 @@ struct EventLoop {
     blockstore: Blockstore,
     moderation: Arc<RwLock<Moderation>>,
     catalog: Arc<Mutex<Catalog>>,
+    catalog_events: tokio::sync::broadcast::Sender<()>,
     feeds_topic: gossipsub::IdentTopic,
     cmd_rx: mpsc::Receiver<Command>,
     pending_listen:
@@ -683,6 +706,7 @@ impl EventLoop {
         blockstore: Blockstore,
         moderation: Arc<RwLock<Moderation>>,
         catalog: Arc<Mutex<Catalog>>,
+        catalog_events: tokio::sync::broadcast::Sender<()>,
         feeds_topic: gossipsub::IdentTopic,
         cmd_rx: mpsc::Receiver<Command>,
     ) -> Self {
@@ -691,6 +715,7 @@ impl EventLoop {
             blockstore,
             moderation,
             catalog,
+            catalog_events,
             feeds_topic,
             cmd_rx,
             pending_listen: HashMap::new(),
@@ -897,13 +922,17 @@ impl EventLoop {
     fn handle_feed_message(&self, data: &[u8]) {
         match Feed::from_json(data) {
             Ok(feed) => {
-                if let Err(e) = self
+                match self
                     .catalog
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .apply(feed)
                 {
-                    tracing::debug!("feed rejeté: {e}");
+                    Ok(true) => {
+                        let _ = self.catalog_events.send(());
+                    }
+                    Ok(false) => {}
+                    Err(e) => tracing::debug!("feed rejeté: {e}"),
                 }
             }
             Err(e) => tracing::debug!("feed illisible: {e}"),
