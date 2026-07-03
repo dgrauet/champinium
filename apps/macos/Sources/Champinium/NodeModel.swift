@@ -30,10 +30,18 @@ final class NodeModel: ObservableObject {
 
     private var node: ChampiniumNode?
     private var listener: CatalogListener?
+    /// Répertoire de la lecture en cours (supprimé au changement de contenu).
+    private var currentPlayDir: String?
+
+    /// Racine des répertoires de lecture temporaires.
+    private var playRoot: String { NSTemporaryDirectory() + "champinium-play" }
 
     /// Ouvre le nœud, commence à écouter et s'abonne aux mises à jour du
     /// catalogue (rafraîchissement réactif, pas de délai gossip codé en dur).
     func start() async {
+        // Purge les répertoires de lecture des exécutions précédentes (ils ne
+        // servent qu'à la session en cours et s'accumuleraient sinon).
+        try? FileManager.default.removeItem(atPath: playRoot)
         do {
             // Répertoire durable par OS (jamais le tmp : sinon perte du PeerId
             // et régression du seq de feed au nettoyage du système).
@@ -71,12 +79,20 @@ final class NodeModel: ObservableObject {
         status = "catalogue: \(entries.count) créateur(s)"
     }
 
-    /// Récupère et lit un contenu (manifeste HLS) via AVPlayer.
+    /// Récupère et lit un contenu (manifeste HLS) via AVPlayer. Le répertoire
+    /// de la lecture précédente est supprimé au passage (pas d'accumulation).
     func play(manifestCid: String) async {
         guard let node else { return }
+        if let previous = currentPlayDir {
+            player?.pause()
+            player = nil
+            try? FileManager.default.removeItem(atPath: previous)
+            currentPlayDir = nil
+        }
         do {
-            let out = NSTemporaryDirectory() + "champinium-play/" + UUID().uuidString
+            let out = playRoot + "/" + UUID().uuidString
             let playlist = try await node.fetchHls(manifestCid: manifestCid, outDir: out)
+            self.currentPlayDir = out
             let player = AVPlayer(url: URL(fileURLWithPath: playlist))
             self.player = player
             player.play()

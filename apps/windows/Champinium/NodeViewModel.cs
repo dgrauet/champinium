@@ -45,6 +45,12 @@ public sealed class NodeViewModel : INotifyPropertyChanged
     private Microsoft.UI.Dispatching.DispatcherQueue? _dispatcher;
     private CatalogRefresher? _listener;
 
+    /// <summary>Répertoire de la lecture en cours (supprimé au changement de contenu).</summary>
+    private string? _currentPlayDir;
+
+    /// <summary>Racine des répertoires de lecture temporaires.</summary>
+    private static string PlayRoot => Path.Combine(Path.GetTempPath(), "champinium-play");
+
     private string _status = "démarrage…";
     public string Status
     {
@@ -86,6 +92,15 @@ public sealed class NodeViewModel : INotifyPropertyChanged
     /// <summary>Ouvre le nœud sous le répertoire de données durable de l'OS et commence à écouter.</summary>
     public async Task StartAsync()
     {
+        // Purge (best-effort) les répertoires de lecture des exécutions
+        // précédentes : ils ne servent qu'à la session en cours.
+        try
+        {
+            Directory.Delete(PlayRoot, recursive: true);
+        }
+        catch (IOException) { } // couvre aussi DirectoryNotFoundException
+        catch (UnauthorizedAccessException) { }
+
         try
         {
             // Répertoire durable choisi par le noyau (%LocalAppData%\Champinium
@@ -171,13 +186,27 @@ public sealed class NodeViewModel : INotifyPropertyChanged
             return;
         }
 
+        // Supprime (best-effort) le répertoire de la lecture précédente : le
+        // lecteur peut encore verrouiller un segment ; le reliquat éventuel est
+        // repris par la purge du prochain démarrage.
+        if (_currentPlayDir is not null)
+        {
+            try
+            {
+                Directory.Delete(_currentPlayDir, recursive: true);
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            _currentPlayDir = null;
+        }
+
         try
         {
-            var outDir = Path.Combine(
-                Path.GetTempPath(), "champinium-play", Guid.NewGuid().ToString());
+            var outDir = Path.Combine(PlayRoot, Guid.NewGuid().ToString());
             Directory.CreateDirectory(outDir);
 
             var playlist = await _node.FetchHls(manifestCid, outDir);
+            _currentPlayDir = outDir;
             Status = "lecture en cours";
             PlaybackReady?.Invoke(playlist);
         }
