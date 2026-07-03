@@ -106,16 +106,32 @@ impl Behaviour {
             [(StreamProtocol::new(BLOCK_PROTOCOL), ProtocolSupport::Full)],
             request_response::Config::default(),
         );
-        // Feeds signés diffusés en gossipsub. Messages signés par l'identité libp2p.
+        // Feeds signés diffusés en gossipsub. Messages signés par l'identité
+        // libp2p. `validate_messages` : un message n'est RELAYÉ qu'après que la
+        // couche applicative a rapporté son verdict (feed vérifié) — voir
+        // `EventLoop::handle_feed_message` ; sans rapport, plus rien ne circule.
         let gossipsub_cfg = gossipsub::ConfigBuilder::default()
             .max_transmit_size(MAX_FEED_SIZE)
+            .validate_messages()
             .build()
             .expect("config gossipsub valide");
-        let gossipsub = gossipsub::Behaviour::new(
+        let mut gossipsub = gossipsub::Behaviour::new(
             gossipsub::MessageAuthenticity::Signed(key.clone()),
             gossipsub_cfg,
         )
         .expect("config gossipsub valide");
+        // Peer scoring : chaque feed invalide rapporté (Reject) dégrade le score
+        // de son émetteur ; sous les seuils par défaut, ses messages ne sont
+        // plus relayés puis le pair est graylisté. C'est la brique de
+        // réputation contre l'inondation du catalogue par des clés jetables.
+        let mut score_params = gossipsub::PeerScoreParams::default();
+        score_params.topics.insert(
+            gossipsub::IdentTopic::new(FEEDS_TOPIC).hash(),
+            gossipsub::TopicScoreParams::default(),
+        );
+        gossipsub
+            .with_peer_score(score_params, gossipsub::PeerScoreThresholds::default())
+            .expect("paramètres de scoring valides");
         Self {
             kademlia,
             identify,
@@ -170,6 +186,10 @@ enum Command {
     GetRecord {
         key: RecordKey,
         tx: oneshot::Sender<Vec<Vec<u8>>>,
+    },
+    PeerScore {
+        peer: PeerId,
+        tx: oneshot::Sender<Option<f64>>,
     },
 }
 
@@ -264,6 +284,15 @@ impl Node {
             feed_seq,
             cmd_tx,
         })
+    }
+
+    /// Score gossipsub d'un pair (réputation ; `None` si le pair est inconnu
+    /// de la couche gossip). Diagnostic/observabilité — les seuils d'application
+    /// (arrêt du relais, graylist) sont gérés par gossipsub lui-même.
+    pub async fn gossip_peer_score(&self, peer: PeerId) -> CoreResult<Option<f64>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Command::PeerScore { peer, tx }).await?;
+        rx.await.map_err(|_| CoreError::Shutdown)
     }
 
     /// S'abonne aux mises à jour du catalogue : un tic est émis à chaque
@@ -824,6 +853,9 @@ impl EventLoop {
                 let qid = self.swarm.behaviour_mut().kademlia.get_record(key);
                 self.pending_get_record.insert(qid, (tx, Vec::new()));
             }
+            Command::PeerScore { peer, tx } => {
+                let _ = tx.send(self.swarm.behaviour().gossipsub.peer_score(&peer));
+            }
         }
     }
 
@@ -874,9 +906,10 @@ impl EventLoop {
                 }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                propagation_source,
+                message_id,
                 message,
-                ..
-            })) => self.handle_feed_message(&message.data),
+            })) => self.handle_feed_message(&message_id, &propagation_source, &message.data),
             _ => {}
         }
     }
@@ -918,9 +951,20 @@ impl EventLoop {
     }
 
     /// Applique un feed reçu en gossipsub au catalogue local (signature vérifiée
-    /// dans `Catalog::apply`). Les feeds invalides sont ignorés silencieusement.
-    fn handle_feed_message(&self, data: &[u8]) {
-        match Feed::from_json(data) {
+    /// dans `Catalog::apply`) puis rapporte le verdict à gossipsub
+    /// (`validate_messages` est actif : sans rapport, rien n'est relayé) :
+    /// - feed appliqué → **Accept** (relayé) ;
+    /// - feed valide mais sans effet (seq déjà vu, catalogue plein) → **Ignore**
+    ///   (pas relayé, pas pénalisé : c'est du retard, pas de la malveillance) ;
+    /// - illisible ou signature invalide → **Reject** (pénalise l'émetteur via
+    ///   le peer scoring).
+    fn handle_feed_message(
+        &mut self,
+        message_id: &gossipsub::MessageId,
+        propagation_source: &PeerId,
+        data: &[u8],
+    ) {
+        let acceptance = match Feed::from_json(data) {
             Ok(feed) => {
                 match self
                     .catalog
@@ -930,13 +974,24 @@ impl EventLoop {
                 {
                     Ok(true) => {
                         let _ = self.catalog_events.send(());
+                        gossipsub::MessageAcceptance::Accept
                     }
-                    Ok(false) => {}
-                    Err(e) => tracing::debug!("feed rejeté: {e}"),
+                    Ok(false) => gossipsub::MessageAcceptance::Ignore,
+                    Err(e) => {
+                        tracing::debug!("feed rejeté: {e}");
+                        gossipsub::MessageAcceptance::Reject
+                    }
                 }
             }
-            Err(e) => tracing::debug!("feed illisible: {e}"),
-        }
+            Err(e) => {
+                tracing::debug!("feed illisible: {e}");
+                gossipsub::MessageAcceptance::Reject
+            }
+        };
+        self.swarm
+            .behaviour_mut()
+            .gossipsub
+            .report_message_validation_result(message_id, propagation_source, acceptance);
     }
 
     fn handle_kad_result(&mut self, id: QueryId, result: QueryResult, last: bool) {
@@ -1036,6 +1091,93 @@ mod tests {
     async fn spawn_node(dir: &Path, name: &str) -> Node {
         let bs = Blockstore::open(dir.join(name)).unwrap();
         Node::new(Keypair::generate_ed25519(), bs).await.unwrap()
+    }
+
+    /// Un pair qui publie des feeds invalides sur le topic gossipsub doit voir
+    /// son score chuter (peer scoring) : c'est la base de la réputation qui
+    /// finit par graylister les inondeurs de feeds signés par des clés jetables.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn peer_publishing_invalid_feeds_gets_negative_gossip_score() {
+        let dir = tempfile::tempdir().unwrap();
+        let honest = spawn_node(dir.path(), "honest").await;
+        let malicious = spawn_node(dir.path(), "malicious").await;
+
+        let addr = honest
+            .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        malicious
+            .add_address(honest.peer_id(), addr.clone())
+            .await
+            .unwrap();
+        malicious.dial(addr).await.unwrap();
+
+        // Le malveillant inonde le topic d'octets qui ne sont pas des feeds.
+        // Chaque message rejeté par la validation applicative doit dégrader son
+        // score chez le pair honnête.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut i: u64 = 0;
+            loop {
+                i += 1;
+                let (tx, rx) = oneshot::channel();
+                malicious
+                    .cmd_tx
+                    .send(Command::PublishFeed {
+                        data: format!("pas un feed {i}").into_bytes(),
+                        tx,
+                    })
+                    .await
+                    .unwrap();
+                let _ = rx.await;
+                if honest
+                    .gossip_peer_score(malicious.peer_id())
+                    .await
+                    .unwrap()
+                    .is_some_and(|s| s < 0.0)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+        .await
+        .expect("le score du pair malveillant doit devenir négatif");
+    }
+
+    /// Régression : avec la validation applicative activée (les messages ne
+    /// sont plus relayés automatiquement), un feed VALIDE doit toujours être
+    /// relayé de proche en proche — A n'est pas connecté à C, seul B peut
+    /// transmettre, ce qu'il ne fait que s'il rapporte l'acceptation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn valid_feed_is_forwarded_across_a_relay_hop() {
+        let dir = tempfile::tempdir().unwrap();
+        let node_a = spawn_node(dir.path(), "fa").await;
+        let node_b = spawn_node(dir.path(), "fb").await;
+        let node_c = spawn_node(dir.path(), "fc").await;
+
+        let addr_b = node_b
+            .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        for node in [&node_a, &node_c] {
+            node.add_address(node_b.peer_id(), addr_b.clone())
+                .await
+                .unwrap();
+            node.dial(addr_b.clone()).await.unwrap();
+        }
+
+        let cid = cid_for(b"contenu relaye");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                node_a.publish_feed(&[cid]).await.unwrap();
+                if node_c.catalog_cids().contains(&cid) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+        .await
+        .expect("un feed valide doit traverser le saut de relais gossip");
     }
 
     /// Un tiers ne doit pas pouvoir écraser le record DHT du feed d'un créateur
