@@ -20,27 +20,48 @@ pub struct CatalogEntry {
     pub cids: Vec<Cid>,
 }
 
+/// Borne par défaut du nombre d'émetteurs retenus (anti-DoS : sans borne, des
+/// feeds signés par des clés jetables feraient croître la mémoire sans limite).
+pub const DEFAULT_MAX_ISSUERS: usize = 1024;
+
 /// Catalogue : dernier feed connu par émetteur.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Catalog {
     feeds: HashMap<PeerId, Feed>,
+    max_issuers: usize,
+}
+
+impl Default for Catalog {
+    fn default() -> Self {
+        Self::with_max_issuers(DEFAULT_MAX_ISSUERS)
+    }
 }
 
 impl Catalog {
-    /// Crée un catalogue vide.
+    /// Crée un catalogue vide, borné à [`DEFAULT_MAX_ISSUERS`] émetteurs.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Crée un catalogue vide borné à `max` émetteurs.
+    pub fn with_max_issuers(max: usize) -> Self {
+        Self {
+            feeds: HashMap::new(),
+            max_issuers: max,
+        }
+    }
+
     /// Applique un feed reçu : **vérifie la signature**, puis le retient s'il est
     /// plus récent (seq strictement supérieur) que celui déjà connu pour cet
-    /// émetteur. Renvoie `true` si le catalogue a changé.
+    /// émetteur. Un émetteur inconnu est refusé si le catalogue est plein
+    /// (borne anti-DoS ; pas d'éviction, sinon des clés jetables pourraient
+    /// chasser les feeds légitimes). Renvoie `true` si le catalogue a changé.
     pub fn apply(&mut self, feed: Feed) -> CoreResult<bool> {
         feed.verify()?;
         let issuer = feed.issuer_peer_id()?;
         let newer = match self.feeds.get(&issuer) {
             Some(existing) => feed.seq > existing.seq,
-            None => true,
+            None => self.feeds.len() < self.max_issuers,
         };
         if newer {
             self.feeds.insert(issuer, feed);
@@ -113,6 +134,34 @@ mod tests {
         b.apply(v1).unwrap();
 
         assert_eq!(a.all_cids(), b.all_cids());
+    }
+
+    #[test]
+    fn bounded_rejects_new_issuers_when_full() {
+        let mut cat = Catalog::with_max_issuers(2);
+        let k1 = Keypair::generate_ed25519();
+        let k2 = Keypair::generate_ed25519();
+        let k3 = Keypair::generate_ed25519();
+
+        assert!(cat
+            .apply(Feed::build_signed(&k1, 1, &[cid_for(b"a")]).unwrap())
+            .unwrap());
+        assert!(cat
+            .apply(Feed::build_signed(&k2, 1, &[cid_for(b"b")]).unwrap())
+            .unwrap());
+
+        // Plein : un émetteur inconnu est refusé (pas d'éviction, sinon un
+        // attaquant pourrait chasser les feeds légitimes).
+        assert!(!cat
+            .apply(Feed::build_signed(&k3, 1, &[cid_for(b"c")]).unwrap())
+            .unwrap());
+        assert_eq!(cat.issuer_count(), 2);
+
+        // ... mais un émetteur déjà connu peut toujours se mettre à jour.
+        assert!(cat
+            .apply(Feed::build_signed(&k1, 2, &[cid_for(b"d")]).unwrap())
+            .unwrap());
+        assert_eq!(cat.issuer_count(), 2);
     }
 
     #[test]

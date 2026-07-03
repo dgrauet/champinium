@@ -18,7 +18,9 @@ final class NodeModel: ObservableObject {
     /// Ouvre le nœud et commence à écouter.
     func start() async {
         do {
-            let dir = NSTemporaryDirectory() + "champinium-macos-node"
+            // Répertoire durable par OS (jamais le tmp : sinon perte du PeerId
+            // et régression du seq de feed au nettoyage du système).
+            let dir = defaultDataDir()
             let node = try await openNode(dataDir: dir)
             self.node = node
             self.peerId = node.peerId()

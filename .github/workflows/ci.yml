@@ -97,3 +97,22 @@ jobs:
         run: just gen-csharp
       - name: Build macOS app (XCFramework + swift build)
         run: just macos-build
+
+  windows-app:
+    name: Windows front (WinUI 3 / C#)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Install just
+        run: cargo install just
+      - name: Install uniffi-bindgen-cs (matches uniffi 0.28.3)
+        run: cargo install uniffi-bindgen-cs --git https://github.com/NordSecurity/uniffi-bindgen-cs --tag v0.9.2+v0.28.3
+      - name: Build core + generate C# bindings
+        run: just gen-csharp
+      - name: Build Windows app (dotnet build)
+        run: dotnet build apps/windows/Champinium.sln -c Release -p:Platform=x64

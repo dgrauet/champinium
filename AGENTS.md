@@ -20,7 +20,11 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
   capacité absente, ils **ouvrent une demande de changement de contrat** (voir
   protocole plus bas) — ils ne contournent pas via du code natif ad hoc.
 
-### Contrat actuel — v1 (`CONTRACT_VERSION = 1`)
+### Contrat actuel — v2 (`CONTRACT_VERSION = 2`)
+
+> v1 → v2 : ajout de `subscribe_denylist(json) -> u64` sur `ChampiniumNode`
+> (modération fédérée activable depuis les fronts). Purement additif.
+
 
 Fonctions libres (smoke test async, conservées de v0) :
 
@@ -42,6 +46,7 @@ Objet **`ChampiniumNode`** (méthodes) :
 | `ingest_file(path) -> String` | **async** | ffmpeg → HLS, renvoie le CID du manifeste |
 | `publish_feed(cids) -> ()` | **async** | publie un feed signé |
 | `fetch_hls(manifest_cid, out_dir) -> String` | **async** | reconstruit un HLS jouable, renvoie le playlist |
+| `subscribe_denylist(json) -> u64` | **async** | souscrit une denylist signée, renvoie le nb de blocs purgés |
 
 Record `FfiCatalogEntry { issuer, seq, cids }`. Erreur `FfiError` (message aplati).
 Validé : bindings Swift **et** C# générés pour toute cette surface (objet + async).

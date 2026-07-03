@@ -98,6 +98,36 @@ async fn reception_refuses_blocked_but_allows_clean() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_subscription_blocks_and_purges_existing_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let forbidden = b"contenu bloque apres coup".to_vec();
+
+    // Nœud sans modération au départ : il stocke le contenu.
+    let kp = load_or_generate(dir.path().join("node.key")).unwrap();
+    let bs = Blockstore::open(dir.path().join("blocks")).unwrap();
+    let node = Node::with_moderation(kp, bs, Moderation::empty())
+        .await
+        .unwrap();
+    let bad_cid = node.add(&forbidden).await.unwrap();
+    assert!(node.blockstore().has(&bad_cid));
+
+    // Souscription à chaud d'une denylist qui couvre ce CID.
+    let issuer = load_or_generate(dir.path().join("issuer.key")).unwrap();
+    let dl = Denylist::build_signed("test", UPDATED, &issuer, &[bad_cid]).unwrap();
+    let purged = node.subscribe_denylist(&dl).await.unwrap();
+
+    assert_eq!(purged, 1, "le bloc désormais interdit doit être purgé");
+    assert!(
+        !node.blockstore().has(&bad_cid),
+        "le contenu doit avoir été retiré du cache"
+    );
+    assert!(
+        matches!(node.get(bad_cid).await, Err(CoreError::Moderated(_))),
+        "get doit désormais refuser le contenu"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn serving_checkpoint_refuses_to_serve_blocked() {
     let dir = tempfile::tempdir().unwrap();
     let forbidden = b"contenu interdit au service".to_vec();
@@ -110,7 +140,9 @@ async fn serving_checkpoint_refuses_to_serve_blocked() {
     let node_a = Node::with_moderation(kp_a, bs_a, moderation_a)
         .await
         .unwrap();
-    node_a.provide(bad_cid).await.unwrap(); // annonce quand même le provider record
+    // provide sur un CID bloqué est un no-op (on ne s'annonce pas fournisseur
+    // d'un contenu qu'on refuse de servir) : l'appel réussit sans rien annoncer.
+    node_a.provide(bad_cid).await.unwrap();
 
     // B : aucune modération — il essaie de récupérer.
     let kp_b = load_or_generate(dir.path().join("b.key")).unwrap();

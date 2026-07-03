@@ -9,9 +9,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use champinium_core::identity::load_or_generate;
-use champinium_core::p2p::split_peer_id;
-use champinium_core::{Blockstore, Cid, Node};
+use champinium_core::{paths, Cid, Node};
 use gstreamer::prelude::*;
 use gtk::glib;
 use gtk::prelude::*;
@@ -213,11 +211,19 @@ fn start_playback(playlist: &Path) -> Result<gstreamer::Element, String> {
 async fn open_node(rt: &Arc<Runtime>) -> Result<Node, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     rt.spawn(async move {
+        // Répertoire durable par OS (jamais le tmp : sinon perte du PeerId).
         let res = async {
-            let dir = std::env::temp_dir().join("champinium-linux-node");
-            let kp = load_or_generate(dir.join("node.key")).map_err(|e| e.to_string())?;
-            let bs = Blockstore::open(dir.join("blocks")).map_err(|e| e.to_string())?;
-            Node::new(kp, bs).await.map_err(|e| e.to_string())
+            let dir = paths::default_data_dir();
+            let node = Node::open(&dir).await.map_err(|e| e.to_string())?;
+            // Écoute pour être joignable (reseed entrant, statut seeder).
+            node.listen(
+                "/ip4/0.0.0.0/tcp/0"
+                    .parse()
+                    .map_err(|e| format!("multiaddr d'écoute invalide : {e}"))?,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(node)
         }
         .await;
         let _ = tx.send(res);
@@ -229,11 +235,7 @@ async fn connect_inner(node: &Node, peer: &str) -> Result<(), String> {
     let addr = peer
         .parse()
         .map_err(|e| format!("multiaddr invalide : {e}"))?;
-    let (pid, base) = split_peer_id(addr).map_err(|e| e.to_string())?;
-    node.add_address(pid, base.clone())
-        .await
-        .map_err(|e| e.to_string())?;
-    node.dial(base).await.map_err(|e| e.to_string())
+    node.connect(addr).await.map_err(|e| e.to_string())
 }
 
 async fn fetch_inner(node: &Node, manifest: Cid) -> Result<PathBuf, String> {

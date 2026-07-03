@@ -24,9 +24,31 @@ pub fn load_or_generate(path: impl AsRef<Path>) -> Result<Keypair> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, bytes)?;
+        write_private(path, &bytes)?;
         Ok(kp)
     }
+}
+
+/// Écrit un secret sur disque avec des permissions restreintes au propriétaire
+/// (0600 sur Unix ; sur les autres OS, permissions par défaut).
+#[cfg(unix)]
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(bytes)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    std::fs::write(path, bytes)?;
+    Ok(())
 }
 
 /// `PeerId` dérivé d'une paire de clés.
@@ -60,5 +82,20 @@ mod tests {
         let a = load_or_generate(dir.path().join("a.key")).unwrap();
         let b = load_or_generate(dir.path().join("b.key")).unwrap();
         assert_ne!(peer_id(&a), peer_id(&b));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_key_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.key");
+        load_or_generate(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "la clé privée ne doit être lisible que par son propriétaire"
+        );
     }
 }
