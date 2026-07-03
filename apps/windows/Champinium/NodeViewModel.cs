@@ -125,12 +125,12 @@ public sealed class NodeViewModel : INotifyPropertyChanged
             foreach (var entry in _node.Catalog())
             {
                 issuers++;
-                foreach (var cid in entry.Cids)
+                foreach (var cid in entry.cids)
                 {
                     Entries.Add(new CatalogCid
                     {
-                        Issuer = entry.Issuer,
-                        Seq = entry.Seq,
+                        Issuer = entry.issuer,
+                        Seq = entry.seq,
                         Cid = cid,
                     });
                 }
