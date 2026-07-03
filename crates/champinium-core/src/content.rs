@@ -25,6 +25,15 @@ pub fn verify(cid: &Cid, bytes: &[u8]) -> bool {
     &cid_for(bytes) == cid
 }
 
+/// Ajoute un champ à un tampon d'octets à signer en le **préfixant par sa
+/// longueur** (u64 little-endian). Encodage non ambigu : deux découpages de
+/// champs différents ne peuvent pas produire les mêmes octets, ce qui élimine
+/// la malléabilité par décalage de frontière (voir `feed`/`moderation`).
+pub(crate) fn push_field(buf: &mut Vec<u8>, field: &[u8]) {
+    buf.extend_from_slice(&(field.len() as u64).to_le_bytes());
+    buf.extend_from_slice(field);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

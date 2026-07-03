@@ -14,6 +14,7 @@
 //! - **#2 réception/service** : refus de récupérer, mettre en cache, reseeder ou
 //!   servir un contenu matché.
 
+use crate::content::push_field;
 use crate::error::{CoreError, Result as CoreResult};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -44,22 +45,22 @@ pub struct Denylist {
 
 impl Denylist {
     /// Octets canoniques signés (indépendants de la sérialisation JSON, donc
-    /// déterministes) : schéma, nom, date, puis CIDs triés, séparés par `\n`.
+    /// déterministes) : schéma, nom, date, puis CIDs triés. Chaque champ est
+    /// **préfixé par sa longueur** (et non séparé par `\n`) pour empêcher toute
+    /// malléabilité par décalage de frontière (un `\n` dans un champ ne peut plus
+    /// faire passer du contenu d'un champ à l'autre à octets signés constants).
     fn signing_bytes(&self) -> Vec<u8> {
-        let mut s = String::new();
-        s.push_str(&self.schema);
-        s.push('\n');
-        s.push_str(&self.name);
-        s.push('\n');
-        s.push_str(&self.updated);
-        s.push('\n');
+        let mut buf = Vec::new();
+        push_field(&mut buf, self.schema.as_bytes());
+        push_field(&mut buf, self.name.as_bytes());
+        push_field(&mut buf, self.updated.as_bytes());
         let mut entries = self.entries.clone();
         entries.sort();
+        push_field(&mut buf, &(entries.len() as u64).to_le_bytes());
         for e in entries {
-            s.push_str(&e);
-            s.push('\n');
+            push_field(&mut buf, e.as_bytes());
         }
-        s.into_bytes()
+        buf
     }
 
     /// Construit et **signe** une denylist (côté éditeur/publisher).
@@ -222,6 +223,36 @@ mod tests {
 
         let mut m = Moderation::empty();
         assert!(m.subscribe(&dl).is_err(), "une liste altérée est rejetée");
+    }
+
+    #[test]
+    fn field_boundary_shifting_is_not_malleable() {
+        // Denylist légitime : updated="u", entries=["cidA","cidB"] (triés).
+        let issuer = Keypair::generate_ed25519();
+        let a = cid_for(b"aaa");
+        let b = cid_for(b"bbb");
+        let (a, b) = if a.to_string() < b.to_string() {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let legit = Denylist::build_signed("n", "u", &issuer, &[a, b]).unwrap();
+
+        // Attaque : on déplace le premier CID depuis `entries` vers `updated`.
+        // Avec une concaténation naïve séparée par '\n', les octets signés sont
+        // identiques → la même signature validerait cette liste falsifiée.
+        let forged = Denylist {
+            schema: legit.schema.clone(),
+            name: legit.name.clone(),
+            issuer_pubkey: legit.issuer_pubkey.clone(),
+            updated: format!("u\n{a}"),
+            entries: vec![b.to_string()],
+            signature: legit.signature.clone(),
+        };
+        assert!(
+            forged.verify().is_err(),
+            "un décalage de frontière de champ ne doit pas produire une signature valide"
+        );
     }
 
     #[test]

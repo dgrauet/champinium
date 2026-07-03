@@ -36,8 +36,7 @@ fmt:
     cargo fmt --all
 
 # Génère les bindings Swift (macOS) dans bindings/swift/ via UniFFI library-mode.
-# NOTE : assemblage de l'XCFramework (lipo + xcodebuild -create-xcframework) à
-# ajouter quand on attaquera le front macOS (Phase 0/3).
+# L'assemblage de l'XCFramework est fait par `macos-prepare` (recette ci-dessous).
 gen-swift: build-core
     mkdir -p bindings/swift
     cargo run --release -p champinium-core --bin uniffi-bindgen -- \

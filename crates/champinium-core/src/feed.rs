@@ -7,6 +7,7 @@
 //! l'authenticité. Diffusé en gossipsub (live) ; le catalogue est reconstruit en
 //! écoutant (voir [`crate::catalog`]).
 
+use crate::content::push_field;
 use crate::error::{CoreError, Result as CoreResult};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -34,22 +35,21 @@ pub struct Feed {
 }
 
 impl Feed {
-    /// Octets canoniques signés (déterministes) : schéma, clé, seq, puis CIDs triés.
+    /// Octets canoniques signés (déterministes) : schéma, clé, seq, puis CIDs
+    /// triés. Chaque champ est **préfixé par sa longueur** (non séparé par `\n`)
+    /// pour éliminer toute malléabilité par décalage de frontière.
     fn signing_bytes(&self) -> Vec<u8> {
-        let mut s = String::new();
-        s.push_str(&self.schema);
-        s.push('\n');
-        s.push_str(&self.issuer_pubkey);
-        s.push('\n');
-        s.push_str(&self.seq.to_string());
-        s.push('\n');
+        let mut buf = Vec::new();
+        push_field(&mut buf, self.schema.as_bytes());
+        push_field(&mut buf, self.issuer_pubkey.as_bytes());
+        push_field(&mut buf, &self.seq.to_le_bytes());
         let mut cids = self.cids.clone();
         cids.sort();
+        push_field(&mut buf, &(cids.len() as u64).to_le_bytes());
         for c in cids {
-            s.push_str(&c);
-            s.push('\n');
+            push_field(&mut buf, c.as_bytes());
         }
-        s.into_bytes()
+        buf
     }
 
     /// Construit et **signe** un feed avec l'identité du créateur.

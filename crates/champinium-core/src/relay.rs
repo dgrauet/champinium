@@ -23,12 +23,21 @@ struct RelayBehaviour {
     ping: ping::Behaviour,
 }
 
-/// Poignée vers un relais en fonctionnement.
+/// Poignée vers un relais en fonctionnement. La tâche de fond est arrêtée
+/// automatiquement quand la poignée est abandonnée (`Drop` abort le `JoinHandle`)
+/// : indispensable pour les tests, qui sinon fuiraient une tâche par relais.
 pub struct RelayHandle {
     /// PeerId du relais.
     pub peer_id: PeerId,
     /// Adresse d'écoute effective (à référencer dans une adresse de circuit).
     pub addr: Multiaddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RelayHandle {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl RelayHandle {
@@ -50,7 +59,7 @@ pub async fn start_relay(keypair: Keypair, listen: Multiaddr) -> CoreResult<Rela
         .map_err(|e| CoreError::Network(e.to_string()))?;
 
     let (tx, rx) = oneshot::channel();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let mut announce = Some(tx);
         loop {
             if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
@@ -66,7 +75,11 @@ pub async fn start_relay(keypair: Keypair, listen: Multiaddr) -> CoreResult<Rela
     });
 
     let addr = rx.await.map_err(|_| CoreError::Shutdown)?;
-    Ok(RelayHandle { peer_id, addr })
+    Ok(RelayHandle {
+        peer_id,
+        addr,
+        task,
+    })
 }
 
 fn build_relay_swarm(keypair: Keypair) -> CoreResult<Swarm<RelayBehaviour>> {

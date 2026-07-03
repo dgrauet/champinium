@@ -16,7 +16,9 @@ niveaux, tous deux appliqués par le moteur du noyau ([`crate::moderation`]).
 - Modèle **fédéré** : un nœud choisit de suivre une ou plusieurs listes tierces
   (modération subjective). Leur **signature Ed25519 est vérifiée** avant prise en
   compte (`Moderation::subscribe`). Une liste non signée ou altérée est rejetée.
-- Format (voir `default-denylist.json` comme gabarit) :
+- Format (voir `default-denylist.example.json` comme gabarit — le suffixe
+  `.example` évite de le confondre avec une liste active, sa `signature` étant
+  nulle) :
 
   ```json
   {
