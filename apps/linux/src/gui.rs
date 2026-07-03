@@ -29,18 +29,30 @@ pub fn run() {
     let _ = app.run();
 }
 
+/// Racine des répertoires de lecture temporaires (un sous-dossier par contenu).
+fn play_root() -> PathBuf {
+    std::env::temp_dir().join("champinium-play")
+}
+
 /// État partagé sur le thread principal GTK (non Send : Rc/RefCell).
 struct Ui {
     rt: Arc<Runtime>,
     node: RefCell<Option<Node>>,
     player: RefCell<Option<gstreamer::Element>>,
+    /// Répertoire de la lecture en cours (supprimé au changement de contenu).
+    current_play_dir: RefCell<Option<PathBuf>>,
 }
 
 fn build_ui(app: &Application) {
+    // Purge les répertoires de lecture des exécutions précédentes (ils ne
+    // servent qu'à la session en cours et s'accumuleraient sinon).
+    let _ = std::fs::remove_dir_all(play_root());
+
     let ui = Rc::new(Ui {
         rt: Arc::new(Runtime::new().expect("runtime tokio")),
         node: RefCell::new(None),
         player: RefCell::new(None),
+        current_play_dir: RefCell::new(None),
     });
 
     let status = Label::new(Some("démarrage…"));
@@ -50,14 +62,12 @@ fn build_ui(app: &Application) {
         .hexpand(true)
         .build();
     let connect_btn = Button::with_label("Connecter");
-    let refresh_btn = Button::with_label("Rafraîchir");
     let list = ListBox::new();
     let scroller = ScrolledWindow::builder().child(&list).vexpand(true).build();
 
     let bar = GtkBox::new(Orientation::Horizontal, 8);
     bar.append(&peer_entry);
     bar.append(&connect_btn);
-    bar.append(&refresh_btn);
 
     let root = GtkBox::new(Orientation::Vertical, 8);
     root.set_margin_top(12);
@@ -76,22 +86,33 @@ fn build_ui(app: &Application) {
         .child(&root)
         .build();
 
-    // Ouverture du nœud (async).
+    // Ouverture du nœud (async), puis abonnement aux mises à jour du catalogue :
+    // le rafraîchissement est réactif (parité macOS/Windows), plus de bouton.
     {
         let ui = ui.clone();
         let status = status.clone();
+        let list = list.clone();
         glib::spawn_future_local(async move {
             match open_node(&ui.rt).await {
                 Ok(node) => {
                     status.set_text(&format!("nœud en ligne — {}", node.peer_id()));
+                    let mut events = node.subscribe_catalog();
                     *ui.node.borrow_mut() = Some(node);
+                    // Les primitives tokio::sync fonctionnent sur l'exécuteur
+                    // glib : la boucle vit sur le thread GTK et peut toucher
+                    // les widgets directement. Un abonné en retard (Lagged) a
+                    // seulement raté des tics : on rafraîchit quand même.
+                    use tokio::sync::broadcast::error::RecvError;
+                    while let Ok(()) | Err(RecvError::Lagged(_)) = events.recv().await {
+                        refresh_catalog(&ui, &status, &list);
+                    }
                 }
                 Err(e) => status.set_text(&format!("erreur d'ouverture : {e}")),
             }
         });
     }
 
-    // Connexion à un pair.
+    // Connexion à un pair (le catalogue se rafraîchit tout seul ensuite).
     {
         let ui = ui.clone();
         let status = status.clone();
@@ -118,29 +139,32 @@ fn build_ui(app: &Application) {
         });
     }
 
-    // Rafraîchissement du catalogue (lecture synchrone).
-    {
-        let ui = ui.clone();
-        let status = status.clone();
-        let list = list.clone();
-        refresh_btn.connect_clicked(move |_| {
-            while let Some(child) = list.first_child() {
-                list.remove(&child);
-            }
-            let Some(node) = ui.node.borrow().clone() else {
-                return;
-            };
-            let entries = node.catalog_entries();
-            status.set_text(&format!("catalogue : {} créateur(s)", entries.len()));
-            for entry in entries {
-                for cid in entry.cids {
-                    list.append(&catalog_row(&ui, &status, &cid.to_string()));
-                }
-            }
-        });
-    }
-
     window.present();
+}
+
+/// Reconstruit la liste depuis le catalogue : un en-tête par créateur
+/// (« créateur X — seq N », parité macOS/Windows) puis ses CIDs.
+fn refresh_catalog(ui: &Rc<Ui>, status: &Label, list: &ListBox) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+    let Some(node) = ui.node.borrow().clone() else {
+        return;
+    };
+    let entries = node.catalog_entries();
+    status.set_text(&format!("catalogue : {} créateur(s)", entries.len()));
+    for entry in entries {
+        let header = Label::new(Some(&format!(
+            "créateur {} — seq {}",
+            entry.issuer, entry.seq
+        )));
+        header.set_xalign(0.0);
+        header.add_css_class("heading");
+        list.append(&header);
+        for cid in entry.cids {
+            list.append(&catalog_row(ui, status, &cid.to_string()));
+        }
+    }
 }
 
 /// Une ligne du catalogue : le CID + un bouton « Lire ».
@@ -164,6 +188,14 @@ fn catalog_row(ui: &Rc<Ui>, status: &Label, cid: &str) -> GtkBox {
             status.set_text("CID invalide");
             return;
         };
+        // Arrête la lecture précédente et supprime son répertoire (pas
+        // d'accumulation de segments dans le tmp au fil des lectures).
+        if let Some(old) = ui.player.borrow_mut().take() {
+            let _ = old.set_state(gstreamer::State::Null);
+        }
+        if let Some(old_dir) = ui.current_play_dir.borrow_mut().take() {
+            let _ = std::fs::remove_dir_all(old_dir);
+        }
         let rt = ui.rt.clone();
         let ui = ui.clone();
         let status = status.clone();
@@ -176,11 +208,9 @@ fn catalog_row(ui: &Rc<Ui>, status: &Label, cid: &str) -> GtkBox {
             match rx.await {
                 Ok(Ok(playlist)) => match start_playback(&playlist) {
                     Ok(player) => {
-                        // Arrête la lecture précédente, conserve la nouvelle vivante.
-                        if let Some(old) = ui.player.borrow_mut().take() {
-                            let _ = old.set_state(gstreamer::State::Null);
-                        }
                         *ui.player.borrow_mut() = Some(player);
+                        *ui.current_play_dir.borrow_mut() =
+                            playlist.parent().map(Path::to_path_buf);
                         status.set_text("lecture en cours");
                     }
                     Err(e) => status.set_text(&format!("lecture : {e}")),
@@ -239,7 +269,7 @@ async fn connect_inner(node: &Node, peer: &str) -> Result<(), String> {
 }
 
 async fn fetch_inner(node: &Node, manifest: Cid) -> Result<PathBuf, String> {
-    let out = std::env::temp_dir().join(format!("champinium-play-{manifest}"));
+    let out = play_root().join(manifest.to_string());
     node.fetch_hls(manifest, &out)
         .await
         .map_err(|e| e.to_string())
