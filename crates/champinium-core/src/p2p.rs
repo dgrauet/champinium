@@ -299,13 +299,16 @@ impl Node {
     pub fn is_blocked(&self, cid: &Cid) -> bool {
         self.moderation
             .read()
-            .expect("moderation lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_blocked(cid)
     }
 
     /// Nombre de CIDs actuellement bloqués.
     pub fn blocked_count(&self) -> usize {
-        self.moderation.read().expect("moderation lock").len()
+        self.moderation
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// Souscrit **à chaud** à une denylist signée : vérifie la signature, ajoute
@@ -313,7 +316,10 @@ impl Node {
     /// interdit (checkpoint rétroactif). Renvoie le nombre de blocs purgés.
     pub async fn subscribe_denylist(&self, list: &Denylist) -> CoreResult<usize> {
         {
-            let mut mod_guard = self.moderation.write().expect("moderation lock");
+            let mut mod_guard = self
+                .moderation
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             mod_guard.subscribe(list)?;
         }
         // Purge des blocs déjà stockés que la nouvelle liste couvre.
@@ -334,7 +340,10 @@ impl Node {
         // concurrentes ne peuvent pas réordonner le seq écrit sur disque (sinon,
         // au redémarrage, on republierait un seq déjà vu, ignoré par le LWW).
         let seq = {
-            let mut guard = self.feed_seq.lock().expect("feed_seq mutex");
+            let mut guard = self
+                .feed_seq
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             *guard += 1;
             if let Err(e) = std::fs::write(feed_seq_path(&self.blockstore), guard.to_string()) {
                 tracing::warn!("persistance du seq de feed échouée: {e}");
@@ -345,7 +354,7 @@ impl Node {
         // Le créateur figure dans son propre catalogue.
         self.catalog
             .lock()
-            .expect("catalog mutex")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .apply(feed.clone())?;
         let data = feed.to_json()?.into_bytes();
         // PUT du feed dans la DHT (best-effort) : permet la découverte hors gossip.
@@ -392,7 +401,7 @@ impl Node {
             let _ = self
                 .catalog
                 .lock()
-                .expect("catalog mutex")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .apply(feed.clone());
         }
         Ok(best)
@@ -424,6 +433,18 @@ impl Node {
     /// tous ses segments (checkpoint #2 via `get`), les écrit dans `out_dir` et
     /// génère un `index.m3u8`. Renvoie le chemin du playlist.
     pub async fn fetch_hls(&self, manifest_cid: Cid, out_dir: &Path) -> CoreResult<PathBuf> {
+        match self.fetch_hls_inner(manifest_cid, out_dir).await {
+            Ok(playlist) => Ok(playlist),
+            Err(e) => {
+                // Pas de sortie partielle : un segment manquant/refusé ne doit
+                // pas laisser de `.ts` orphelins sans `index.m3u8` jouable.
+                let _ = tokio::fs::remove_dir_all(out_dir).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn fetch_hls_inner(&self, manifest_cid: Cid, out_dir: &Path) -> CoreResult<PathBuf> {
         let bytes = self.get(manifest_cid).await?;
         let manifest = HlsManifest::from_json(&bytes)?;
         tokio::fs::create_dir_all(out_dir).await?;
@@ -439,12 +460,18 @@ impl Node {
 
     /// Instantané des entrées du catalogue reconstruit (un feed par émetteur).
     pub fn catalog_entries(&self) -> Vec<CatalogEntry> {
-        self.catalog.lock().expect("catalog mutex").entries()
+        self.catalog
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries()
     }
 
     /// Tous les CIDs connus du catalogue.
     pub fn catalog_cids(&self) -> HashSet<Cid> {
-        self.catalog.lock().expect("catalog mutex").all_cids()
+        self.catalog
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .all_cids()
     }
 
     /// Stocke un bloc localement et l'annonce dans la DHT (provider record).
@@ -870,7 +897,12 @@ impl EventLoop {
     fn handle_feed_message(&self, data: &[u8]) {
         match Feed::from_json(data) {
             Ok(feed) => {
-                if let Err(e) = self.catalog.lock().expect("catalog mutex").apply(feed) {
+                if let Err(e) = self
+                    .catalog
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .apply(feed)
+                {
                     tracing::debug!("feed rejeté: {e}");
                 }
             }
@@ -933,7 +965,10 @@ impl EventLoop {
                 request, channel, ..
             } => {
                 // CHECKPOINT MODÉRATION : ne jamais servir un contenu matché.
-                let blocked = self.moderation.read().expect("moderation lock");
+                let blocked = self
+                    .moderation
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let data = Cid::try_from(request.0.as_slice()).ok().and_then(|cid| {
                     if blocked.is_blocked(&cid) {
                         None

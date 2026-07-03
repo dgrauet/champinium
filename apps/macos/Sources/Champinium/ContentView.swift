@@ -44,7 +44,7 @@ struct ContentView: View {
 
     private var catalogList: some View {
         List {
-            ForEach(Array(model.entries.enumerated()), id: \.offset) { _, entry in
+            ForEach(model.entries, id: \.issuer) { entry in
                 Section("créateur \(entry.issuer) — seq \(entry.seq)") {
                     ForEach(entry.cids, id: \.self) { cid in
                         HStack {

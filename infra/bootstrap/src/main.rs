@@ -35,8 +35,10 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let keypair = load_or_generate(cli.data_dir.join("node.key"))?;
-    // Magasin de blocs éphémère : un bootstrap ne sert pas de contenu.
-    let blockstore = Blockstore::open(std::env::temp_dir().join("champinium-bootstrap-blocks"))?;
+    // Magasin de blocs sous le data_dir de l'instance (reste vide : un bootstrap
+    // ne stocke aucun contenu). Placé là — et non dans un tmp partagé — pour que
+    // deux bootstraps sur la même machine n'entrent pas en collision.
+    let blockstore = Blockstore::open(cli.data_dir.join("blocks"))?;
     let node = Node::new(keypair, blockstore).await?;
 
     let addr = node

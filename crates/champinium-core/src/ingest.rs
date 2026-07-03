@@ -121,13 +121,10 @@ pub fn parse_playlist(m3u8: &str, dir: &Path) -> CoreResult<(f32, Vec<(PathBuf, 
         if let Some(rest) = line.strip_prefix("#EXT-X-TARGETDURATION:") {
             target = rest.trim().parse().unwrap_or(0.0);
         } else if let Some(rest) = line.strip_prefix("#EXTINF:") {
-            pending = rest
-                .split(',')
-                .next()
-                .unwrap_or("0")
-                .trim()
+            let dur = rest.split(',').next().unwrap_or("").trim();
+            pending = dur
                 .parse()
-                .unwrap_or(0.0);
+                .map_err(|_| CoreError::Ingest(format!("durée #EXTINF illisible: {dur:?}")))?;
         } else if line.is_empty() || line.starts_with('#') {
             continue;
         } else {
@@ -170,6 +167,17 @@ mod tests {
         assert_eq!(segs.len(), 2);
         assert_eq!(segs[0].1, 3.5);
         assert!(segs[1].0.ends_with("seg_00001.ts"));
+    }
+
+    #[test]
+    fn parse_playlist_rejects_unparseable_duration() {
+        // Une durée #EXTINF illisible ne doit PAS devenir silencieusement 0.0
+        // dans un manifeste ensuite signé/publié : c'est une erreur.
+        let m3u8 = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:pasunnombre,\nseg_00000.ts\n#EXT-X-ENDLIST\n";
+        assert!(matches!(
+            parse_playlist(m3u8, Path::new("/tmp/x")),
+            Err(CoreError::Ingest(_))
+        ));
     }
 
     #[test]
