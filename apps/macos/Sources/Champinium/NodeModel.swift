@@ -5,6 +5,21 @@ import AVFoundation
 import Foundation
 import ChampiniumCore
 
+/// Pont vers le callback du contrat : le noyau rappelle `onCatalogUpdated` hors
+/// du thread UI ; on re-dispatche vers le thread principal, où le modèle relit
+/// l'instantané `catalog()`.
+private final class CatalogRefresher: CatalogListener {
+    private let onUpdate: @Sendable () -> Void
+
+    init(onUpdate: @escaping @Sendable () -> Void) {
+        self.onUpdate = onUpdate
+    }
+
+    func onCatalogUpdated() {
+        onUpdate()
+    }
+}
+
 @MainActor
 final class NodeModel: ObservableObject {
     @Published var status: String = "démarrage…"
@@ -14,8 +29,10 @@ final class NodeModel: ObservableObject {
     @Published var player: AVPlayer?
 
     private var node: ChampiniumNode?
+    private var listener: CatalogListener?
 
-    /// Ouvre le nœud et commence à écouter.
+    /// Ouvre le nœud, commence à écouter et s'abonne aux mises à jour du
+    /// catalogue (rafraîchissement réactif, pas de délai gossip codé en dur).
     func start() async {
         do {
             // Répertoire durable par OS (jamais le tmp : sinon perte du PeerId
@@ -25,20 +42,24 @@ final class NodeModel: ObservableObject {
             self.node = node
             self.peerId = node.peerId()
             self.listenAddr = try await node.listen(addr: "/ip4/0.0.0.0/tcp/0")
+            let refresher = CatalogRefresher { [weak self] in
+                Task { @MainActor in self?.refreshCatalog() }
+            }
+            self.listener = refresher
+            await node.setCatalogListener(listener: refresher)
             self.status = "nœud en ligne"
         } catch {
             self.status = "erreur d'ouverture: \(error)"
         }
     }
 
-    /// Se connecte à un pair, puis rafraîchit le catalogue après un court délai.
+    /// Se connecte à un pair ; le catalogue se rafraîchit tout seul quand les
+    /// feeds arrivent (voir `CatalogRefresher`).
     func connect(to peer: String) async {
         guard let node, !peer.isEmpty else { return }
         do {
             try await node.connect(peer: peer)
             self.status = "connecté à un pair"
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
-            refreshCatalog()
         } catch {
             self.status = "connexion: \(error)"
         }
@@ -60,6 +81,15 @@ final class NodeModel: ObservableObject {
             self.player = player
             player.play()
             self.status = "lecture en cours"
+        } catch let e as FfiError {
+            // Erreur typée du contrat : un refus de modération est un blocage
+            // volontaire, présenté comme tel (pas comme une panne technique).
+            switch e {
+            case .Moderated:
+                self.status = "contenu bloqué par la modération"
+            default:
+                self.status = "lecture: \(e)"
+            }
         } catch {
             self.status = "lecture: \(error)"
         }
