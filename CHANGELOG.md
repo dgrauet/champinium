@@ -6,6 +6,17 @@ versionnage : [SemVer](https://semver.org/lang/fr/). À partir de la 0.2.0, ce
 fichier est maintenu automatiquement par release-please (voir
 [ADR-0005](docs/adr/0005-release-please.md)).
 
+## [0.4.0](https://github.com/dgrauet/champinium/compare/v0.3.0...v0.4.0) (2026-07-04)
+
+
+### ⚠ BREAKING CHANGES
+
+* recherche décentralisée — feed v2 (métadonnées signées), index local, tags DHT, contrat v4 ([#24](https://github.com/dgrauet/champinium/issues/24))
+
+### Features
+
+* recherche décentralisée — feed v2 (métadonnées signées), index local, tags DHT, contrat v4 ([#24](https://github.com/dgrauet/champinium/issues/24)) ([23cfd14](https://github.com/dgrauet/champinium/commit/23cfd146fa37dff465585d28bd36294135ad7ec3)), closes [#20](https://github.com/dgrauet/champinium/issues/20)
+
 ## [0.3.0](https://github.com/dgrauet/champinium/compare/v0.2.0...v0.3.0) (2026-07-04)
 
 
