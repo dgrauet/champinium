@@ -12,7 +12,7 @@ PKG="$ROOT/dist/champinium-linux"
 rm -rf "$ROOT/dist"
 mkdir -p "$PKG"
 
-cp "$ROOT/target/release/champinium-linux" "$PKG/champinium"
+cp "$ROOT/target/release/champinium" "$PKG/champinium"
 
 cat > "$PKG/champinium.desktop" <<DESKTOP
 [Desktop Entry]
