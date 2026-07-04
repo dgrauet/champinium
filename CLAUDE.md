@@ -146,7 +146,13 @@ connect → catalogue → `fetchHls` → lecture **AVPlayer**. `swift build` OK
 (compile + link contre le binding réel). Lecture GUI à valider hors headless.
 Voir [`AGENTS.md`](AGENTS.md) pour le tableau du contrat.
 
-**Phase 4 — en cours.**
+**Critère de sortie MVP (Phase 3) déroulé** — voir
+[`docs/mvp-demo.md`](docs/mvp-demo.md) : A ingère/publie, B découvre par gossip
+et reconstruit un HLS jouable, puis — A éteint — un nœud C obtient le contenu
+identique depuis B seul (seed-what-you-consume prouvé). Reste à rejouer en GUI
+sur deux machines physiques.
+
+**Phase 4 — close.**
 - **Front Linux GTK4 ✔ (feature `gui`)** : `apps/linux` consomme le crate ; UI =
   ouverture nœud → listen → connect → catalogue (refresh **réactif** via
   `subscribe_catalog`, en-tête « créateur X — seq N » par émetteur) → lecture
@@ -189,6 +195,10 @@ Voir [`AGENTS.md`](AGENTS.md) pour le tableau du contrat.
   (`subscribe_denylist`), clé privée en 0600, `paths::default_data_dir()` durable
   par OS, signatures par champs préfixés par longueur (anti-malléabilité),
   nettoyage des répertoires de lecture temporaires dans les 3 fronts.
+- **Déploiement tiers documenté ✔** : guide opérateur
+  [`docs/deploy-bootstrap-relay.md`](docs/deploy-bootstrap-relay.md)
+  (bootstrap 4101/tcp, relay 4201/tcp, systemd, périmètre : de la connectivité,
+  pas de contenu).
 - **bitswap — bloqué en amont (différé)** : l'implémentation maintenue (beetswap)
   cible libp2p 0.56 (d'où l'upgrade) mais sa dépendance transitive `core2` est
   **entièrement yankée et sans source git** → graphe non résoluble actuellement.
@@ -197,11 +207,26 @@ Voir [`AGENTS.md`](AGENTS.md) pour le tableau du contrat.
   seront réparés (ou via vendoring si réellement nécessaire). Le transport reste
   `request-response` en attendant.
 
+**Phase 5 — en cours.**
+- **Signalement P2P ✔** : quand le checkpoint #2 refuse un CID, le nœud émet un
+  rapport signé `champinium-report/v1` sur le topic `champinium/reports/v1`
+  (best-effort). Les pairs vérifient et agrègent (borné : 10 000 CIDs, 1 000
+  rapporteurs/CID) le nombre de rapporteurs **distincts** par CID — matière pour
+  les éditeurs de denylists, **aucun effet automatique**. Topic couvert par la
+  validation applicative + peer scoring. `Node::report_count(s)`.
+- **Réplication mesurée ✔** : `Node::replication_factor(cid)` (fournisseurs
+  DHT), CLI `replication <cid> --peer …`. Testé : 1 → 2 après
+  seed-what-you-consume.
+- **Restent** (issues) : recherche décentralisée (#20 — exige un feed v2 avec
+  métadonnées titre/tags + contrat FFI v4), IPNS durable (#21), réplication
+  opportuniste au-delà du reseed à la consommation.
+
 Phasing : 0 (spike async FFI ✔ contrat) → **1 (P2P nu CLI ✔)** → **2 (modération ✔,
-feeds/gossipsub/catalogue ✔, ingestion ffmpeg ✔)** → **3 (contrat UniFFI v3 ✔ —
-erreurs typées + événements catalogue, UI macOS compile ✔)** → 4 (Linux GTK4 ✔,
-relay NAT ✔, seeding ✔, Windows ✔, feed DHT ✔, fetch concurrent ✔, peer scoring ✔,
-durcissement audit ✔ ; bitswap différé). Voir le spec.
+feeds/gossipsub/catalogue ✔, ingestion ffmpeg ✔)** → **3 (contrat UniFFI v3 ✔,
+UI macOS compile ✔, critère MVP déroulé ✔)** → **4 (close : 3 fronts ✔, relay
+NAT ✔, seeding ✔, feed DHT ✔, fetch concurrent ✔, déploiement tiers documenté ✔ ;
+bitswap différé)** → 5 (en cours : peer scoring ✔, signalement P2P ✔, réplication
+mesurée ✔ ; recherche #20, IPNS #21). Voir le spec.
 
 **Dernière release : v0.2.0** (release-please, `bump-minor-pre-major` actif :
 un breaking change bumpe la mineure tant qu'on est < 1.0.0 — la 1.0 sera un
