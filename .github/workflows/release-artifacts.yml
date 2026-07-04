@@ -1,0 +1,160 @@
+# Artefacts de release SANS coût de signature (Phase 6, palier gratuit) :
+# - macOS  : Champinium.app signée AD-HOC (pas de notarisation) → zip ;
+# - Windows: dossier portable non signé (WinAppSDK auto-contenu) → zip ;
+# - Linux  : tarball du front GTK4 (+ .desktop ; dépend des libs système) ;
+# - outils : champinium-{cli,seed,bootstrap,relay} par OS.
+# Voir docs/packaging.md (dont : ce que la signature payante ajouterait).
+#
+# Déclenché à la publication d'une release (release-please) — les artefacts
+# sont attachés à la release. `workflow_dispatch` permet de valider la chaîne
+# sans release (artefacts de workflow uniquement).
+name: release-artifacts
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write # `gh release upload`
+
+jobs:
+  tools:
+    name: outils (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            suffix: linux-x86_64
+          - os: macos-latest
+            suffix: macos-arm64
+          - os: windows-latest
+            suffix: windows-x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build tools (release)
+        run: cargo build --release -p champinium-cli -p champinium-seed -p champinium-bootstrap -p champinium-relay
+      - name: Archive (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist/champinium-tools
+          cp target/release/champinium-cli target/release/champinium-seed \
+             target/release/champinium-bootstrap target/release/champinium-relay \
+             dist/champinium-tools/
+          tar -C dist -czf "dist/champinium-tools-${{ matrix.suffix }}.tar.gz" champinium-tools
+      - name: Archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/champinium-tools | Out-Null
+          Copy-Item target/release/champinium-cli.exe,target/release/champinium-seed.exe,target/release/champinium-bootstrap.exe,target/release/champinium-relay.exe dist/champinium-tools/
+          Compress-Archive -Path dist/champinium-tools -DestinationPath "dist/champinium-tools-${{ matrix.suffix }}.zip"
+      - name: Upload to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        shell: bash
+        run: gh release upload "$TAG" dist/champinium-tools-*
+      - name: Upload workflow artifact (dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: champinium-tools-${{ matrix.suffix }}
+          path: dist/champinium-tools-*
+
+  macos-app:
+    name: app macOS (.app ad-hoc, non notarisée)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install just
+        run: cargo install just
+      - name: Prepare bindings + XCFramework
+        run: just macos-prepare
+      - name: Package Champinium.app (ad-hoc)
+        run: ./scripts/package-macos-app.sh
+      - name: Upload to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" dist/Champinium-macos.zip
+      - name: Upload workflow artifact (dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Champinium-macos
+          path: dist/Champinium-macos.zip
+
+  windows-app:
+    name: app Windows (portable non signée)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Install just
+        run: cargo install just
+      - name: Install uniffi-bindgen-cs (matches uniffi 0.28.3)
+        run: cargo install uniffi-bindgen-cs --git https://github.com/NordSecurity/uniffi-bindgen-cs --tag v0.9.2+v0.28.3
+      - name: Build core + generate C# bindings
+        run: just gen-csharp
+      - name: Publish (unpackaged, WinAppSDK auto-contenu)
+        run: dotnet publish apps/windows/Champinium/Champinium.csproj -c Release -r win-x64 -p:Platform=x64 -p:WindowsAppSDKSelfContained=true -p:SelfContained=true -o dist/Champinium-windows
+      - name: Zip
+        shell: pwsh
+        run: Compress-Archive -Path dist/Champinium-windows -DestinationPath dist/Champinium-windows-x86_64.zip
+      - name: Upload to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        shell: bash
+        run: gh release upload "$TAG" dist/Champinium-windows-x86_64.zip
+      - name: Upload workflow artifact (dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Champinium-windows
+          path: dist/Champinium-windows-x86_64.zip
+
+  linux-app:
+    name: app Linux (tarball GTK4)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install GTK4 + GStreamer dev libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libgstreamer1.0-dev
+      - name: Build GUI (release)
+        run: cargo build --release -p champinium-linux --features gui
+      - name: Package tarball
+        run: ./scripts/package-linux-app.sh
+      - name: Upload to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" dist/Champinium-linux-x86_64.tar.gz
+      - name: Upload workflow artifact (dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Champinium-linux
+          path: dist/Champinium-linux-x86_64.tar.gz
