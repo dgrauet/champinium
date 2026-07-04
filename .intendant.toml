@@ -1,0 +1,37 @@
+# Gouvernance intendant — composition multi-stack du repo.
+#
+# - `core`      : le workspace Rust à la racine (crates/, infra/, apps/linux —
+#                 le front GTK consomme le crate directement, il fait partie du
+#                 workspace Cargo).
+# - `macos-app` : le front SwiftUI (SwiftPM), audité avec les règles swift.
+# - apps/windows (C#/WinUI 3) n'a PAS de stack intendant : il reste couvert par
+#   les règles transverses (racine) et validé par le job CI `windows-app`.
+
+[intendant]
+version = "1"
+enforcement = "strict"
+
+[[subprojects]]
+name = "core"
+path = "."
+stack = "rust"
+
+[[subprojects]]
+name = "macos-app"
+path = "apps/macos"
+stack = "swift"
+
+[exemptions]
+# Deux titres de squash antérieurs à la garde CI003 (PRs #3 et #14) ; on ne
+# réécrit pas l'historique de main. Le format est verrouillé en CI depuis.
+RL002 = "Titres de squash historiques (#3, #14) — historique de main non réécrit ; CI003 verrouille le format depuis"
+
+[exemptions.macos-app]
+# SwiftPM ne génère pas de Package.resolved sans dépendance DISTANTE : ce
+# package n'a qu'un binaryTarget local (XCFramework généré) et des targets
+# locales. Vérifié : `swift package resolve` ne produit rien.
+SWIFT_PK002 = "Aucune dépendance distante — swift package resolve ne génère pas de Package.resolved"
+# Garde-fou d'architecture (CLAUDE.md) : zéro logique métier dans les fronts,
+# donc rien à tester unitairement ici — la logique est testée dans le core
+# Rust (75+ tests) et le front est validé par compilation/lien en CI.
+SWIFT_TS001 = "Front = présentation pure (zéro logique métier par design) ; logique testée dans champinium-core"
