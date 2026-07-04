@@ -20,7 +20,7 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
   capacité absente, ils **ouvrent une demande de changement de contrat** (voir
   protocole plus bas) — ils ne contournent pas via du code natif ad hoc.
 
-### Contrat actuel — v3 (`CONTRACT_VERSION = 3`)
+### Contrat actuel — v4 (`CONTRACT_VERSION = 4`)
 
 > v1 → v2 : ajout de `subscribe_denylist(json) -> u64` sur `ChampiniumNode`
 > (modération fédérée activable depuis les fronts). Purement additif.
@@ -31,6 +31,14 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
 > `CatalogListener`** (`on_catalog_updated()`) enregistrée via
 > `set_catalog_listener(listener)` (async) — remplace le délai gossip codé en
 > dur dans les fronts par un rafraîchissement réactif du catalogue.
+>
+> v3 → v4 : **recherche décentralisée**. Records `FfiContentItem { cid, title,
+> tags }` et `FfiSearchHit { issuer, cid, title, tags }` ; `FfiCatalogEntry`
+> gagne `items` (contenus enrichis — rupture pour qui construit le record) ;
+> `publish_feed_with(items)` (async — feed v2 à métadonnées signées + annonce
+> des tags dans la DHT), `search(query)` (sync — index local, ne couvre que ce
+> que le nœud a vu passer), `search_tag(tag)` (async — découverte par tag via
+> la DHT, feeds signés vérifiés).
 
 
 Fonctions libres (smoke test async, conservées de v0) :
@@ -55,8 +63,13 @@ Objet **`ChampiniumNode`** (méthodes) :
 | `fetch_hls(manifest_cid, out_dir) -> String` | **async** | reconstruit un HLS jouable, renvoie le playlist |
 | `subscribe_denylist(json) -> u64` | **async** | souscrit une denylist signée, renvoie le nb de blocs purgés |
 | `set_catalog_listener(listener) -> ()` | **async** | enregistre un `CatalogListener` (rafraîchissement réactif) |
+| `publish_feed_with(items) -> ()` | **async** | publie un feed v2 (titre/tags signés) + annonce les tags DHT |
+| `search(query) -> Vec<FfiSearchHit>` | sync | recherche locale (titres/tags du catalogue reconstruit) |
+| `search_tag(tag) -> Vec<FfiSearchHit>` | **async** | découverte par tag via la DHT (hors gossip) |
 
-Record `FfiCatalogEntry { issuer, seq, cids }`. Erreur **`FfiError` typée**
+Records `FfiCatalogEntry { issuer, seq, cids, items }`,
+`FfiContentItem { cid, title, tags }`, `FfiSearchHit { issuer, cid, title, tags }`.
+Erreur **`FfiError` typée**
 (`Moderated` / `Network` / `NotFound` / `InvalidInput` / `Internal`, chacune avec
 `msg`). Callback interface **`CatalogListener`** : `on_catalog_updated()` —
 rappelé hors du thread UI, le front re-dispatche puis relit `catalog()`.
