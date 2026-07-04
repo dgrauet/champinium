@@ -93,6 +93,28 @@ enum Cmd {
         path: PathBuf,
         #[arg(long, default_value = "/ip4/0.0.0.0/tcp/0")]
         listen: String,
+        /// Titre du contenu (métadonnée signée, cherchable par les pairs).
+        #[arg(long, default_value = "")]
+        title: String,
+        /// Tag du contenu (répétable ; normalisé en minuscules, cherchable).
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
+    /// Recherche locale (titres/tags du catalogue reconstruit en écoutant).
+    Search {
+        query: String,
+        /// Pair auquel se connecter `/ip4/.../tcp/.../p2p/<peerid>`.
+        #[arg(long)]
+        peer: String,
+        /// Durée d'écoute des feeds avant la recherche (secondes).
+        #[arg(long, default_value = "6")]
+        wait: u64,
+    },
+    /// Recherche par tag via la DHT (découverte hors gossip).
+    SearchTag {
+        tag: String,
+        #[arg(long)]
+        peer: String,
     },
     /// Reconstruit un HLS jouable depuis un manifeste, récupéré depuis un pair.
     FetchHls {
@@ -226,18 +248,43 @@ async fn main() -> Result<()> {
                 None => println!("aucun feed trouvé dans la DHT pour {issuer}"),
             }
         }
-        Cmd::Ingest { path, listen } => {
+        Cmd::Ingest {
+            path,
+            listen,
+            title,
+            tags,
+        } => {
             let node = build_node(&cli.data_dir, &cli.denylist).await?;
             let addr = node
                 .listen(listen.parse().context("multiaddr d'écoute invalide")?)
                 .await?;
             let manifest_cid = node.ingest_file(&path).await?;
             println!("Manifeste HLS: {manifest_cid}");
-            node.publish_feed(&[manifest_cid]).await?;
-            spawn_feed_republisher(node.clone(), vec![manifest_cid]);
+            let entry = champinium_core::feed::FeedEntry {
+                cid: manifest_cid.to_string(),
+                title,
+                tags,
+            };
+            node.publish_feed_with(std::slice::from_ref(&entry)).await?;
+            spawn_feed_republisher_with(node.clone(), vec![entry]);
             print_identity(&node, &addr);
             println!("média ingéré + feed annoncé — ce nœud le sert. Ctrl-C pour arrêter.");
             tokio::signal::ctrl_c().await?;
+        }
+        Cmd::Search { query, peer, wait } => {
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            node.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await?;
+            connect_peer(&node, &peer).await?;
+            // Laisse le catalogue se reconstruire par écoute gossip.
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            print_hits(&node.search(&query));
+        }
+        Cmd::SearchTag { tag, peer } => {
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            node.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await?;
+            connect_peer(&node, &peer).await?;
+            let hits = search_tag_with_retry(&node, &tag).await?;
+            print_hits(&hits);
         }
         Cmd::FetchHls {
             manifest,
@@ -282,6 +329,56 @@ fn spawn_feed_republisher(node: Node, cids: Vec<Cid>) {
             let _ = node.publish_feed(&cids).await;
         }
     });
+}
+
+/// Variante avec métadonnées (titre/tags rediffusés avec le feed).
+fn spawn_feed_republisher_with(node: Node, entries: Vec<champinium_core::feed::FeedEntry>) {
+    if entries.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let _ = node.publish_feed_with(&entries).await;
+        }
+    });
+}
+
+/// Affiche des résultats de recherche.
+fn print_hits(hits: &[champinium_core::catalog::SearchHit]) {
+    if hits.is_empty() {
+        println!("aucun résultat");
+        return;
+    }
+    for h in hits {
+        let title = if h.title.is_empty() {
+            "(sans titre)"
+        } else {
+            &h.title
+        };
+        println!(
+            "{title} — {} (créateur {}) [{}]",
+            h.cid,
+            h.issuer,
+            h.tags.join(", ")
+        );
+    }
+}
+
+/// Recherche par tag en retentant le temps que le réseau converge.
+async fn search_tag_with_retry(
+    node: &Node,
+    tag: &str,
+) -> Result<Vec<champinium_core::catalog::SearchHit>> {
+    let deadline = std::time::Duration::from_secs(20);
+    let start = std::time::Instant::now();
+    loop {
+        let hits = node.search_tag(tag).await?;
+        if !hits.is_empty() || start.elapsed() >= deadline {
+            return Ok(hits);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    }
 }
 
 /// Récupère un bloc en retentant le temps que la connexion et Kademlia convergent.

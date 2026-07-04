@@ -6,13 +6,19 @@ import ChampiniumCore
 struct ContentView: View {
     @StateObject private var model = NodeModel()
     @State private var peerField: String = ""
+    @State private var searchQuery: String = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             header
             connectBar
+            searchBar
             Divider()
-            catalogList
+            if searchQuery.isEmpty {
+                catalogList
+            } else {
+                searchResults
+            }
             if let player = model.player {
                 VideoPlayer(player: player)
                     .frame(minHeight: 220)
@@ -42,19 +48,50 @@ struct ContentView: View {
         }
     }
 
+    private var searchBar: some View {
+        TextField("Rechercher (titre ou tag)…", text: $searchQuery)
+            .textFieldStyle(.roundedBorder)
+            .onChange(of: searchQuery, perform: { model.search($0) })
+    }
+
     private var catalogList: some View {
         List {
             ForEach(model.entries, id: \.issuer) { entry in
                 Section("créateur \(entry.issuer) — seq \(entry.seq)") {
-                    ForEach(entry.cids, id: \.self) { cid in
-                        HStack {
-                            Text(cid).font(.system(.caption, design: .monospaced)).lineLimit(1)
-                            Spacer()
-                            Button("Lire") { Task { await model.play(manifestCid: cid) } }
-                        }
+                    ForEach(entry.items, id: \.cid) { item in
+                        contentRow(
+                            title: item.title, tags: item.tags, cid: item.cid)
                     }
                 }
             }
+        }
+    }
+
+    private var searchResults: some View {
+        List {
+            ForEach(model.searchHits, id: \.cid) { hit in
+                contentRow(title: hit.title, tags: hit.tags, cid: hit.cid)
+            }
+            if model.searchHits.isEmpty {
+                Text("aucun résultat").foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// Une ligne de contenu : titre (ou CID si sans titre), tags, bouton Lire.
+    private func contentRow(title: String, tags: [String], cid: String) -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title.isEmpty ? cid : title)
+                    .font(title.isEmpty ? .system(.caption, design: .monospaced) : .body)
+                    .lineLimit(1)
+                if !tags.isEmpty {
+                    Text(tags.joined(separator: " · "))
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            Button("Lire") { Task { await model.play(manifestCid: cid) } }
         }
     }
 }

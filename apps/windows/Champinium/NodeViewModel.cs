@@ -2,6 +2,7 @@
 // Aucune logique métier ici — uniquement de l'orchestration d'appels au noyau
 // et de l'état d'affichage (équivalent C#/MVVM du NodeModel.swift macOS).
 using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.IO;
@@ -11,15 +12,23 @@ using Champinium.Core; // bindings générés par `just gen-csharp`
 
 namespace Champinium;
 
-/// <summary>Une ligne affichable : un CID rattaché à son créateur/feed.</summary>
+/// <summary>Une ligne affichable : un contenu rattaché à son créateur/feed.</summary>
 public sealed class CatalogCid
 {
     public string Issuer { get; init; } = "";
     public ulong Seq { get; init; }
     public string Cid { get; init; } = "";
+    public string Title { get; init; } = "";
+    public IReadOnlyList<string> Tags { get; init; } = Array.Empty<string>();
 
     /// <summary>Libellé court du créateur, pour l'en-tête de section.</summary>
     public string Header => $"créateur {Issuer} — seq {Seq}";
+
+    /// <summary>Libellé principal : le titre, ou le CID si sans titre.</summary>
+    public string Display => Title.Length > 0 ? Title : Cid;
+
+    /// <summary>Tags joints pour l'affichage (vide si aucun).</summary>
+    public string TagsText => string.Join(" · ", Tags);
 }
 
 /// <summary>
@@ -80,8 +89,21 @@ public sealed class NodeViewModel : INotifyPropertyChanged
         set => Set(ref _peerField, value);
     }
 
-    /// <summary>Catalogue aplati (un élément par CID) pour la liste.</summary>
+    /// <summary>Catalogue aplati (un élément par contenu) pour la liste ;
+    /// filtré par la recherche locale quand <see cref="SearchQuery"/> est saisi.</summary>
     public ObservableCollection<CatalogCid> Entries { get; } = new();
+
+    /// <summary>Requête de recherche locale (liaison TextBox) ; vide = catalogue.</summary>
+    private string _searchQuery = "";
+    public string SearchQuery
+    {
+        get => _searchQuery;
+        set
+        {
+            Set(ref _searchQuery, value);
+            RefreshCatalog();
+        }
+    }
 
     /// <summary>
     /// Émis quand un média est prêt à être lu : la vue branche le chemin du
@@ -154,25 +176,49 @@ public sealed class NodeViewModel : INotifyPropertyChanged
         }
     }
 
-    /// <summary>Met à jour la liste depuis le catalogue reconstruit localement.</summary>
+    /// <summary>
+    /// Met à jour la liste : catalogue complet, ou résultats de la recherche
+    /// locale (le core fait la recherche — le VM ne fait que présenter).
+    /// </summary>
     public void RefreshCatalog()
     {
         Entries.Clear();
-        var issuers = 0;
-        if (_node is not null)
+        if (_node is null)
         {
-            foreach (var entry in _node.Catalog())
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(SearchQuery))
+        {
+            var hits = _node.Search(SearchQuery);
+            foreach (var hit in hits)
             {
-                issuers++;
-                foreach (var cid in entry.cids)
+                Entries.Add(new CatalogCid
                 {
-                    Entries.Add(new CatalogCid
-                    {
-                        Issuer = entry.issuer,
-                        Seq = entry.seq,
-                        Cid = cid,
-                    });
-                }
+                    Issuer = hit.issuer,
+                    Cid = hit.cid,
+                    Title = hit.title,
+                    Tags = hit.tags,
+                });
+            }
+            Status = $"recherche: {hits.Count} résultat(s)";
+            return;
+        }
+
+        var issuers = 0;
+        foreach (var entry in _node.Catalog())
+        {
+            issuers++;
+            foreach (var item in entry.items)
+            {
+                Entries.Add(new CatalogCid
+                {
+                    Issuer = entry.issuer,
+                    Seq = entry.seq,
+                    Cid = item.cid,
+                    Title = item.title,
+                    Tags = item.tags,
+                });
             }
         }
         Status = $"catalogue: {issuers} créateur(s)";

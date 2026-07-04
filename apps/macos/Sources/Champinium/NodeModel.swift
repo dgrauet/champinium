@@ -26,6 +26,7 @@ final class NodeModel: ObservableObject {
     @Published var peerId: String = ""
     @Published var listenAddr: String = ""
     @Published var entries: [FfiCatalogEntry] = []
+    @Published var searchHits: [FfiSearchHit] = []
     @Published var player: AVPlayer?
 
     private var node: ChampiniumNode?
@@ -77,6 +78,11 @@ final class NodeModel: ObservableObject {
     func refreshCatalog() {
         entries = node?.catalog() ?? []
         status = "catalogue: \(entries.count) créateur(s)"
+    }
+
+    /// Recherche locale (titres/tags du catalogue) — la logique vit dans le core.
+    func search(_ query: String) {
+        searchHits = query.isEmpty ? [] : (node?.search(query: query) ?? [])
     }
 
     /// Récupère et lit un contenu (manifeste HLS) via AVPlayer. Le répertoire
