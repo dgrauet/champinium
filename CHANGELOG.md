@@ -6,6 +6,18 @@ versionnage : [SemVer](https://semver.org/lang/fr/). À partir de la 0.2.0, ce
 fichier est maintenu automatiquement par release-please (voir
 [ADR-0005](docs/adr/0005-release-please.md)).
 
+## [0.6.0](https://github.com/dgrauet/champinium/compare/v0.5.0...v0.6.0) (2026-07-04)
+
+
+### Features
+
+* **infra:** packaging sans coût de signature (Phase 6, palier gratuit) ([#29](https://github.com/dgrauet/champinium/issues/29)) ([e25d8c6](https://github.com/dgrauet/champinium/commit/e25d8c664334320d0b595aac30c1b9afc4fdb550))
+
+
+### Bug Fixes
+
+* **infra:** nom du binaire Linux dans le script de packaging ([#31](https://github.com/dgrauet/champinium/issues/31)) ([dbf3fa1](https://github.com/dgrauet/champinium/commit/dbf3fa1c415d6dba8b91ce8efe89afa28811ca00))
+
 ## [0.5.0](https://github.com/dgrauet/champinium/compare/v0.4.0...v0.5.0) (2026-07-04)
 
 
