@@ -6,6 +6,13 @@ versionnage : [SemVer](https://semver.org/lang/fr/). À partir de la 0.2.0, ce
 fichier est maintenu automatiquement par release-please (voir
 [ADR-0005](docs/adr/0005-release-please.md)).
 
+## [0.5.0](https://github.com/dgrauet/champinium/compare/v0.4.0...v0.5.0) (2026-07-04)
+
+
+### Features
+
+* **p2p:** réplication opportuniste des contenus sous-répliqués ([#27](https://github.com/dgrauet/champinium/issues/27)) ([725c080](https://github.com/dgrauet/champinium/commit/725c0800fb0d25a03e29ad2622c3b43daa6011db))
+
 ## [0.4.0](https://github.com/dgrauet/champinium/compare/v0.3.0...v0.4.0) (2026-07-04)
 
 
