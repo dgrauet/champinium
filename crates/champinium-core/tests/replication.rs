@@ -73,3 +73,44 @@ async fn consumer_reseeds_to_other_peers() {
     node_c.dial(addr_b).await.unwrap();
     assert_eq!(fetch(&node_c, cid).await, payload);
 }
+
+/// Le facteur de réplication d'un CID est mesurable : après qu'un consommateur
+/// a récupéré (et donc réannoncé) un bloc, la DHT compte DEUX fournisseurs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replication_factor_counts_providers() {
+    let dir = tempfile::tempdir().unwrap();
+    let node_a = node(dir.path(), "rf-a").await;
+    let addr_a = node_a
+        .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .await
+        .unwrap();
+    let payload = b"bloc replique mesurable".to_vec();
+    let cid = node_a.add(&payload).await.unwrap();
+
+    // Le publieur seul : facteur 1.
+    assert_eq!(node_a.replication_factor(cid).await.unwrap(), 1);
+
+    // B consomme → devient fournisseur → facteur 2 (vu de B).
+    let node_b = node(dir.path(), "rf-b").await;
+    node_b
+        .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .await
+        .unwrap();
+    node_b
+        .add_address(node_a.peer_id(), addr_a.clone())
+        .await
+        .unwrap();
+    node_b.dial(addr_a).await.unwrap();
+    assert_eq!(fetch(&node_b, cid).await, payload);
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if node_b.replication_factor(cid).await.unwrap() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("le facteur de réplication doit atteindre 2 après le reseed");
+}

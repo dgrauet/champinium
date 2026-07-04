@@ -18,6 +18,7 @@ use crate::feed::Feed;
 use crate::identity;
 use crate::ingest::{self, HlsManifest, HlsSegment};
 use crate::moderation::{Denylist, Moderation};
+use crate::report::{Report, ReportBook};
 use cid::Cid;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -41,6 +42,7 @@ use tokio::sync::{mpsc, oneshot};
 const BLOCK_PROTOCOL: &str = "/champinium/block/1.0.0";
 const IDENTIFY_PROTOCOL: &str = "/champinium/0.1.0";
 const FEEDS_TOPIC: &str = "champinium/feeds/v1";
+const REPORTS_TOPIC: &str = "champinium/reports/v1";
 
 /// Taille max d'un bloc servi via request-response (un segment HLS = un bloc).
 /// Le défaut cbor (10 MiB) est trop bas pour un segment vidéo haute qualité.
@@ -125,10 +127,12 @@ impl Behaviour {
         // plus relayés puis le pair est graylisté. C'est la brique de
         // réputation contre l'inondation du catalogue par des clés jetables.
         let mut score_params = gossipsub::PeerScoreParams::default();
-        score_params.topics.insert(
-            gossipsub::IdentTopic::new(FEEDS_TOPIC).hash(),
-            gossipsub::TopicScoreParams::default(),
-        );
+        for topic in [FEEDS_TOPIC, REPORTS_TOPIC] {
+            score_params.topics.insert(
+                gossipsub::IdentTopic::new(topic).hash(),
+                gossipsub::TopicScoreParams::default(),
+            );
+        }
         gossipsub
             .with_peer_score(score_params, gossipsub::PeerScoreThresholds::default())
             .expect("paramètres de scoring valides");
@@ -191,6 +195,10 @@ enum Command {
         peer: PeerId,
         tx: oneshot::Sender<Option<f64>>,
     },
+    PublishReport {
+        data: Vec<u8>,
+        tx: oneshot::Sender<CoreResult<()>>,
+    },
 }
 
 /// Poignée vers un nœud P2P en fonctionnement.
@@ -202,6 +210,7 @@ pub struct Node {
     moderation: Arc<RwLock<Moderation>>,
     catalog: Arc<Mutex<Catalog>>,
     catalog_events: tokio::sync::broadcast::Sender<()>,
+    reports: Arc<Mutex<ReportBook>>,
     feed_seq: Arc<Mutex<u64>>,
     cmd_tx: mpsc::Sender<Command>,
 }
@@ -244,16 +253,20 @@ impl Node {
             .behaviour_mut()
             .kademlia
             .set_mode(Some(kad::Mode::Server));
-        // Souscription au topic des feeds.
+        // Souscription aux topics des feeds et des signalements.
         let topic = gossipsub::IdentTopic::new(FEEDS_TOPIC);
-        swarm
-            .behaviour_mut()
-            .gossipsub
-            .subscribe(&topic)
-            .map_err(|e| CoreError::Network(format!("gossipsub subscribe: {e}")))?;
+        let reports_topic = gossipsub::IdentTopic::new(REPORTS_TOPIC);
+        for t in [&topic, &reports_topic] {
+            swarm
+                .behaviour_mut()
+                .gossipsub
+                .subscribe(t)
+                .map_err(|e| CoreError::Network(format!("gossipsub subscribe: {e}")))?;
+        }
 
         let moderation = Arc::new(RwLock::new(moderation));
         let catalog = Arc::new(Mutex::new(Catalog::new()));
+        let reports = Arc::new(Mutex::new(ReportBook::default()));
         // Canal d'événements « catalogue mis à jour » : capacité large car un
         // abonné lent ne doit pas perdre le signal (les tics sont fusionnables :
         // rater un tic mais en recevoir un plus tard suffit à se resynchroniser).
@@ -265,7 +278,9 @@ impl Node {
             moderation.clone(),
             catalog.clone(),
             catalog_events.clone(),
+            reports.clone(),
             topic,
+            reports_topic,
             cmd_rx,
         );
         tokio::spawn(event_loop.run());
@@ -281,9 +296,28 @@ impl Node {
             moderation,
             catalog,
             catalog_events,
+            reports,
             feed_seq,
             cmd_tx,
         })
+    }
+
+    /// Nombre de rapporteurs **distincts** ayant signalé ce CID (agrégat local,
+    /// borné). Matière première pour un éditeur de denylist — aucun effet
+    /// automatique sur le contenu.
+    pub fn report_count(&self, cid: &Cid) -> usize {
+        self.reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .count(cid)
+    }
+
+    /// CIDs signalés avec leur nombre de rapporteurs distincts.
+    pub fn report_counts(&self) -> Vec<(Cid, usize)> {
+        self.reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .counts()
     }
 
     /// Score gossipsub d'un pair (réputation ; `None` si le pair est inconnu
@@ -570,15 +604,24 @@ impl Node {
         rx.await.map_err(|_| CoreError::Shutdown)
     }
 
+    /// Facteur de réplication **mesuré** d'un CID : nombre de fournisseurs
+    /// annoncés dans la DHT (soi-même compris). Observabilité de la mitigation
+    /// du risque #1 (persistance) : seed-what-you-consume doit le faire croître.
+    pub async fn replication_factor(&self, cid: Cid) -> CoreResult<usize> {
+        Ok(self.get_providers(cid).await?.len())
+    }
+
     /// Récupère un bloc : cache local → sinon découverte DHT + transfert + vérif.
     /// Interroge **tous les fournisseurs en parallèle** et retient la première
     /// réponse valide. Applique seed-what-you-consume : le bloc est mis en cache
     /// **et réannoncé** (le consommateur devient fournisseur → réplication).
     ///
     /// CHECKPOINT MODÉRATION #2 (réception) : un contenu matché n'est ni récupéré,
-    /// ni mis en cache, ni reseedé.
+    /// ni mis en cache, ni reseedé — et le refus est **signalé** aux pairs
+    /// (rapport signé sur le topic des signalements, best-effort).
     pub async fn get(&self, cid: Cid) -> CoreResult<Vec<u8>> {
         if self.is_blocked(&cid) {
+            self.emit_report(&cid, "denylist").await;
             return Err(CoreError::Moderated(cid.to_string()));
         }
         if self.blockstore.has(&cid) {
@@ -632,6 +675,31 @@ impl Node {
             return Err(CoreError::IntegrityMismatch);
         }
         Ok(bytes)
+    }
+
+    /// Émet un rapport signé « CID refusé par ma modération » (best-effort :
+    /// un échec de diffusion ne doit jamais faire échouer le refus lui-même).
+    /// Le rapport compte aussi dans l'agrégat local (idempotent par rapporteur).
+    async fn emit_report(&self, cid: &Cid, reason: &str) {
+        let Ok(report) = Report::build_signed(&self.keypair, cid, reason) else {
+            return;
+        };
+        {
+            let mut book = self
+                .reports
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = book.apply(&report);
+        }
+        let Ok(json) = report.to_json() else { return };
+        let (tx, _rx) = oneshot::channel();
+        let _ = self
+            .cmd_tx
+            .send(Command::PublishReport {
+                data: json.into_bytes(),
+                tx,
+            })
+            .await;
     }
 
     async fn send(&self, cmd: Command) -> CoreResult<()> {
@@ -715,7 +783,9 @@ struct EventLoop {
     moderation: Arc<RwLock<Moderation>>,
     catalog: Arc<Mutex<Catalog>>,
     catalog_events: tokio::sync::broadcast::Sender<()>,
+    reports: Arc<Mutex<ReportBook>>,
     feeds_topic: gossipsub::IdentTopic,
+    reports_topic: gossipsub::IdentTopic,
     cmd_rx: mpsc::Receiver<Command>,
     pending_listen:
         HashMap<libp2p::core::transport::ListenerId, oneshot::Sender<CoreResult<Multiaddr>>>,
@@ -730,13 +800,16 @@ struct EventLoop {
 type PendingGetRecord = (oneshot::Sender<Vec<Vec<u8>>>, Vec<Vec<u8>>);
 
 impl EventLoop {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         swarm: Swarm<Behaviour>,
         blockstore: Blockstore,
         moderation: Arc<RwLock<Moderation>>,
         catalog: Arc<Mutex<Catalog>>,
         catalog_events: tokio::sync::broadcast::Sender<()>,
+        reports: Arc<Mutex<ReportBook>>,
         feeds_topic: gossipsub::IdentTopic,
+        reports_topic: gossipsub::IdentTopic,
         cmd_rx: mpsc::Receiver<Command>,
     ) -> Self {
         Self {
@@ -745,7 +818,9 @@ impl EventLoop {
             moderation,
             catalog,
             catalog_events,
+            reports,
             feeds_topic,
+            reports_topic,
             cmd_rx,
             pending_listen: HashMap::new(),
             pending_provide: HashMap::new(),
@@ -856,6 +931,20 @@ impl EventLoop {
             Command::PeerScore { peer, tx } => {
                 let _ = tx.send(self.swarm.behaviour().gossipsub.peer_score(&peer));
             }
+            Command::PublishReport { data, tx } => {
+                let res = match self
+                    .swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .publish(self.reports_topic.clone(), data)
+                {
+                    Ok(_) => Ok(()),
+                    // Personne n'écoute encore : le signalement est best-effort.
+                    Err(gossipsub::PublishError::NoPeersSubscribedToTopic) => Ok(()),
+                    Err(e) => Err(CoreError::Network(format!("gossipsub publish: {e}"))),
+                };
+                let _ = tx.send(res);
+            }
         }
     }
 
@@ -909,9 +998,52 @@ impl EventLoop {
                 propagation_source,
                 message_id,
                 message,
-            })) => self.handle_feed_message(&message_id, &propagation_source, &message.data),
+            })) => {
+                // Dispatch par topic : feeds (catalogue) ou signalements.
+                if message.topic == self.reports_topic.hash() {
+                    self.handle_report_message(&message_id, &propagation_source, &message.data);
+                } else {
+                    self.handle_feed_message(&message_id, &propagation_source, &message.data);
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Applique un rapport de signalement reçu (signature vérifiée) à l'agrégat
+    /// local, puis rapporte le verdict à gossipsub (mêmes règles que les feeds :
+    /// Accept si l'agrégat change, Ignore si sans effet — doublon, agrégat
+    /// plein —, Reject si invalide → pénalise l'émetteur via le peer scoring).
+    fn handle_report_message(
+        &mut self,
+        message_id: &gossipsub::MessageId,
+        propagation_source: &PeerId,
+        data: &[u8],
+    ) {
+        let acceptance = match Report::from_json(data).and_then(|r| r.verify().map(|()| r)) {
+            Ok(report) => {
+                let mut book = self
+                    .reports
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match book.apply(&report) {
+                    Ok(true) => gossipsub::MessageAcceptance::Accept,
+                    Ok(false) => gossipsub::MessageAcceptance::Ignore,
+                    Err(e) => {
+                        tracing::debug!("rapport rejeté: {e}");
+                        gossipsub::MessageAcceptance::Reject
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!("rapport invalide: {e}");
+                gossipsub::MessageAcceptance::Reject
+            }
+        };
+        self.swarm
+            .behaviour_mut()
+            .gossipsub
+            .report_message_validation_result(message_id, propagation_source, acceptance);
     }
 
     /// Stores DHT entrants (mode `StoreInserts::FilterBoth` : rien n'est stocké

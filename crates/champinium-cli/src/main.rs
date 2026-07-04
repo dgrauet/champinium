@@ -64,6 +64,12 @@ enum Cmd {
         #[arg(long)]
         peer: String,
     },
+    /// Facteur de réplication mesuré d'un CID (nombre de fournisseurs DHT).
+    Replication {
+        cid: String,
+        #[arg(long)]
+        peer: String,
+    },
     /// Reconstruit et affiche le catalogue en écoutant les feeds d'un pair.
     Catalog {
         /// Pair auquel se connecter `/ip4/.../tcp/.../p2p/<peerid>`.
@@ -177,6 +183,14 @@ async fn main() -> Result<()> {
                     println!("{p}");
                 }
             }
+        }
+        Cmd::Replication { cid, peer } => {
+            let cid: Cid = cid.parse().context("CID invalide")?;
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            node.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await?;
+            connect_peer(&node, &peer).await?;
+            let n = node.replication_factor(cid).await?;
+            println!("facteur de réplication: {n} fournisseur(s)");
         }
         Cmd::Catalog { peer, wait } => {
             let node = build_node(&cli.data_dir, &cli.denylist).await?;
