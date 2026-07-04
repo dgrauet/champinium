@@ -1,0 +1,7 @@
+# Config swiftformat du front macOS (convention CLAUDE.md : swift-format).
+# Le wrapper généré Sources/ChampiniumCore/ est exclu : il est produit par
+# UniFFI au build (gitignoré), pas écrit à la main.
+--exclude Sources/ChampiniumCore,.build,Frameworks
+--swiftversion 5.9
+--indent 4
+--maxwidth 100
