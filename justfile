@@ -56,6 +56,10 @@ macos-prepare: gen-swift
 macos-build: macos-prepare
     cd apps/macos && swift build
 
+# Bundle macOS distribuable (signature ad-hoc, gratuite — voir docs/packaging.md).
+macos-app: macos-prepare
+    ./scripts/package-macos-app.sh
+
 # Génère les bindings C# (Windows) dans bindings/csharp/.
 # Requiert : cargo install uniffi-bindgen-cs
 gen-csharp: build-core
