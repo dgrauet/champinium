@@ -36,6 +36,13 @@ struct Cli {
     /// Intervalle de réannonce/republication, en secondes.
     #[arg(long, default_value = "3600")]
     reprovide_interval: u64,
+    /// Cible de réplication opportuniste : le démon réplique les contenus du
+    /// catalogue ayant moins de N fournisseurs (0 = désactivé).
+    #[arg(long, default_value = "2")]
+    replication_target: usize,
+    /// Nombre max de contenus répliqués par passe (borne bande passante/disque).
+    #[arg(long, default_value = "16")]
+    replicate_max: usize,
 }
 
 #[tokio::main]
@@ -68,6 +75,7 @@ async fn main() -> Result<()> {
     let interval = Duration::from_secs(cli.reprovide_interval.max(1));
     loop {
         reseed(&node).await;
+        replicate(&node, cli.replication_target, cli.replicate_max).await;
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}
             _ = tokio::signal::ctrl_c() => {
@@ -75,6 +83,19 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
         }
+    }
+}
+
+/// Réplication opportuniste : réplique les contenus du catalogue sous-répliqués
+/// (mitigation du risque #1 persistance, au-delà de seed-what-you-consume).
+async fn replicate(node: &Node, target: usize, max_items: usize) {
+    if target == 0 {
+        return;
+    }
+    match node.replicate_under_provided(target, max_items).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("réplication opportuniste de {n} contenu(s)"),
+        Err(e) => tracing::warn!("réplication opportuniste échouée: {e}"),
     }
 }
 
