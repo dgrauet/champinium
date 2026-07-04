@@ -114,3 +114,69 @@ async fn replication_factor_counts_providers() {
     .await
     .expect("le facteur de réplication doit atteindre 2 après le reseed");
 }
+
+/// Réplication OPPORTUNISTE (au-delà de seed-what-you-consume) : un nœud qui
+/// connaît un contenu par son catalogue (feed gossip) mais ne l'a PAS consommé
+/// le réplique proactivement s'il est sous-répliqué — manifeste HLS ET
+/// segments — et devient fournisseur.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn under_provided_content_is_replicated_opportunistically() {
+    use champinium_core::ingest::{HlsManifest, HlsSegment};
+
+    let dir = tempfile::tempdir().unwrap();
+    let node_a = node(dir.path(), "op-a").await;
+    let addr_a = node_a
+        .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .await
+        .unwrap();
+
+    // A publie un « contenu » : un segment + un manifeste HLS qui le référence.
+    let seg = node_a.add(b"segment video opportuniste").await.unwrap();
+    let manifest = HlsManifest::new(
+        4.0,
+        vec![HlsSegment {
+            cid: seg.to_string(),
+            duration: 4.0,
+        }],
+    );
+    let manifest_cid = node_a
+        .add(manifest.to_json().unwrap().as_bytes())
+        .await
+        .unwrap();
+
+    // B apprend l'existence du contenu par le feed (catalogue), sans le consommer.
+    let node_b = node(dir.path(), "op-b").await;
+    node_b
+        .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .await
+        .unwrap();
+    node_b
+        .add_address(node_a.peer_id(), addr_a.clone())
+        .await
+        .unwrap();
+    node_b.dial(addr_a).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            node_a.publish_feed(&[manifest_cid]).await.unwrap();
+            if node_b.catalog_cids().contains(&manifest_cid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .expect("le feed doit atteindre B");
+    assert!(
+        !node_b.blockstore().has(&manifest_cid),
+        "pas encore consommé"
+    );
+
+    // Facteur observé : 1 (A seul) < cible 2 → B doit répliquer.
+    let replicated = node_b.replicate_under_provided(2, 10).await.unwrap();
+    assert_eq!(replicated, 1, "un contenu répliqué");
+    assert!(node_b.blockstore().has(&manifest_cid), "manifeste répliqué");
+    assert!(node_b.blockstore().has(&seg), "segments répliqués aussi");
+
+    // Une seconde passe ne refait rien : le contenu est désormais local.
+    assert_eq!(node_b.replicate_under_provided(2, 10).await.unwrap(), 0);
+}

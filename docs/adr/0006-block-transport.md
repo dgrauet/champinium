@@ -24,3 +24,12 @@ fournisseurs **en parallèle** et réannonce le bloc consommé
 - libp2p 0.56 est en place : la migration bitswap ne dépendra plus que de la
   résolution amont de `core2`/`multihash-codetable` (ou d'un vendoring assumé).
 - Pas de want-list ni de session bitswap pour l'instant ; transfert bloc-par-bloc.
+
+## Point amont (2026-07-04)
+
+`core2` reste entièrement yanké, **mais** `multihash-codetable` a désormais une
+lignée **0.2.x saine** (sans `core2` : digest/sha2 0.11). Le blocage se réduit
+donc à `beetswap` (0.5.0), qui exige encore `multihash-codetable ^0.1`
+(lignée empoisonnée). Prochain déclencheur : un bump `^0.1 → ^0.2` côté
+beetswap (demande amont légère), puis reprise de la migration ici — et, dans la
+foulée, réévaluation d'IPNS (ADR 0007).

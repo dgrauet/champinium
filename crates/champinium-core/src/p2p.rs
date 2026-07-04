@@ -695,6 +695,55 @@ impl Node {
         Ok(self.get_providers(cid).await?.len())
     }
 
+    /// Réplication **opportuniste** (au-delà de seed-what-you-consume,
+    /// mitigation du risque #1 persistance) : parcourt les contenus connus du
+    /// catalogue, mesure leur facteur de réplication, et réplique ceux qui ont
+    /// moins de `target` fournisseurs — manifeste HLS **et** segments (tout
+    /// passe par `get`, donc le checkpoint modération #2 s'applique). Au plus
+    /// `max_items` contenus par passe (borne bande passante/disque). Renvoie le
+    /// nombre de contenus répliqués.
+    pub async fn replicate_under_provided(
+        &self,
+        target: usize,
+        max_items: usize,
+    ) -> CoreResult<usize> {
+        if target == 0 {
+            return Ok(0);
+        }
+        let mut replicated = 0;
+        for cid in self.catalog_cids() {
+            if replicated >= max_items {
+                break;
+            }
+            if self.blockstore.has(&cid) || self.is_blocked(&cid) {
+                continue;
+            }
+            if self.replication_factor(cid).await? >= target {
+                continue;
+            }
+            match self.replicate(cid).await {
+                Ok(()) => replicated += 1,
+                // Best-effort : un contenu irrécupérable (fournisseur parti,
+                // segment bloqué) ne doit pas stopper la passe.
+                Err(e) => tracing::debug!("réplication de {cid} échouée: {e}"),
+            }
+        }
+        Ok(replicated)
+    }
+
+    /// Réplique un contenu : récupère le bloc (mise en cache + réannonce via
+    /// `get`) et, si c'est un manifeste HLS, tous ses segments.
+    async fn replicate(&self, cid: Cid) -> CoreResult<()> {
+        let bytes = self.get(cid).await?;
+        if let Ok(manifest) = HlsManifest::from_json(&bytes) {
+            for seg in &manifest.segments {
+                let seg_cid: Cid = seg.cid.parse().map_err(CoreError::Cid)?;
+                self.get(seg_cid).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Récupère un bloc : cache local → sinon découverte DHT + transfert + vérif.
     /// Interroge **tous les fournisseurs en parallèle** et retient la première
     /// réponse valide. Applique seed-what-you-consume : le bloc est mis en cache
