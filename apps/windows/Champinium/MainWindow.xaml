@@ -16,6 +16,7 @@
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
@@ -47,11 +48,16 @@
             <Button Grid.Column="2" Content="Rafraîchir" Click="OnRefreshClick" />
         </Grid>
 
-        <Border Grid.Row="2" Height="1"
+        <!-- Recherche locale : titres et tags du catalogue reconstruit -->
+        <TextBox Grid.Row="2"
+                 PlaceholderText="Rechercher (titre ou tag)…"
+                 Text="{x:Bind Model.SearchQuery, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+
+        <Border Grid.Row="3" Height="1"
                 Background="{ThemeResource DividerStrokeColorDefaultBrush}" />
 
-        <!-- Catalogue : un item par CID, regroupé par créateur -->
-        <ListView Grid.Row="3"
+        <!-- Catalogue (ou résultats de recherche) : un item par contenu -->
+        <ListView Grid.Row="4"
                   ItemsSource="{x:Bind Model.Entries, Mode=OneWay}"
                   SelectionMode="None">
             <ListView.ItemTemplate>
@@ -65,9 +71,13 @@
                             <TextBlock Text="{x:Bind Header}"
                                        Style="{StaticResource CaptionTextBlockStyle}"
                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                            <TextBlock Text="{x:Bind Cid}"
-                                       FontFamily="Consolas"
+                            <!-- Titre du contenu, ou CID si sans titre -->
+                            <TextBlock Text="{x:Bind Display}"
                                        TextTrimming="CharacterEllipsis"
+                                       TextWrapping="NoWrap" />
+                            <TextBlock Text="{x:Bind TagsText}"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource TextFillColorTertiaryBrush}"
                                        TextWrapping="NoWrap" />
                         </StackPanel>
                         <Button Grid.Column="1" Content="Lire"
@@ -78,7 +88,7 @@
         </ListView>
 
         <!-- Lecteur média (Media Foundation via MediaPlayerElement) -->
-        <MediaPlayerElement Grid.Row="4"
+        <MediaPlayerElement Grid.Row="5"
                             x:Name="Player"
                             AreTransportControlsEnabled="True"
                             MinHeight="220" />

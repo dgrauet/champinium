@@ -14,7 +14,7 @@ use crate::blockstore::Blockstore;
 use crate::catalog::{Catalog, CatalogEntry};
 use crate::content::{cid_for, verify};
 use crate::error::{CoreError, Result as CoreResult};
-use crate::feed::Feed;
+use crate::feed::{Feed, FeedEntry};
 use crate::identity;
 use crate::ingest::{self, HlsManifest, HlsSegment};
 use crate::moderation::{Denylist, Moderation};
@@ -163,11 +163,11 @@ enum Command {
         addr: Multiaddr,
     },
     Provide {
-        cid: Cid,
+        key: RecordKey,
         tx: oneshot::Sender<CoreResult<()>>,
     },
     GetProviders {
-        cid: Cid,
+        key: RecordKey,
         tx: oneshot::Sender<HashSet<PeerId>>,
     },
     RequestBlock {
@@ -411,9 +411,25 @@ impl Node {
         Ok(purged)
     }
 
-    /// Publie un feed signé listant `cids` : l'ajoute au catalogue local puis le
-    /// diffuse en gossipsub. Le `seq` est incrémenté à chaque appel.
+    /// Publie un feed signé listant `cids` (sans métadonnées) : voir
+    /// [`Node::publish_feed_with`].
     pub async fn publish_feed(&self, cids: &[Cid]) -> CoreResult<()> {
+        let entries: Vec<FeedEntry> = cids
+            .iter()
+            .map(|c| FeedEntry {
+                cid: c.to_string(),
+                title: String::new(),
+                tags: Vec::new(),
+            })
+            .collect();
+        self.publish_feed_with(&entries).await
+    }
+
+    /// Publie un feed v2 signé avec métadonnées (titre, tags) : l'ajoute au
+    /// catalogue local, le diffuse en gossipsub, le PUT dans la DHT, et
+    /// **s'annonce fournisseur de chaque tag** (`/champinium/tag/<tag>`) pour la
+    /// découverte par tag hors gossip. Le `seq` est incrémenté à chaque appel.
+    pub async fn publish_feed_with(&self, entries: &[FeedEntry]) -> CoreResult<()> {
         // Incrément et persistance sous le même verrou : deux publications
         // concurrentes ne peuvent pas réordonner le seq écrit sur disque (sinon,
         // au redémarrage, on republierait un seq déjà vu, ignoré par le LWW).
@@ -428,7 +444,7 @@ impl Node {
             }
             *guard
         };
-        let feed = Feed::build_signed(&self.keypair, seq, cids)?;
+        let feed = Feed::build_signed_with(&self.keypair, seq, entries)?;
         // Le créateur figure dans son propre catalogue.
         let changed = self
             .catalog
@@ -449,10 +465,70 @@ impl Node {
                 tx: put_tx,
             })
             .await;
+        // Annonce des tags (best-effort, plafonné) : le fournisseur du tag est
+        // l'émetteur lui-même ; un chercheur récupère ensuite son feed SIGNÉ et
+        // filtre — un tag annoncé à tort ne fait perdre qu'une requête.
+        for tag in feed.all_tags().into_iter().take(MAX_PROVIDED_TAGS) {
+            let (tx, _rx) = oneshot::channel();
+            let _ = self
+                .cmd_tx
+                .send(Command::Provide {
+                    key: tag_provider_key(&tag),
+                    tx,
+                })
+                .await;
+        }
         // Diffusion live en gossipsub.
         let (tx, rx) = oneshot::channel();
         self.send(Command::PublishFeed { data, tx }).await?;
         rx.await.map_err(|_| CoreError::Shutdown)?
+    }
+
+    /// Recherche **locale** dans le catalogue reconstruit (titres, tags).
+    /// Limite assumée : ne couvre que les feeds que ce nœud a vus passer.
+    pub fn search(&self, query: &str) -> Vec<crate::catalog::SearchHit> {
+        self.catalog
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .search(query)
+    }
+
+    /// Recherche par tag **via la DHT** (hors gossip) : retrouve les émetteurs
+    /// annoncés fournisseurs du tag, récupère et vérifie leurs feeds signés,
+    /// alimente le catalogue, et renvoie les contenus portant ce tag.
+    pub async fn search_tag(&self, tag: &str) -> CoreResult<Vec<crate::catalog::SearchHit>> {
+        let tag = crate::feed::normalize_tag(tag);
+        if tag.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (tx, rx) = oneshot::channel();
+        self.send(Command::GetProviders {
+            key: tag_provider_key(&tag),
+            tx,
+        })
+        .await?;
+        let issuers = rx.await.map_err(|_| CoreError::Shutdown)?;
+
+        let mut hits = Vec::new();
+        for issuer in issuers {
+            // `fetch_feed` vérifie signature + émetteur et alimente le catalogue.
+            let Ok(Some(feed)) = self.fetch_feed(issuer).await else {
+                continue;
+            };
+            for e in &feed.entries {
+                if e.tags.iter().any(|t| t == &tag) {
+                    if let Ok(cid) = e.cid.parse::<Cid>() {
+                        hits.push(crate::catalog::SearchHit {
+                            issuer,
+                            cid,
+                            title: e.title.clone(),
+                            tags: e.tags.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(hits)
     }
 
     /// Récupère le feed d'un créateur depuis la DHT (découverte hors gossip).
@@ -593,14 +669,22 @@ impl Node {
             return Ok(());
         }
         let (tx, rx) = oneshot::channel();
-        self.send(Command::Provide { cid, tx }).await?;
+        self.send(Command::Provide {
+            key: RecordKey::new(&cid.to_bytes()),
+            tx,
+        })
+        .await?;
         rx.await.map_err(|_| CoreError::Shutdown)?
     }
 
     /// Recherche les fournisseurs d'un CID via la DHT.
     pub async fn get_providers(&self, cid: Cid) -> CoreResult<HashSet<PeerId>> {
         let (tx, rx) = oneshot::channel();
-        self.send(Command::GetProviders { cid, tx }).await?;
+        self.send(Command::GetProviders {
+            key: RecordKey::new(&cid.to_bytes()),
+            tx,
+        })
+        .await?;
         rx.await.map_err(|_| CoreError::Shutdown)
     }
 
@@ -723,6 +807,20 @@ fn load_feed_seq(blockstore: &Blockstore) -> u64 {
 
 /// Préfixe des clés DHT de feeds.
 const FEED_KEY_PREFIX: &[u8] = b"/champinium/feed/";
+
+/// Préfixe des clés de fournisseurs de tags.
+const TAG_KEY_PREFIX: &[u8] = b"/champinium/tag/";
+
+/// Nombre max de tags distincts annoncés par publication (anti-abus : chaque
+/// annonce est une requête DHT).
+const MAX_PROVIDED_TAGS: usize = 64;
+
+/// Clé de fournisseur d'un tag : `/champinium/tag/<tag normalisé>`.
+fn tag_provider_key(tag: &str) -> RecordKey {
+    let mut key = TAG_KEY_PREFIX.to_vec();
+    key.extend_from_slice(tag.as_bytes());
+    RecordKey::new(&key)
+}
 
 /// Clé DHT du feed d'un créateur : `/champinium/feed/<peerid>`.
 fn feed_record_key(peer: &PeerId) -> RecordKey {
@@ -866,8 +964,7 @@ impl EventLoop {
             Command::AddAddress { peer, addr } => {
                 self.swarm.behaviour_mut().kademlia.add_address(&peer, addr);
             }
-            Command::Provide { cid, tx } => {
-                let key = RecordKey::new(&cid.to_bytes());
+            Command::Provide { key, tx } => {
                 match self.swarm.behaviour_mut().kademlia.start_providing(key) {
                     Ok(qid) => {
                         self.pending_provide.insert(qid, tx);
@@ -877,8 +974,7 @@ impl EventLoop {
                     }
                 }
             }
-            Command::GetProviders { cid, tx } => {
-                let key = RecordKey::new(&cid.to_bytes());
+            Command::GetProviders { key, tx } => {
                 let qid = self.swarm.behaviour_mut().kademlia.get_providers(key);
                 self.pending_get_providers.insert(qid, (tx, HashSet::new()));
             }

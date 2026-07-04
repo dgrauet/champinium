@@ -1,4 +1,4 @@
-//! Surface UniFFI exposée aux fronts natifs (contrat v3).
+//! Surface UniFFI exposée aux fronts natifs (contrat v4).
 //!
 //! C'est la **frontière de contrat** : les fronts (Swift, C#) codent contre cet
 //! objet, jamais contre l'implémentation. Toute évolution passe par l'agent NOYAU
@@ -61,6 +61,31 @@ pub trait CatalogListener: Send + Sync {
     fn on_catalog_updated(&self);
 }
 
+/// Un contenu avec ses métadonnées signées (titre, tags). Sert à la fois de
+/// sortie (catalogue, recherche) et d'entrée (`publish_feed_with`).
+#[derive(uniffi::Record)]
+pub struct FfiContentItem {
+    /// CID du contenu (chaîne CIDv1) — pour une vidéo, le manifeste HLS.
+    pub cid: String,
+    /// Titre lisible (peut être vide).
+    pub title: String,
+    /// Tags (normalisés en minuscules à la publication).
+    pub tags: Vec<String>,
+}
+
+/// Un résultat de recherche.
+#[derive(uniffi::Record)]
+pub struct FfiSearchHit {
+    /// PeerId du créateur (chaîne).
+    pub issuer: String,
+    /// CID du contenu.
+    pub cid: String,
+    /// Titre.
+    pub title: String,
+    /// Tags.
+    pub tags: Vec<String>,
+}
+
 /// Une entrée de catalogue, vue par les fronts.
 #[derive(uniffi::Record)]
 pub struct FfiCatalogEntry {
@@ -70,6 +95,8 @@ pub struct FfiCatalogEntry {
     pub seq: u64,
     /// CIDs publiés (chaînes).
     pub cids: Vec<String>,
+    /// Contenus enrichis (mêmes CIDs, avec titre/tags — vides pour un feed v1).
+    pub items: Vec<FfiContentItem>,
 }
 
 /// Nœud Champinium exposé aux fronts. Encapsule le noyau ; les fronts ne font que
@@ -113,7 +140,26 @@ impl ChampiniumNode {
                 issuer: e.issuer.to_string(),
                 seq: e.seq,
                 cids: e.cids.iter().map(|c| c.to_string()).collect(),
+                items: e
+                    .items
+                    .into_iter()
+                    .map(|i| FfiContentItem {
+                        cid: i.cid.to_string(),
+                        title: i.title,
+                        tags: i.tags,
+                    })
+                    .collect(),
             })
+            .collect()
+    }
+
+    /// Recherche **locale** (titres et tags du catalogue reconstruit). Limite
+    /// assumée : ne couvre que ce que ce nœud a vu passer.
+    pub fn search(&self, query: String) -> Vec<FfiSearchHit> {
+        self.inner
+            .search(&query)
+            .into_iter()
+            .map(search_hit_to_ffi)
             .collect()
     }
 }
@@ -143,11 +189,40 @@ impl ChampiniumNode {
         Ok(cid.to_string())
     }
 
-    /// Publie un feed signé listant `cids`.
+    /// Publie un feed signé listant `cids` (sans métadonnées).
     pub async fn publish_feed(&self, cids: Vec<String>) -> Result<(), FfiError> {
         let parsed = parse_cids(&cids)?;
         self.inner.publish_feed(&parsed).await?;
         Ok(())
+    }
+
+    /// Publie un feed signé avec métadonnées (titre, tags) : rend le contenu
+    /// **cherchable** (index local des pairs + découverte par tag via la DHT).
+    pub async fn publish_feed_with(&self, items: Vec<FfiContentItem>) -> Result<(), FfiError> {
+        // Valide les CIDs avant signature (erreur typée InvalidInput).
+        parse_cids(&items.iter().map(|i| i.cid.clone()).collect::<Vec<_>>())?;
+        let entries: Vec<crate::feed::FeedEntry> = items
+            .into_iter()
+            .map(|i| crate::feed::FeedEntry {
+                cid: i.cid,
+                title: i.title,
+                tags: i.tags,
+            })
+            .collect();
+        self.inner.publish_feed_with(&entries).await?;
+        Ok(())
+    }
+
+    /// Recherche par tag **via la DHT** (découverte hors gossip) : retrouve les
+    /// émetteurs fournisseurs du tag et vérifie leurs feeds signés.
+    pub async fn search_tag(&self, tag: String) -> Result<Vec<FfiSearchHit>, FfiError> {
+        Ok(self
+            .inner
+            .search_tag(&tag)
+            .await?
+            .into_iter()
+            .map(search_hit_to_ffi)
+            .collect())
     }
 
     /// Enregistre un listener de catalogue : remplace l'attente aveugle côté
@@ -191,6 +266,15 @@ impl ChampiniumNode {
             .fetch_hls(cid, std::path::Path::new(&out_dir))
             .await?;
         Ok(playlist.to_string_lossy().into_owned())
+    }
+}
+
+fn search_hit_to_ffi(h: crate::catalog::SearchHit) -> FfiSearchHit {
+    FfiSearchHit {
+        issuer: h.issuer.to_string(),
+        cid: h.cid.to_string(),
+        title: h.title,
+        tags: h.tags,
     }
 }
 
@@ -281,5 +365,35 @@ mod tests {
             .await
             .expect("le listener doit être rappelé après publish_feed")
             .unwrap();
+    }
+
+    /// Contrat v4 : publication avec métadonnées + recherche locale exposées
+    /// aux fronts (le catalogue expose aussi les items enrichis).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publish_with_metadata_then_search_via_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = open_node(dir.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+
+        let cid = crate::content::cid_for(b"contenu v4").to_string();
+        node.publish_feed_with(vec![FfiContentItem {
+            cid: cid.clone(),
+            title: "Aurores boréales".into(),
+            tags: vec!["nature".into()],
+        }])
+        .await
+        .unwrap();
+
+        // Recherche locale (titre, insensible à la casse).
+        let hits = node.search("aurores".into());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].cid, cid);
+        assert_eq!(hits[0].title, "Aurores boréales");
+
+        // Le catalogue expose les items enrichis.
+        let entries = node.catalog();
+        assert_eq!(entries[0].items[0].title, "Aurores boréales");
+        assert_eq!(entries[0].items[0].tags, vec!["nature"]);
     }
 }

@@ -12,12 +12,31 @@ use cid::Cid;
 use libp2p::PeerId;
 use std::collections::{HashMap, HashSet};
 
+/// Un contenu du catalogue avec ses métadonnées (feed v2 ; vides pour un v1).
+#[derive(Debug, Clone)]
+pub struct CatalogItem {
+    pub cid: Cid,
+    pub title: String,
+    pub tags: Vec<String>,
+}
+
 /// Une entrée de catalogue : le dernier feed connu d'un créateur.
 #[derive(Debug, Clone)]
 pub struct CatalogEntry {
     pub issuer: PeerId,
     pub seq: u64,
     pub cids: Vec<Cid>,
+    /// Contenus avec métadonnées (mêmes CIDs que `cids`, enrichis).
+    pub items: Vec<CatalogItem>,
+}
+
+/// Un résultat de recherche locale.
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    pub issuer: PeerId,
+    pub cid: Cid,
+    pub title: String,
+    pub tags: Vec<String>,
 }
 
 /// Borne par défaut du nombre d'émetteurs retenus (anti-DoS : sans borne, des
@@ -74,13 +93,64 @@ impl Catalog {
         self.feeds
             .iter()
             .filter_map(|(issuer, feed)| {
-                feed.cids().ok().map(|cids| CatalogEntry {
+                let cids = feed.cids().ok()?;
+                // v2 : métadonnées des entries ; v1 : items sans titre ni tags.
+                let items = if feed.entries.is_empty() {
+                    cids.iter()
+                        .map(|cid| CatalogItem {
+                            cid: *cid,
+                            title: String::new(),
+                            tags: Vec::new(),
+                        })
+                        .collect()
+                } else {
+                    feed.entries
+                        .iter()
+                        .filter_map(|e| {
+                            e.cid.parse::<Cid>().ok().map(|cid| CatalogItem {
+                                cid,
+                                title: e.title.clone(),
+                                tags: e.tags.clone(),
+                            })
+                        })
+                        .collect()
+                };
+                Some(CatalogEntry {
                     issuer: *issuer,
                     seq: feed.seq,
                     cids,
+                    items,
                 })
             })
             .collect()
+    }
+
+    /// Recherche locale : sous-chaîne insensible à la casse dans les titres,
+    /// correspondance sur les tags (déjà normalisés en minuscules). Limite
+    /// assumée (risque #4 du spec) : l'index ne couvre que les feeds que CE
+    /// nœud a vus passer — il n'y a pas de recherche globale exhaustive sur un
+    /// réseau décentralisé.
+    pub fn search(&self, query: &str) -> Vec<SearchHit> {
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let mut hits = Vec::new();
+        for entry in self.entries() {
+            for item in entry.items {
+                if item.title.to_lowercase().contains(&needle)
+                    || item.tags.iter().any(|t| t == &needle)
+                {
+                    hits.push(SearchHit {
+                        issuer: entry.issuer,
+                        cid: item.cid,
+                        title: item.title,
+                        tags: item.tags,
+                    });
+                }
+            }
+        }
+        hits
     }
 
     /// Tous les CIDs connus, tous émetteurs confondus.
@@ -171,5 +241,72 @@ mod tests {
         feed.signature = None;
         let mut cat = Catalog::new();
         assert!(cat.apply(feed).is_err());
+    }
+
+    // --- Recherche locale (index reconstruit par écoute, limites assumées :
+    // --- ne couvre que ce que CE nœud a vu passer) ---
+
+    fn meta(cid: Cid, title: &str, tags: &[&str]) -> crate::feed::FeedEntry {
+        crate::feed::FeedEntry {
+            cid: cid.to_string(),
+            title: title.to_string(),
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn search_matches_title_and_tags_case_insensitive() {
+        let k1 = Keypair::generate_ed25519();
+        let k2 = Keypair::generate_ed25519();
+        let mut cat = Catalog::new();
+        cat.apply(
+            Feed::build_signed_with(
+                &k1,
+                1,
+                &[meta(cid_for(b"a"), "Aurores boréales", &["nature", "nuit"])],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        cat.apply(
+            Feed::build_signed_with(
+                &k2,
+                1,
+                &[meta(cid_for(b"b"), "Recette de pâtes", &["cuisine"])],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Titre, insensible à la casse.
+        let hits = cat.search("AURORES");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].cid, cid_for(b"a"));
+        assert_eq!(hits[0].title, "Aurores boréales");
+        assert_eq!(hits[0].issuer, k1.public().to_peer_id());
+
+        // Tag.
+        let hits = cat.search("cuisine");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].cid, cid_for(b"b"));
+
+        // Aucun résultat.
+        assert!(cat.search("astronomie").is_empty());
+    }
+
+    #[test]
+    fn entries_expose_items_with_metadata() {
+        let k = Keypair::generate_ed25519();
+        let mut cat = Catalog::new();
+        cat.apply(
+            Feed::build_signed_with(&k, 1, &[meta(cid_for(b"a"), "Titre", &["tag"])]).unwrap(),
+        )
+        .unwrap();
+        let entries = cat.entries();
+        assert_eq!(entries[0].items.len(), 1);
+        assert_eq!(entries[0].items[0].title, "Titre");
+        assert_eq!(entries[0].items[0].tags, vec!["tag"]);
+        // `cids` reste dérivé (compat).
+        assert_eq!(entries[0].cids, vec![cid_for(b"a")]);
     }
 }

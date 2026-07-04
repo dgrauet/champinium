@@ -62,6 +62,9 @@ fn build_ui(app: &Application) {
         .hexpand(true)
         .build();
     let connect_btn = Button::with_label("Connecter");
+    let search_entry = Entry::builder()
+        .placeholder_text("Rechercher (titre ou tag)…")
+        .build();
     let list = ListBox::new();
     let scroller = ScrolledWindow::builder().child(&list).vexpand(true).build();
 
@@ -76,6 +79,7 @@ fn build_ui(app: &Application) {
     root.set_margin_end(12);
     root.append(&status);
     root.append(&bar);
+    root.append(&search_entry);
     root.append(&scroller);
 
     let window = ApplicationWindow::builder()
@@ -92,6 +96,7 @@ fn build_ui(app: &Application) {
         let ui = ui.clone();
         let status = status.clone();
         let list = list.clone();
+        let search_entry = search_entry.clone();
         glib::spawn_future_local(async move {
             match open_node(&ui.rt).await {
                 Ok(node) => {
@@ -104,11 +109,22 @@ fn build_ui(app: &Application) {
                     // seulement raté des tics : on rafraîchit quand même.
                     use tokio::sync::broadcast::error::RecvError;
                     while let Ok(()) | Err(RecvError::Lagged(_)) = events.recv().await {
-                        refresh_catalog(&ui, &status, &list);
+                        refresh_list(&ui, &status, &list, &search_entry.text());
                     }
                 }
                 Err(e) => status.set_text(&format!("erreur d'ouverture : {e}")),
             }
+        });
+    }
+
+    // Recherche locale (titres/tags) : la logique vit dans le core, la vue ne
+    // fait que réafficher la liste filtrée à chaque frappe.
+    {
+        let ui = ui.clone();
+        let status = status.clone();
+        let list = list.clone();
+        search_entry.connect_changed(move |entry| {
+            refresh_list(&ui, &status, &list, &entry.text());
         });
     }
 
@@ -142,15 +158,30 @@ fn build_ui(app: &Application) {
     window.present();
 }
 
-/// Reconstruit la liste depuis le catalogue : un en-tête par créateur
-/// (« créateur X — seq N », parité macOS/Windows) puis ses CIDs.
-fn refresh_catalog(ui: &Rc<Ui>, status: &Label, list: &ListBox) {
+/// Reconstruit la liste : catalogue complet (un en-tête par créateur, parité
+/// macOS/Windows) ou résultats de la recherche locale si `query` est non vide.
+fn refresh_list(ui: &Rc<Ui>, status: &Label, list: &ListBox, query: &str) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
     }
     let Some(node) = ui.node.borrow().clone() else {
         return;
     };
+    let query = query.trim();
+    if !query.is_empty() {
+        let hits = node.search(query);
+        status.set_text(&format!("recherche : {} résultat(s)", hits.len()));
+        for hit in hits {
+            list.append(&content_row(
+                ui,
+                status,
+                &hit.title,
+                &hit.tags,
+                &hit.cid.to_string(),
+            ));
+        }
+        return;
+    }
     let entries = node.catalog_entries();
     status.set_text(&format!("catalogue : {} créateur(s)", entries.len()));
     for entry in entries {
@@ -161,20 +192,34 @@ fn refresh_catalog(ui: &Rc<Ui>, status: &Label, list: &ListBox) {
         header.set_xalign(0.0);
         header.add_css_class("heading");
         list.append(&header);
-        for cid in entry.cids {
-            list.append(&catalog_row(ui, status, &cid.to_string()));
+        for item in entry.items {
+            list.append(&content_row(
+                ui,
+                status,
+                &item.title,
+                &item.tags,
+                &item.cid.to_string(),
+            ));
         }
     }
 }
 
-/// Une ligne du catalogue : le CID + un bouton « Lire ».
-fn catalog_row(ui: &Rc<Ui>, status: &Label, cid: &str) -> GtkBox {
+/// Une ligne de contenu : titre (ou CID si sans titre) + tags + bouton « Lire ».
+fn content_row(ui: &Rc<Ui>, status: &Label, title: &str, tags: &[String], cid: &str) -> GtkBox {
     let row = GtkBox::new(Orientation::Horizontal, 8);
-    let label = Label::new(Some(cid));
+    let text = GtkBox::new(Orientation::Vertical, 2);
+    let label = Label::new(Some(if title.is_empty() { cid } else { title }));
     label.set_xalign(0.0);
-    label.set_hexpand(true);
+    text.append(&label);
+    if !tags.is_empty() {
+        let tags_label = Label::new(Some(&tags.join(" · ")));
+        tags_label.set_xalign(0.0);
+        tags_label.add_css_class("dim-label");
+        text.append(&tags_label);
+    }
+    text.set_hexpand(true);
     let play = Button::with_label("Lire");
-    row.append(&label);
+    row.append(&text);
     row.append(&play);
 
     let ui = ui.clone();
