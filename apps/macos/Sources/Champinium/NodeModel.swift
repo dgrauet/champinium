@@ -2,8 +2,8 @@
 // Aucune logique métier ici — uniquement de l'orchestration d'appels au noyau
 // et de l'état d'affichage.
 import AVFoundation
-import Foundation
 import ChampiniumCore
+import Foundation
 
 /// Pont vers le callback du contrat : le noyau rappelle `onCatalogUpdated` hors
 /// du thread UI ; on re-dispatche vers le thread principal, où le modèle relit
@@ -35,7 +35,9 @@ final class NodeModel: ObservableObject {
     private var currentPlayDir: String?
 
     /// Racine des répertoires de lecture temporaires.
-    private var playRoot: String { NSTemporaryDirectory() + "champinium-play" }
+    private var playRoot: String {
+        NSTemporaryDirectory() + "champinium-play"
+    }
 
     /// Ouvre le nœud, commence à écouter et s'abonne aux mises à jour du
     /// catalogue (rafraîchissement réactif, pas de délai gossip codé en dur).
@@ -49,16 +51,16 @@ final class NodeModel: ObservableObject {
             let dir = defaultDataDir()
             let node = try await openNode(dataDir: dir)
             self.node = node
-            self.peerId = node.peerId()
-            self.listenAddr = try await node.listen(addr: "/ip4/0.0.0.0/tcp/0")
+            peerId = node.peerId()
+            listenAddr = try await node.listen(addr: "/ip4/0.0.0.0/tcp/0")
             let refresher = CatalogRefresher { [weak self] in
                 Task { @MainActor in self?.refreshCatalog() }
             }
-            self.listener = refresher
+            listener = refresher
             await node.setCatalogListener(listener: refresher)
-            self.status = "nœud en ligne"
+            status = "nœud en ligne"
         } catch {
-            self.status = "erreur d'ouverture: \(error)"
+            status = "erreur d'ouverture: \(error)"
         }
     }
 
@@ -68,9 +70,9 @@ final class NodeModel: ObservableObject {
         guard let node, !peer.isEmpty else { return }
         do {
             try await node.connect(peer: peer)
-            self.status = "connecté à un pair"
+            status = "connecté à un pair"
         } catch {
-            self.status = "connexion: \(error)"
+            status = "connexion: \(error)"
         }
     }
 
@@ -98,11 +100,11 @@ final class NodeModel: ObservableObject {
         do {
             let out = playRoot + "/" + UUID().uuidString
             let playlist = try await node.fetchHls(manifestCid: manifestCid, outDir: out)
-            self.currentPlayDir = out
+            currentPlayDir = out
             let player = AVPlayer(url: URL(fileURLWithPath: playlist))
             self.player = player
             player.play()
-            self.status = "lecture en cours"
+            status = "lecture en cours"
         } catch let e as FfiError {
             // Erreur typée du contrat : un refus de modération est un blocage
             // volontaire, présenté comme tel (pas comme une panne technique).
@@ -113,7 +115,7 @@ final class NodeModel: ObservableObject {
                 self.status = "lecture: \(e)"
             }
         } catch {
-            self.status = "lecture: \(error)"
+            status = "lecture: \(error)"
         }
     }
 }
