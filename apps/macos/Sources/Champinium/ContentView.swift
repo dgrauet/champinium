@@ -1,7 +1,7 @@
 // Vue principale : barre de connexion, catalogue, et lecteur AVPlayer.
 import AVKit
-import SwiftUI
 import ChampiniumCore
+import SwiftUI
 
 struct ContentView: View {
     @StateObject private var model = NodeModel()
@@ -60,7 +60,8 @@ struct ContentView: View {
                 Section("créateur \(entry.issuer) — seq \(entry.seq)") {
                     ForEach(entry.items, id: \.cid) { item in
                         contentRow(
-                            title: item.title, tags: item.tags, cid: item.cid)
+                            title: item.title, tags: item.tags, cid: item.cid
+                        )
                     }
                 }
             }

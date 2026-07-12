@@ -48,7 +48,7 @@ logique métier dans les fronts.**
   `cargo clippy -- -D warnings` propres avant commit. Erreurs via `thiserror`/
   `anyhow` (jamais d'`unwrap()` sur chemin réseau). Async = tokio. Types exposés
   via UniFFI annotés `#[uniffi::export]` / `#[derive(uniffi::*)]`.
-- **Swift (macOS)** : SwiftUI, pas de logique métier (délègue au core). `swift-format`.
+- **Swift (macOS)** : SwiftUI, pas de logique métier (délègue au core). `swiftformat` (config apps/macos/.swiftformat, lint en CI).
 - **C# (Windows)** : WinUI 3, MVVM léger, async/await sur les fns du core.
 - **Tout front** : si tu écris de la logique non-présentation dans un front,
   c'est un bug d'architecture — remonte-la dans le core.
