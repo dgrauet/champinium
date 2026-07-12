@@ -6,6 +6,8 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    commit-message:
+      prefix: "chore(deps)"
     groups:
       github-actions:
         patterns:
@@ -14,14 +16,28 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    commit-message:
+      prefix: "chore(deps)"
     groups:
       cargo:
         patterns:
           - "*"
+    ignore:
+      # uniffi doit rester en lockstep avec uniffi-bindgen-cs (pinné en CI sur
+      # v0.9.2+v0.28.3) : un bump uniffi casse la génération des bindings.
+      # Migration manuelle coordonnée (crate + tag bindgen + CONTRACT_VERSION).
+      - dependency-name: "uniffi*"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
   - package-ecosystem: "nuget"
     directory: "/apps/windows/Champinium"
     schedule:
       interval: "weekly"
+    commit-message:
+      # Sans préfixe, dependabot titre « Bump ... » — rejeté par la garde
+      # conventional commits (cz check) en CI.
+      prefix: "chore(deps)"
     groups:
       nuget:
         patterns:
