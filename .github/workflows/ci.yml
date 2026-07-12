@@ -134,3 +134,7 @@ jobs:
         run: just gen-csharp
       - name: Build Windows app (dotnet build)
         run: dotnet build apps/windows/Champinium.sln -c Release -p:Platform=x64
+      - name: Format check (dotnet format, code manuscrit uniquement)
+        # --include limite au code écrit à la main : les bindings UniFFI générés
+        # (bindings/csharp/, inclus via Compile Include) ne sont pas formatés.
+        run: dotnet format apps/windows/Champinium.sln --verify-no-changes --no-restore --include apps/windows/Champinium/
