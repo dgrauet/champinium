@@ -19,11 +19,13 @@ stack = "rust"
 name = "macos-app"
 path = "apps/macos"
 stack = "swift"
+role = "frontend"
 
 [[subprojects]]
 name = "windows-app"
 path = "apps/windows"
 stack = "dotnet"
+role = "frontend"
 
 [exemptions]
 # Deux titres de squash antérieurs à la garde CI003 (PRs #3 et #14) ; on ne
@@ -35,16 +37,8 @@ RL002 = "Titres de squash historiques (#3, #14) — historique de main non réé
 # package n'a qu'un binaryTarget local (XCFramework généré) et des targets
 # locales. Vérifié : `swift package resolve` ne produit rien.
 SWIFT_PK002 = "Aucune dépendance distante — swift package resolve ne génère pas de Package.resolved"
-# Garde-fou d'architecture (CLAUDE.md) : zéro logique métier dans les fronts,
-# donc rien à tester unitairement ici — la logique est testée dans le core
-# Rust (75+ tests) et le front est validé par compilation/lien en CI.
-SWIFT_TS001 = "Front = présentation pure (zéro logique métier par design) ; logique testée dans champinium-core"
 
 [exemptions.windows-app]
-# Même garde-fou que macos-app : zéro logique métier dans les fronts, la
-# logique est testée dans le core Rust et le front est validé par
-# compilation en CI (job `windows-app`).
-DOTNET_TS001 = "Front = présentation pure (zéro logique métier par design) ; logique testée dans champinium-core"
 # RestorePackagesWithLockFile est activé dans le csproj, mais le lockfile ne
 # peut être généré que sous Windows (pas de SDK .NET sur les postes macOS).
 DOTNET_PK002 = "RestorePackagesWithLockFile activé ; lancer `dotnet restore` sous Windows, committer packages.lock.json, puis retirer cette exemption"
