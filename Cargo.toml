@@ -21,4 +21,4 @@ repository = "https://github.com/champinium/champinium"
 
 [workspace.dependencies]
 champinium-core = { path = "crates/champinium-core" }
-uniffi = "0.28"
+uniffi = "0.32"
