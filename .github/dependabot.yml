@@ -1,0 +1,28 @@
+# Maintien automatique des dépendances : pins SHA des actions (CI005),
+# crates du workspace, et paquets NuGet du front Windows.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      cargo:
+        patterns:
+          - "*"
+  - package-ecosystem: "nuget"
+    directory: "/apps/windows/Champinium"
+    schedule:
+      interval: "weekly"
+    groups:
+      nuget:
+        patterns:
+          - "*"
