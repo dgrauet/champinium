@@ -36,9 +36,11 @@ jobs:
           - os: windows-latest
             suffix: windows-x86_64
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88  # stable branch
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
       - name: Build tools (release)
         run: cargo build --release -p champinium-cli -p champinium-seed -p champinium-bootstrap -p champinium-relay
       - name: Archive (Unix)
@@ -65,7 +67,7 @@ jobs:
         run: gh release upload "$TAG" dist/champinium-tools-*
       - name: Upload workflow artifact (dispatch)
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: champinium-tools-${{ matrix.suffix }}
           path: dist/champinium-tools-*
@@ -74,9 +76,11 @@ jobs:
     name: app macOS (.app ad-hoc, non notarisée)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88  # stable branch
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
       - name: Install just
         run: cargo install just
       - name: Prepare bindings + XCFramework
@@ -91,7 +95,7 @@ jobs:
         run: gh release upload "$TAG" dist/Champinium-macos.zip
       - name: Upload workflow artifact (dispatch)
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: Champinium-macos
           path: dist/Champinium-macos.zip
@@ -100,10 +104,12 @@ jobs:
     name: app Windows (portable non signée)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88  # stable branch
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9  # v4.3.1
         with:
           dotnet-version: "8.0.x"
       - name: Install just
@@ -126,7 +132,7 @@ jobs:
         run: gh release upload "$TAG" dist/Champinium-windows-x86_64.zip
       - name: Upload workflow artifact (dispatch)
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: Champinium-windows
           path: dist/Champinium-windows-x86_64.zip
@@ -135,9 +141,11 @@ jobs:
     name: app Linux (tarball GTK4)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88  # stable branch
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
       - name: Install GTK4 + GStreamer dev libs
         run: |
           sudo apt-get update
@@ -154,7 +162,7 @@ jobs:
         run: gh release upload "$TAG" dist/Champinium-linux-x86_64.tar.gz
       - name: Upload workflow artifact (dispatch)
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: Champinium-linux
           path: dist/Champinium-linux-x86_64.tar.gz
