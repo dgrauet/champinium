@@ -3,9 +3,8 @@
 # - `core`      : le workspace Rust à la racine (crates/, infra/, apps/linux —
 #                 le front GTK consomme le crate directement, il fait partie du
 #                 workspace Cargo).
-# - `macos-app` : le front SwiftUI (SwiftPM), audité avec les règles swift.
-# - apps/windows (C#/WinUI 3) n'a PAS de stack intendant : il reste couvert par
-#   les règles transverses (racine) et validé par le job CI `windows-app`.
+# - `macos-app`   : le front SwiftUI (SwiftPM), audité avec les règles swift.
+# - `windows-app` : le front C#/WinUI 3, audité avec les règles dotnet.
 
 [intendant]
 version = "1"
@@ -21,6 +20,11 @@ name = "macos-app"
 path = "apps/macos"
 stack = "swift"
 
+[[subprojects]]
+name = "windows-app"
+path = "apps/windows"
+stack = "dotnet"
+
 [exemptions]
 # Deux titres de squash antérieurs à la garde CI003 (PRs #3 et #14) ; on ne
 # réécrit pas l'historique de main. Le format est verrouillé en CI depuis.
@@ -35,3 +39,12 @@ SWIFT_PK002 = "Aucune dépendance distante — swift package resolve ne génère
 # donc rien à tester unitairement ici — la logique est testée dans le core
 # Rust (75+ tests) et le front est validé par compilation/lien en CI.
 SWIFT_TS001 = "Front = présentation pure (zéro logique métier par design) ; logique testée dans champinium-core"
+
+[exemptions.windows-app]
+# Même garde-fou que macos-app : zéro logique métier dans les fronts, la
+# logique est testée dans le core Rust et le front est validé par
+# compilation en CI (job `windows-app`).
+DOTNET_TS001 = "Front = présentation pure (zéro logique métier par design) ; logique testée dans champinium-core"
+# RestorePackagesWithLockFile est activé dans le csproj, mais le lockfile ne
+# peut être généré que sous Windows (pas de SDK .NET sur les postes macOS).
+DOTNET_PK002 = "RestorePackagesWithLockFile activé ; lancer `dotnet restore` sous Windows, committer packages.lock.json, puis retirer cette exemption"
