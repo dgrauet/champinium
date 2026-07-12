@@ -228,7 +228,9 @@ NAT ✔, seeding ✔, feed DHT ✔, fetch concurrent ✔, déploiement tiers doc
 bitswap différé)** → 5 (en cours : peer scoring ✔, signalement P2P ✔, réplication
 mesurée ✔ ; recherche #20, IPNS #21). Voir le spec.
 
-**Dernière release : v0.2.0** (release-please, `bump-minor-pre-major` actif :
+**Dernière release : voir `.release-please-manifest.json` / CHANGELOG** —
+pas de version en dur ici, elle dérive (règle intendant DG006). Release-please
+gère le versionnement (`bump-minor-pre-major` actif :
 un breaking change bumpe la mineure tant qu'on est < 1.0.0 — la 1.0 sera un
 choix délibéré de stabilisation d'API). Versionnement du contrat FFI distinct :
 `CONTRACT_VERSION = 3` (voir `AGENTS.md`).
