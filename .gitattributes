@@ -1,0 +1,6 @@
+# Le front Windows est vérifié par `dotnet format` avec `end_of_line = lf`
+# (.editorconfig) : forcer LF au checkout, y compris sur les runners Windows
+# où core.autocrlf convertirait en CRLF.
+*.cs text eol=lf
+*.xaml text eol=lf
+*.csproj text eol=lf
