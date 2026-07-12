@@ -16,6 +16,9 @@
     <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
+    <!-- Restore reproductible (DOTNET_PK002) : génère/valide packages.lock.json.
+         Lancer `dotnet restore` sous Windows pour produire le lockfile. -->
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
     <!-- Les bindings UniFFI C# générés utilisent des blocs `unsafe` (marshalling). -->
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <UseWinUI>true</UseWinUI>
