@@ -1,6 +1,26 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Fenêtre principale : en-tête + barre de connexion + catalogue + lecteur.
-     Miroir WinUI 3 du ContentView SwiftUI (macOS). Présentation uniquement. -->
+<!-- Fenêtre principale : en-tête + barre de connexion + onglets
+     Abonnements/Explorer + lecteur. Miroir WinUI 3 du ContentView SwiftUI
+     (macOS). Présentation uniquement — aucun filtrage ici : le catalogue
+     Abonnements vient de `catalog_subscribed()`, le catalogue Explorer de
+     `catalog()`, tous deux calculés par le core.
+
+     Pivot (pas SelectorBar) : disponible sans condition de version dans
+     Microsoft.UI.Xaml.Controls depuis les premières releases de WinUI 3,
+     alors que SelectorBar n'a été ajouté qu'à partir de WindowsAppSDK 1.4 —
+     choix conservateur vu la version de PackageReference du csproj (2.3.1,
+     non alignée sur le schéma de versions WinAppSDK habituel — à vérifier en
+     CI, voir rapport de tâche).
+
+     Binding classique PARTOUT dans ce fichier (zéro x:Bind) — un DataTemplate
+     x:Bind en ressource nommée partagée par plusieurs ListView générait un
+     connecteur ancré sur la Window (CS1503, plusieurs itérations en CI) ; par
+     prudence, plus aucun x:Bind n'est utilisé, y compris au niveau Window, une
+     fois que la structure du fichier inclut un Pivot (ItemsControl). Le
+     DataContext de la Grid racine est posé sur `Model` en code-behind
+     (MainWindow.xaml.cs, après InitializeComponent) — tous les
+     `{Binding …}` de ce fichier résolvent dessus, sauf ceux des DataTemplate
+     dont le DataContext est l'item (ChannelGroup/CatalogCid). -->
 <Window
     x:Class="Champinium.MainWindow"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -11,7 +31,72 @@
     mc:Ignorable="d"
     Title="Champinium">
 
-    <Grid Padding="16" RowSpacing="12">
+    <!-- Window n'a pas de propriété XAML `Resources` en WinUI 3 (WMC0011) —
+         les ressources partagées vivent dans Grid.Resources de la racine ;
+         toutes leurs utilisations sont à l'intérieur de cette grille. -->
+    <Grid x:Name="Root" Padding="16" RowSpacing="12">
+        <Grid.Resources>
+            <local:EmptyStringToVisibilityConverter x:Key="EmptyStringToVisibility" />
+            <local:NonEmptyStringToVisibilityConverter x:Key="NonEmptyStringToVisibility" />
+
+            <!-- Gabarit partagé : un groupe (créateur/channel) = en-tête (nom, seq,
+                 bouton abonnement) + ses contenus. Le bouton d'abonnement est au
+                 niveau du GROUPE, jamais sur une ligne de contenu individuelle.
+
+                 `Binding` classique (PAS `x:Bind`) : un `DataTemplate` déclaré en
+                 ressource nommée (`x:Key`), partagé par deux `ListView`, génère un
+                 connecteur `x:Bind` ancré sur la `Window` plutôt que sur l'item —
+                 `Window` n'étant pas un `FrameworkElement` en WinUI 3, ça ne
+                 compile pas (CS1503, deux tentatives de variantes `x:Bind` déjà
+                 essayées sans succès en CI). Le `Binding` classique n'a pas ce
+                 problème : chaque conteneur d'item pose son `DataContext` sur
+                 l'instance (`ChannelGroup`/`CatalogCid`) — pas besoin de `x:DataType`
+                 ni de `Tag` pour la retrouver, `OnToggleSubscriptionClick` la relit
+                 via `(sender as FrameworkElement)?.DataContext`. -->
+            <DataTemplate x:Key="ChannelGroupTemplate">
+                <StackPanel Spacing="4" Padding="0,8">
+                    <Grid ColumnSpacing="8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Grid.Column="0" Spacing="0">
+                            <TextBlock Text="{Binding DisplayName}"
+                                       Style="{StaticResource BodyStrongTextBlockStyle}" />
+                            <TextBlock Text="{Binding SeqText}"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                        </StackPanel>
+                        <Button Grid.Column="1" Content="{Binding SubscribeLabel}"
+                                Click="OnToggleSubscriptionClick" />
+                    </Grid>
+                    <ItemsControl ItemsSource="{Binding Items}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <Grid ColumnSpacing="8" Padding="12,2,0,2">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel Grid.Column="0">
+                                        <TextBlock Text="{Binding Display}"
+                                                   TextTrimming="CharacterEllipsis"
+                                                   TextWrapping="NoWrap" />
+                                        <TextBlock Text="{Binding TagsText}"
+                                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                                   TextWrapping="NoWrap" />
+                                    </StackPanel>
+                                    <Button Grid.Column="1" Content="Lire"
+                                            Tag="{Binding Cid}" Click="OnPlayClick" />
+                                </Grid>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </StackPanel>
+            </DataTemplate>
+        </Grid.Resources>
+
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
@@ -24,11 +109,11 @@
         <!-- En-tête : titre, statut, PeerId -->
         <StackPanel Grid.Row="0" Spacing="2">
             <TextBlock Text="Champinium" Style="{StaticResource TitleTextBlockStyle}" />
-            <TextBlock Text="{x:Bind Model.Status, Mode=OneWay}"
+            <TextBlock Text="{Binding Status, Mode=OneWay}"
                        Style="{StaticResource CaptionTextBlockStyle}"
                        Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
             <!-- PeerId du nœud (vide tant que le nœud n'est pas ouvert). -->
-            <TextBlock Text="{x:Bind Model.PeerId, Mode=OneWay}"
+            <TextBlock Text="{Binding PeerId, Mode=OneWay}"
                        Style="{StaticResource CaptionTextBlockStyle}"
                        Foreground="{ThemeResource TextFillColorTertiaryBrush}"
                        TextWrapping="NoWrap" />
@@ -43,7 +128,7 @@
             </Grid.ColumnDefinitions>
             <TextBox Grid.Column="0"
                      PlaceholderText="/ip4/…/tcp/…/p2p/&lt;peerid&gt;"
-                     Text="{x:Bind Model.PeerField, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                     Text="{Binding PeerField, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
             <Button Grid.Column="1" Content="Connecter" Click="OnConnectClick" />
             <Button Grid.Column="2" Content="Rafraîchir" Click="OnRefreshClick" />
         </Grid>
@@ -51,41 +136,77 @@
         <!-- Recherche locale : titres et tags du catalogue reconstruit -->
         <TextBox Grid.Row="2"
                  PlaceholderText="Rechercher (titre ou tag)…"
-                 Text="{x:Bind Model.SearchQuery, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                 Text="{Binding SearchQuery, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
 
         <Border Grid.Row="3" Height="1"
                 Background="{ThemeResource DividerStrokeColorDefaultBrush}" />
 
-        <!-- Catalogue (ou résultats de recherche) : un item par contenu -->
+        <!-- Résultats de recherche : remplacent les onglets tant que la requête
+             n'est pas vide (les deux catalogues restent inchangés en dessous). -->
         <ListView Grid.Row="4"
-                  ItemsSource="{x:Bind Model.Entries, Mode=OneWay}"
+                  Visibility="{Binding SearchQuery, Mode=OneWay, Converter={StaticResource NonEmptyStringToVisibility}}"
+                  ItemsSource="{Binding SearchResults, Mode=OneWay}"
                   SelectionMode="None">
             <ListView.ItemTemplate>
-                <DataTemplate x:DataType="local:CatalogCid">
+                <DataTemplate>
                     <Grid ColumnSpacing="8" Padding="0,4">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*" />
                             <ColumnDefinition Width="Auto" />
                         </Grid.ColumnDefinitions>
                         <StackPanel Grid.Column="0">
-                            <TextBlock Text="{x:Bind Header}"
-                                       Style="{StaticResource CaptionTextBlockStyle}"
-                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                            <!-- Titre du contenu, ou CID si sans titre -->
-                            <TextBlock Text="{x:Bind Display}"
+                            <TextBlock Text="{Binding Display}"
                                        TextTrimming="CharacterEllipsis"
                                        TextWrapping="NoWrap" />
-                            <TextBlock Text="{x:Bind TagsText}"
+                            <TextBlock Text="{Binding TagsText}"
                                        Style="{StaticResource CaptionTextBlockStyle}"
                                        Foreground="{ThemeResource TextFillColorTertiaryBrush}"
                                        TextWrapping="NoWrap" />
                         </StackPanel>
                         <Button Grid.Column="1" Content="Lire"
-                                Tag="{x:Bind Cid}" Click="OnPlayClick" />
+                                Tag="{Binding Cid}" Click="OnPlayClick" />
                     </Grid>
                 </DataTemplate>
             </ListView.ItemTemplate>
         </ListView>
+
+        <!-- Onglets Abonnements (défaut) / Explorer, visibles hors recherche. -->
+        <Pivot Grid.Row="4" x:Name="CatalogPivot"
+               Visibility="{Binding SearchQuery, Mode=OneWay, Converter={StaticResource EmptyStringToVisibility}}"
+               SelectedIndex="0"
+               SelectionChanged="OnPivotSelectionChanged">
+            <PivotItem Header="Abonnements">
+                <ListView ItemsSource="{Binding SubscribedGroups, Mode=OneWay}"
+                          ItemTemplate="{StaticResource ChannelGroupTemplate}"
+                          SelectionMode="None" />
+            </PivotItem>
+            <PivotItem Header="Explorer">
+                <StackPanel Spacing="12">
+                    <!-- Abonnement par lien + copie du lien de mon propre channel —
+                         visibles uniquement dans l'onglet Explorer (même choix que
+                         le jumeau macOS). -->
+                    <StackPanel Spacing="6">
+                        <Grid ColumnSpacing="8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBox Grid.Column="0"
+                                     PlaceholderText="Coller un lien de channel…"
+                                     Text="{Binding ChannelLinkField, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                            <Button Grid.Column="1" Content="S'abonner" Click="OnSubscribeByLinkClick" />
+                        </Grid>
+                        <Button Content="Copier le lien de mon channel" Click="OnCopyMyLinkClick" />
+                        <TextBlock Text="{Binding SubscriptionStatus, Mode=OneWay}"
+                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    </StackPanel>
+                    <ListView ItemsSource="{Binding ExploreGroups, Mode=OneWay}"
+                              ItemTemplate="{StaticResource ChannelGroupTemplate}"
+                              SelectionMode="None" />
+                </StackPanel>
+            </PivotItem>
+        </Pivot>
 
         <!-- Lecteur média (Media Foundation via MediaPlayerElement) -->
         <MediaPlayerElement Grid.Row="5"

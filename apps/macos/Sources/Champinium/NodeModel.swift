@@ -26,6 +26,8 @@ final class NodeModel: ObservableObject {
     @Published var peerId: String = ""
     @Published var listenAddr: String = ""
     @Published var entries: [FfiCatalogEntry] = []
+    @Published var subscribedEntries: [FfiCatalogEntry] = []
+    @Published var subscriptions: Set<String> = []
     @Published var searchHits: [FfiSearchHit] = []
     @Published var player: AVPlayer?
 
@@ -76,10 +78,34 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    /// Met à jour la liste depuis le catalogue reconstruit localement.
+    /// Met à jour les deux listes (Explorer + Abonnements) et les abonnements
+    /// courants depuis le noyau.
     func refreshCatalog() {
         entries = node?.catalog() ?? []
+        subscribedEntries = node?.catalogSubscribed() ?? []
+        subscriptions = Set(node?.subscriptions() ?? [])
         status = "catalogue: \(entries.count) créateur(s)"
+    }
+
+    /// Lien partageable du channel de ce nœud.
+    func myChannelLink() -> String? {
+        guard let node else { return nil }
+        return try? node.channelLink(peerId: node.peerId())
+    }
+
+    /// S'abonne à un channel via un lien `champinium://channel/<clé>` ou un
+    /// PeerId nu. Rafraîchit le catalogue en cas de succès.
+    func subscribeChannel(_ linkOrPeerId: String) async throws {
+        guard let node else { return }
+        try await node.subscribeChannel(linkOrPeerId: linkOrPeerId)
+        refreshCatalog()
+    }
+
+    /// Se désabonne d'un émetteur. Rafraîchit le catalogue en cas de succès.
+    func unsubscribeChannel(_ peerId: String) async throws {
+        guard let node else { return }
+        try await node.unsubscribeChannel(peerId: peerId)
+        refreshCatalog()
     }
 
     /// Recherche locale (titres/tags du catalogue) — la logique vit dans le core.

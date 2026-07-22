@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use champinium_core::identity::{load_or_generate, peer_id};
 use champinium_core::p2p::split_peer_id;
-use champinium_core::{Blockstore, Cid, Denylist, Moderation, Node};
+use champinium_core::{channel_link, Blockstore, Cid, Denylist, Moderation, Node, PeerId};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -78,6 +78,9 @@ enum Cmd {
         /// Durée d'écoute des feeds (secondes).
         #[arg(long, default_value = "6")]
         wait: u64,
+        /// Affiche uniquement les créateurs souscrits (sinon: catalogue complet).
+        #[arg(long)]
+        subscribed: bool,
     },
     /// Récupère le feed d'un créateur depuis la DHT (hors gossip).
     FetchFeed {
@@ -126,6 +129,21 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// S'abonne à un créateur (par lien ou PeerId nu).
+    Subscribe {
+        /// Lien `champinium://channel/<peerid>` ou PeerId nu.
+        link_or_peerid: String,
+        /// Adresse du pair `/ip4/.../tcp/.../p2p/<peerid>` (optionnel, pour le fetch immédiat).
+        #[arg(long)]
+        peer: Option<String>,
+    },
+    /// Se désabonne d'un créateur.
+    Unsubscribe {
+        /// PeerId du créateur.
+        peerid: String,
+    },
+    /// Liste les créateurs souscrits avec leurs liens.
+    Subscriptions,
 }
 
 #[tokio::main]
@@ -214,15 +232,28 @@ async fn main() -> Result<()> {
             let n = node.replication_factor(cid).await?;
             println!("facteur de réplication: {n} fournisseur(s)");
         }
-        Cmd::Catalog { peer, wait } => {
+        Cmd::Catalog {
+            peer,
+            wait,
+            subscribed,
+        } => {
             let node = build_node(&cli.data_dir, &cli.denylist).await?;
             node.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await?;
             connect_peer(&node, &peer).await?;
             // Écoute les feeds diffusés en gossipsub pendant `wait` secondes.
             tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-            let entries = node.catalog_entries();
+            let entries = if subscribed {
+                node.catalog_subscribed()
+            } else {
+                node.catalog_entries()
+            };
             if entries.is_empty() {
-                println!("catalogue vide (aucun feed reçu)");
+                let msg = if subscribed {
+                    "aucun créateur souscrit avec contenu"
+                } else {
+                    "catalogue vide (aucun feed reçu)"
+                };
+                println!("{msg}");
             } else {
                 for e in entries {
                     println!("créateur {} (seq {}) :", e.issuer, e.seq);
@@ -297,6 +328,37 @@ async fn main() -> Result<()> {
             connect_peer(&node, &peer).await?;
             let playlist = fetch_hls_with_retry(&node, manifest_cid, &out).await?;
             println!("HLS reconstruit: {}", playlist.display());
+        }
+        Cmd::Subscribe {
+            link_or_peerid,
+            peer,
+        } => {
+            let issuer: PeerId =
+                channel_link::parse(&link_or_peerid).context("lien ou PeerId invalide")?;
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            node.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await?;
+            if let Some(peer_addr) = peer {
+                connect_peer(&node, &peer_addr).await?;
+            }
+            node.subscribe(issuer)?;
+            println!("abonné à {}", channel_link::format(&issuer));
+        }
+        Cmd::Unsubscribe { peerid } => {
+            let issuer: PeerId = peerid.parse().context("PeerId invalide")?;
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            node.unsubscribe(issuer)?;
+            println!("désabonné de {}", channel_link::format(&issuer));
+        }
+        Cmd::Subscriptions => {
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let subs = node.subscriptions();
+            if subs.is_empty() {
+                println!("aucun abonnement");
+            } else {
+                for issuer in subs {
+                    println!("{}", channel_link::format(&issuer));
+                }
+            }
         }
     }
     Ok(())
