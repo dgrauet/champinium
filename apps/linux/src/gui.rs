@@ -1,25 +1,32 @@
 //! Interface GTK4 + lecture GStreamer (feature `gui`).
 //!
-//! Pont mince vers le noyau : un runtime tokio exécute les appels async du noyau ;
-//! les résultats reviennent sur le thread principal GTK via `glib::spawn_future_local`
+//! Pont mince vers le noyau : un runtime tokio exécute les appels async (et les
+//! appels sync à I/O disque, comme `subscribe`/`unsubscribe`) du noyau ; les
+//! résultats reviennent sur le thread principal GTK via `glib::spawn_future_local`
 //! + un canal oneshot. Aucune logique métier ici.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use champinium_core::{paths, Cid, Node};
+use champinium_core::{channel_link, paths, CatalogEntry, Cid, CoreError, Node, PeerId};
 use gstreamer::prelude::*;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
-    Application, ApplicationWindow, Box as GtkBox, Button, Entry, Label, ListBox, Orientation,
-    ScrolledWindow,
+    Application, ApplicationWindow, Box as GtkBox, Button, ButtonsType, Entry, Label, ListBox,
+    MessageDialog, Orientation, ResponseType, ScrolledWindow, Stack, StackSwitcher,
 };
 use tokio::runtime::Runtime;
 
 const APP_ID: &str = "org.champinium.Linux";
+
+/// Texte de l'avertissement au premier passage sur l'onglet Explorer (identique
+/// aux fronts macOS/Windows — spec channels).
+const EXPLORER_WARNING: &str =
+    "Contenu non curé venant du réseau ouvert, filtré uniquement par les denylists.";
 
 /// Point d'entrée de l'interface.
 pub fn run() {
@@ -41,6 +48,9 @@ struct Ui {
     player: RefCell<Option<gstreamer::Element>>,
     /// Répertoire de la lecture en cours (supprimé au changement de contenu).
     current_play_dir: RefCell<Option<PathBuf>>,
+    /// Avertissement Explorer déjà accepté cette session (mémoire de session
+    /// uniquement — pas de GSettings, YAGNI, voir brief tâche 7).
+    explorer_warned: Cell<bool>,
 }
 
 fn build_ui(app: &Application) {
@@ -53,6 +63,7 @@ fn build_ui(app: &Application) {
         node: RefCell::new(None),
         player: RefCell::new(None),
         current_play_dir: RefCell::new(None),
+        explorer_warned: Cell::new(false),
     });
 
     let status = Label::new(Some("démarrage…"));
@@ -65,12 +76,56 @@ fn build_ui(app: &Application) {
     let search_entry = Entry::builder()
         .placeholder_text("Rechercher (titre ou tag)…")
         .build();
-    let list = ListBox::new();
-    let scroller = ScrolledWindow::builder().child(&list).vexpand(true).build();
 
     let bar = GtkBox::new(Orientation::Horizontal, 8);
     bar.append(&peer_entry);
     bar.append(&connect_btn);
+
+    // Onglets Abonnements (défaut) / Explorer — deux ListBox alimentées par
+    // `refresh_lists()` depuis le core (`catalog_subscribed()` /
+    // `catalog_entries()`).
+    let subs_list = ListBox::new();
+    let subs_scroller = ScrolledWindow::builder()
+        .child(&subs_list)
+        .vexpand(true)
+        .build();
+
+    let explorer_list = ListBox::new();
+    let explorer_scroller = ScrolledWindow::builder()
+        .child(&explorer_list)
+        .vexpand(true)
+        .build();
+
+    // Abonnement par lien + copie du lien de mon propre channel — visibles
+    // uniquement dans l'onglet Explorer (même choix que macOS/Windows).
+    let channel_entry = Entry::builder()
+        .placeholder_text("Lien de channel ou PeerId…")
+        .hexpand(true)
+        .build();
+    let subscribe_link_btn = Button::with_label("S'abonner");
+    let copy_link_btn = Button::with_label("Copier le lien de mon channel");
+    let link_msg = Label::new(None);
+    link_msg.set_xalign(0.0);
+    link_msg.add_css_class("dim-label");
+
+    let explorer_toolbar = GtkBox::new(Orientation::Horizontal, 8);
+    explorer_toolbar.append(&channel_entry);
+    explorer_toolbar.append(&subscribe_link_btn);
+    explorer_toolbar.append(&copy_link_btn);
+
+    let explorer_page = GtkBox::new(Orientation::Vertical, 6);
+    explorer_page.append(&explorer_toolbar);
+    explorer_page.append(&link_msg);
+    explorer_page.append(&explorer_scroller);
+
+    let stack = Stack::new();
+    stack.add_titled(&subs_scroller, Some("abonnements"), "Abonnements");
+    stack.add_titled(&explorer_page, Some("explorer"), "Explorer");
+    stack.set_visible_child_name("abonnements");
+    stack.set_vexpand(true);
+
+    let switcher = StackSwitcher::new();
+    switcher.set_stack(Some(&stack));
 
     let root = GtkBox::new(Orientation::Vertical, 8);
     root.set_margin_top(12);
@@ -80,7 +135,8 @@ fn build_ui(app: &Application) {
     root.append(&status);
     root.append(&bar);
     root.append(&search_entry);
-    root.append(&scroller);
+    root.append(&switcher);
+    root.append(&stack);
 
     let window = ApplicationWindow::builder()
         .application(app)
@@ -90,12 +146,29 @@ fn build_ui(app: &Application) {
         .child(&root)
         .build();
 
+    // Premier passage sur Explorer : avertissement bloquant, mémorisé pour la
+    // session (voir `Ui::explorer_warned`). Le passage est annulé (retour sur
+    // Abonnements) tant que l'avertissement n'a pas été accepté.
+    {
+        let ui = ui.clone();
+        let window = window.clone();
+        stack.connect_notify_local(Some("visible-child-name"), move |stack, _| {
+            if stack.visible_child_name().as_deref() == Some("explorer")
+                && !ui.explorer_warned.get()
+            {
+                stack.set_visible_child_name("abonnements");
+                show_explorer_warning(&ui, &window, stack);
+            }
+        });
+    }
+
     // Ouverture du nœud (async), puis abonnement aux mises à jour du catalogue :
     // le rafraîchissement est réactif (parité macOS/Windows), plus de bouton.
     {
         let ui = ui.clone();
         let status = status.clone();
-        let list = list.clone();
+        let subs_list = subs_list.clone();
+        let explorer_list = explorer_list.clone();
         let search_entry = search_entry.clone();
         glib::spawn_future_local(async move {
             match open_node(&ui.rt).await {
@@ -109,7 +182,7 @@ fn build_ui(app: &Application) {
                     // seulement raté des tics : on rafraîchit quand même.
                     use tokio::sync::broadcast::error::RecvError;
                     while let Ok(()) | Err(RecvError::Lagged(_)) = events.recv().await {
-                        refresh_list(&ui, &status, &list, &search_entry.text());
+                        refresh_lists(&ui, &status, &subs_list, &explorer_list, &search_entry);
                     }
                 }
                 Err(e) => status.set_text(&format!("erreur d'ouverture : {e}")),
@@ -118,13 +191,14 @@ fn build_ui(app: &Application) {
     }
 
     // Recherche locale (titres/tags) : la logique vit dans le core, la vue ne
-    // fait que réafficher la liste filtrée à chaque frappe.
+    // fait que réafficher les listes filtrées à chaque frappe.
     {
         let ui = ui.clone();
         let status = status.clone();
-        let list = list.clone();
+        let subs_list = subs_list.clone();
+        let explorer_list = explorer_list.clone();
         search_entry.connect_changed(move |entry| {
-            refresh_list(&ui, &status, &list, &entry.text());
+            refresh_lists(&ui, &status, &subs_list, &explorer_list, entry);
         });
     }
 
@@ -155,45 +229,156 @@ fn build_ui(app: &Application) {
         });
     }
 
+    // Abonnement par lien (`channel_link::parse`, tolérant : lien ou PeerId nu).
+    {
+        let ui = ui.clone();
+        let status = status.clone();
+        let subs_list = subs_list.clone();
+        let explorer_list = explorer_list.clone();
+        let search_entry = search_entry.clone();
+        let channel_entry = channel_entry.clone();
+        let link_msg = link_msg.clone();
+        subscribe_link_btn.connect_clicked(move |_| {
+            let text = channel_entry.text().to_string();
+            let peer = match channel_link::parse(&text) {
+                Ok(peer) => peer,
+                Err(_) => {
+                    link_msg.set_text("lien ou PeerId invalide");
+                    return;
+                }
+            };
+            link_msg.set_text("");
+            let Some(node) = ui.node.borrow().clone() else {
+                status.set_text("nœud pas encore prêt");
+                return;
+            };
+            let rt = ui.rt.clone();
+            let ui = ui.clone();
+            let status = status.clone();
+            let subs_list = subs_list.clone();
+            let explorer_list = explorer_list.clone();
+            let search_entry = search_entry.clone();
+            let channel_entry = channel_entry.clone();
+            glib::spawn_future_local(async move {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                rt.spawn(async move {
+                    let _ = tx.send(subscribe_inner(&node, peer).await);
+                });
+                match rx.await {
+                    Ok(Ok(())) => {
+                        channel_entry.set_text("");
+                        status.set_text("abonné");
+                        refresh_lists(&ui, &status, &subs_list, &explorer_list, &search_entry);
+                    }
+                    Ok(Err(e)) => status.set_text(&describe_core_error(&e, "abonnement")),
+                    Err(_) => status.set_text("tâche annulée"),
+                }
+            });
+        });
+    }
+
+    // Copie du lien partageable de mon propre channel.
+    {
+        let ui = ui.clone();
+        let status = status.clone();
+        copy_link_btn.connect_clicked(move |btn| {
+            let Some(node) = ui.node.borrow().clone() else {
+                status.set_text("nœud pas encore prêt");
+                return;
+            };
+            let link = channel_link::format(&node.peer_id());
+            btn.clipboard().set_text(&link);
+            status.set_text("lien copié");
+        });
+    }
+
     window.present();
 }
 
-/// Reconstruit la liste : catalogue complet (un en-tête par créateur, parité
-/// macOS/Windows) ou résultats de la recherche locale si `query` est non vide.
-fn refresh_list(ui: &Rc<Ui>, status: &Label, list: &ListBox, query: &str) {
-    while let Some(child) = list.first_child() {
-        list.remove(&child);
+/// Affiche l'avertissement Explorer ; sur « Continuer », marque la session
+/// comme avertie et bascule vers l'onglet Explorer.
+fn show_explorer_warning(ui: &Rc<Ui>, window: &ApplicationWindow, stack: &Stack) {
+    let dialog = MessageDialog::builder()
+        .transient_for(window)
+        .modal(true)
+        .text("Explorer")
+        .secondary_text(EXPLORER_WARNING)
+        .buttons(ButtonsType::None)
+        .build();
+    dialog.add_button("Annuler", ResponseType::Cancel);
+    dialog.add_button("Continuer", ResponseType::Accept);
+    let ui = ui.clone();
+    let stack = stack.clone();
+    dialog.connect_response(move |dialog, resp| {
+        if resp == ResponseType::Accept {
+            ui.explorer_warned.set(true);
+            stack.set_visible_child_name("explorer");
+        }
+        dialog.close();
+    });
+    dialog.present();
+}
+
+/// Reconstruit les deux listes (Abonnements/Explorer) : catalogue restreint
+/// aux émetteurs souscrits ou catalogue complet (un en-tête par créateur, avec
+/// bouton s'abonner/se désabonner), ou résultats de la recherche locale si la
+/// recherche est non vide.
+fn refresh_lists(
+    ui: &Rc<Ui>,
+    status: &Label,
+    subs_list: &ListBox,
+    explorer_list: &ListBox,
+    search_entry: &Entry,
+) {
+    while let Some(child) = subs_list.first_child() {
+        subs_list.remove(&child);
+    }
+    while let Some(child) = explorer_list.first_child() {
+        explorer_list.remove(&child);
     }
     let Some(node) = ui.node.borrow().clone() else {
         return;
     };
+    let subs: HashSet<PeerId> = node.subscriptions().into_iter().collect();
+    let query = search_entry.text();
     let query = query.trim();
     if !query.is_empty() {
         let hits = node.search(query);
         status.set_text(&format!("recherche : {} résultat(s)", hits.len()));
-        for hit in hits {
-            list.append(&content_row(
+        for hit in &hits {
+            explorer_list.append(&content_row(
                 ui,
                 status,
                 &hit.title,
                 &hit.tags,
                 &hit.cid.to_string(),
             ));
+            if subs.contains(&hit.issuer) {
+                subs_list.append(&content_row(
+                    ui,
+                    status,
+                    &hit.title,
+                    &hit.tags,
+                    &hit.cid.to_string(),
+                ));
+            }
         }
         return;
     }
     let entries = node.catalog_entries();
     status.set_text(&format!("catalogue : {} créateur(s)", entries.len()));
-    for entry in entries {
-        let header = Label::new(Some(&format!(
-            "créateur {} — seq {}",
-            entry.issuer, entry.seq
-        )));
-        header.set_xalign(0.0);
-        header.add_css_class("heading");
-        list.append(&header);
-        for item in entry.items {
-            list.append(&content_row(
+    for entry in &entries {
+        explorer_list.append(&channel_header_row(
+            ui,
+            status,
+            subs_list,
+            explorer_list,
+            search_entry,
+            entry,
+            subs.contains(&entry.issuer),
+        ));
+        for item in &entry.items {
+            explorer_list.append(&content_row(
                 ui,
                 status,
                 &item.title,
@@ -201,6 +386,117 @@ fn refresh_list(ui: &Rc<Ui>, status: &Label, list: &ListBox, query: &str) {
                 &item.cid.to_string(),
             ));
         }
+    }
+    let subscribed_entries = node.catalog_subscribed();
+    for entry in &subscribed_entries {
+        subs_list.append(&channel_header_row(
+            ui,
+            status,
+            subs_list,
+            explorer_list,
+            search_entry,
+            entry,
+            true,
+        ));
+        for item in &entry.items {
+            subs_list.append(&content_row(
+                ui,
+                status,
+                &item.title,
+                &item.tags,
+                &item.cid.to_string(),
+            ));
+        }
+    }
+}
+
+/// En-tête d'un émetteur : nom du channel (ou PeerId tronqué) + seq + bouton
+/// s'abonner/se désabonner (disponible dans les deux vues, au niveau
+/// en-tête — pas par ligne de contenu).
+fn channel_header_row(
+    ui: &Rc<Ui>,
+    status: &Label,
+    subs_list: &ListBox,
+    explorer_list: &ListBox,
+    search_entry: &Entry,
+    entry: &CatalogEntry,
+    subscribed: bool,
+) -> GtkBox {
+    let row = GtkBox::new(Orientation::Horizontal, 8);
+    let text = GtkBox::new(Orientation::Vertical, 2);
+    let name = if entry.channel.name.is_empty() {
+        truncate_peer_id(&entry.issuer.to_string())
+    } else {
+        entry.channel.name.clone()
+    };
+    let header = Label::new(Some(&format!("{name} — seq {}", entry.seq)));
+    header.set_xalign(0.0);
+    header.add_css_class("heading");
+    text.append(&header);
+    text.set_hexpand(true);
+    row.append(&text);
+
+    let btn = Button::with_label(if subscribed {
+        "Se désabonner"
+    } else {
+        "S'abonner"
+    });
+    let issuer = entry.issuer;
+    let ui = ui.clone();
+    let status = status.clone();
+    let subs_list = subs_list.clone();
+    let explorer_list = explorer_list.clone();
+    let search_entry = search_entry.clone();
+    btn.connect_clicked(move |_| {
+        let Some(node) = ui.node.borrow().clone() else {
+            status.set_text("nœud pas encore prêt");
+            return;
+        };
+        let rt = ui.rt.clone();
+        let ui = ui.clone();
+        let status = status.clone();
+        let subs_list = subs_list.clone();
+        let explorer_list = explorer_list.clone();
+        let search_entry = search_entry.clone();
+        glib::spawn_future_local(async move {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            rt.spawn(async move {
+                let res = if subscribed {
+                    unsubscribe_inner(&node, issuer).await
+                } else {
+                    subscribe_inner(&node, issuer).await
+                };
+                let _ = tx.send(res);
+            });
+            match rx.await {
+                Ok(Ok(())) => {
+                    status.set_text(if subscribed { "désabonné" } else { "abonné" });
+                    refresh_lists(&ui, &status, &subs_list, &explorer_list, &search_entry);
+                }
+                Ok(Err(e)) => status.set_text(&describe_core_error(&e, "abonnement")),
+                Err(_) => status.set_text("tâche annulée"),
+            }
+        });
+    });
+    row.append(&btn);
+    row
+}
+
+/// Tronque un PeerId affiché (les 8 premiers + les 4 derniers caractères) —
+/// PeerId s'affiche en base58, ASCII pur, le découpage par octets est sûr.
+fn truncate_peer_id(id: &str) -> String {
+    if id.chars().count() <= 14 {
+        return id.to_string();
+    }
+    format!("{}…{}", &id[..8], &id[id.len() - 4..])
+}
+
+/// Message d'erreur distinguant un refus de modération (blocage délibéré) des
+/// erreurs réseau/techniques.
+fn describe_core_error(e: &CoreError, context: &str) -> String {
+    match e {
+        CoreError::Moderated(_) => "bloqué par la modération : refus délibéré du nœud".to_string(),
+        other => format!("{context} : {other}"),
     }
 }
 
@@ -260,7 +556,9 @@ fn content_row(ui: &Rc<Ui>, status: &Label, title: &str, tags: &[String], cid: &
                     }
                     Err(e) => status.set_text(&format!("lecture : {e}")),
                 },
-                Ok(Err(e)) => status.set_text(&format!("récupération : {e}")),
+                // Refus de modération (checkpoint #2) : blocage délibéré,
+                // distinct d'une panne réseau.
+                Ok(Err(e)) => status.set_text(&describe_core_error(&e, "récupération")),
                 Err(_) => status.set_text("tâche annulée"),
             }
         });
@@ -313,9 +611,19 @@ async fn connect_inner(node: &Node, peer: &str) -> Result<(), String> {
     node.connect(addr).await.map_err(|e| e.to_string())
 }
 
-async fn fetch_inner(node: &Node, manifest: Cid) -> Result<PathBuf, String> {
+async fn fetch_inner(node: &Node, manifest: Cid) -> Result<PathBuf, CoreError> {
     let out = play_root().join(manifest.to_string());
-    node.fetch_hls(manifest, &out)
-        .await
-        .map_err(|e| e.to_string())
+    node.fetch_hls(manifest, &out).await
+}
+
+/// S'abonne à un émetteur — appel sync du core (écriture disque + tâche de
+/// fond `tokio::spawn`), donc exécuté sur le runtime tokio (jamais sur le
+/// thread principal GTK).
+async fn subscribe_inner(node: &Node, issuer: PeerId) -> Result<(), CoreError> {
+    node.subscribe(issuer)
+}
+
+/// Se désabonne d'un émetteur — même contrainte que `subscribe_inner`.
+async fn unsubscribe_inner(node: &Node, issuer: PeerId) -> Result<(), CoreError> {
+    node.unsubscribe(issuer)
 }
