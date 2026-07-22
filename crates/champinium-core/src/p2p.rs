@@ -32,6 +32,7 @@ use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{dcutr, gossipsub, identify, identity::Keypair, noise, ping, relay, tcp, yamux};
 use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -213,6 +214,9 @@ pub struct Node {
     reports: Arc<Mutex<ReportBook>>,
     feed_seq: Arc<Mutex<u64>>,
     channel_profile: Arc<Mutex<ChannelMeta>>,
+    /// Abonnements locaux (channels suivis) — état **privé** du nœud, jamais
+    /// publié sur le réseau (spec channels §2).
+    subscriptions: Arc<Mutex<BTreeSet<PeerId>>>,
     cmd_tx: mpsc::Sender<Command>,
 }
 
@@ -268,6 +272,9 @@ impl Node {
         let moderation = Arc::new(RwLock::new(moderation));
         let catalog = Arc::new(Mutex::new(Catalog::new()));
         let reports = Arc::new(Mutex::new(ReportBook::default()));
+        // Abonnements locaux persistés (spec channels §2) : rechargés avant le
+        // démarrage de la boucle de suivi pour que le passage initial les couvre.
+        let subscriptions = Arc::new(Mutex::new(load_subscriptions(&blockstore)));
         // Canal d'événements « catalogue mis à jour » : capacité large car un
         // abonné lent ne doit pas perdre le signal (les tics sont fusionnables :
         // rater un tic mais en recevoir un plus tard suffit à se resynchroniser).
@@ -280,6 +287,7 @@ impl Node {
             catalog.clone(),
             catalog_events.clone(),
             reports.clone(),
+            subscriptions.clone(),
             topic,
             reports_topic,
             cmd_rx,
@@ -303,6 +311,7 @@ impl Node {
             reports,
             feed_seq,
             channel_profile,
+            subscriptions,
             cmd_tx,
         })
     }
@@ -452,11 +461,12 @@ impl Node {
         let profile = self.channel_profile();
         let feed = Feed::build_signed_with(&self.keypair, seq, &profile, entries)?;
         // Le créateur figure dans son propre catalogue.
+        let subs = self.subscriptions_snapshot();
         let changed = self
             .catalog
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .apply(feed.clone())?;
+            .apply(feed.clone(), &subs)?;
         if changed {
             let _ = self.catalog_events.send(());
         }
@@ -562,11 +572,12 @@ impl Node {
             }
         }
         if let Some(feed) = &best {
+            let subs = self.subscriptions_snapshot();
             let changed = self
                 .catalog
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .apply(feed.clone());
+                .apply(feed.clone(), &subs);
             if changed.unwrap_or(false) {
                 let _ = self.catalog_events.send(());
             }
@@ -631,6 +642,77 @@ impl Node {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entries()
+    }
+
+    /// Instantané (non trié) des abonnements — usage interne (exemption de
+    /// borne du catalogue, cf. `Catalog::apply`).
+    fn subscriptions_snapshot(&self) -> HashSet<PeerId> {
+        self.subscriptions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// S'abonne à un émetteur (channel) : persiste immédiatement (état privé,
+    /// spec channels §2 — jamais publié sur le réseau). Pas encore de fetch
+    /// actif (tâche 2).
+    pub fn subscribe(&self, issuer: PeerId) -> CoreResult<()> {
+        let mut subs = self
+            .subscriptions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        subs.insert(issuer);
+        save_subscriptions(&self.blockstore, &subs)
+    }
+
+    /// Se désabonne d'un émetteur : persiste immédiatement. Le feed déjà
+    /// appliqué au catalogue n'est pas rétroactivement retiré (le catalogue
+    /// reste un instantané "meilleur effort" de ce que le nœud a vu).
+    pub fn unsubscribe(&self, issuer: PeerId) -> CoreResult<()> {
+        let mut subs = self
+            .subscriptions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        subs.remove(&issuer);
+        save_subscriptions(&self.blockstore, &subs)
+    }
+
+    /// Abonnements courants, triés (stabilité d'affichage).
+    pub fn subscriptions(&self) -> Vec<PeerId> {
+        self.subscriptions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// Entrées du catalogue restreintes aux émetteurs souscrits.
+    pub fn catalog_subscribed(&self) -> Vec<CatalogEntry> {
+        let subs = self.subscriptions_snapshot();
+        self.catalog_entries()
+            .into_iter()
+            .filter(|e| subs.contains(&e.issuer))
+            .collect()
+    }
+
+    /// Injecte un feed tiers directement dans le catalogue local, hors réseau
+    /// (tests uniquement : simule la réception d'un feed sans dépendre du
+    /// gossip ou de la DHT).
+    #[doc(hidden)]
+    pub fn apply_feed_for_tests(&self, feed: Feed) -> CoreResult<bool> {
+        let subs = self.subscriptions_snapshot();
+        let changed = self
+            .catalog
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .apply(feed, &subs)?;
+        if changed {
+            let _ = self.catalog_events.send(());
+        }
+        Ok(changed)
     }
 
     /// Profil de channel courant (instantané).
@@ -924,6 +1006,37 @@ fn load_channel_profile(blockstore: &Blockstore) -> ChannelMeta {
         .unwrap_or_default()
 }
 
+/// Chemin du store d'abonnements persisté (état PRIVÉ du nœud — jamais publié
+/// sur le réseau, spec channels §2).
+fn subscriptions_path(blockstore: &Blockstore) -> PathBuf {
+    blockstore.root().join(".subscriptions")
+}
+
+/// Charge les abonnements persistés (vide si absent/illisible — un fichier
+/// corrompu ne doit pas empêcher le démarrage). Les entrées individuellement
+/// invalides (PeerId mal formé) sont ignorées plutôt que de faire échouer tout
+/// le chargement.
+fn load_subscriptions(blockstore: &Blockstore) -> BTreeSet<PeerId> {
+    std::fs::read_to_string(subscriptions_path(blockstore))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .map(|ids| {
+            ids.into_iter()
+                .filter_map(|s| s.parse::<PeerId>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Persiste les abonnements (JSON `Vec<String>` trié — `BTreeSet` le garantit).
+fn save_subscriptions(blockstore: &Blockstore, subs: &BTreeSet<PeerId>) -> CoreResult<()> {
+    let ids: Vec<String> = subs.iter().map(PeerId::to_string).collect();
+    let json = serde_json::to_string(&ids)
+        .map_err(|e| CoreError::Network(format!("json abonnements: {e}")))?;
+    std::fs::write(subscriptions_path(blockstore), json)?;
+    Ok(())
+}
+
 /// Préfixe des clés DHT de feeds.
 const FEED_KEY_PREFIX: &[u8] = b"/champinium/feed/";
 
@@ -1001,6 +1114,7 @@ struct EventLoop {
     catalog: Arc<Mutex<Catalog>>,
     catalog_events: tokio::sync::broadcast::Sender<()>,
     reports: Arc<Mutex<ReportBook>>,
+    subscriptions: Arc<Mutex<BTreeSet<PeerId>>>,
     feeds_topic: gossipsub::IdentTopic,
     reports_topic: gossipsub::IdentTopic,
     cmd_rx: mpsc::Receiver<Command>,
@@ -1025,6 +1139,7 @@ impl EventLoop {
         catalog: Arc<Mutex<Catalog>>,
         catalog_events: tokio::sync::broadcast::Sender<()>,
         reports: Arc<Mutex<ReportBook>>,
+        subscriptions: Arc<Mutex<BTreeSet<PeerId>>>,
         feeds_topic: gossipsub::IdentTopic,
         reports_topic: gossipsub::IdentTopic,
         cmd_rx: mpsc::Receiver<Command>,
@@ -1036,6 +1151,7 @@ impl EventLoop {
             catalog,
             catalog_events,
             reports,
+            subscriptions,
             feeds_topic,
             reports_topic,
             cmd_rx,
@@ -1313,11 +1429,18 @@ impl EventLoop {
     ) {
         let acceptance = match Feed::from_json(data) {
             Ok(feed) => {
+                let subs: HashSet<PeerId> = self
+                    .subscriptions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .copied()
+                    .collect();
                 match self
                     .catalog
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .apply(feed)
+                    .apply(feed, &subs)
                 {
                     Ok(true) => {
                         let _ = self.catalog_events.send(());
