@@ -4,6 +4,7 @@
 using System;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Windows.ApplicationModel.DataTransfer;
 using Windows.Media.Core;
 using Windows.Media.Playback;
 
@@ -13,6 +14,13 @@ public sealed partial class MainWindow : Window
 {
     /// <summary>Modèle de vue lié au XAML (x:Bind).</summary>
     public NodeViewModel Model { get; } = new();
+
+    /// <summary>Index de l'onglet Explorer dans <c>CatalogPivot</c>.</summary>
+    private const int ExplorerPivotIndex = 1;
+
+    /// <summary>Vrai pendant qu'on revient nous-mêmes sur Abonnements après un
+    /// refus de l'avertissement — évite de redéclencher le dialogue en boucle.</summary>
+    private bool _revertingPivotSelection;
 
     public MainWindow()
     {
@@ -42,6 +50,76 @@ public sealed partial class MainWindow : Window
         {
             await Model.PlayAsync(cid);
         }
+    }
+
+    /// <summary>
+    /// Premier accès à l'onglet Explorer : avertissement sur le contenu non
+    /// curé, mémorisé dans <see cref="LocalSettings"/>. Refus → retour sur
+    /// Abonnements.
+    /// </summary>
+    private async void OnPivotSelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_revertingPivotSelection || CatalogPivot.SelectedIndex != ExplorerPivotIndex)
+        {
+            return;
+        }
+
+        if (LocalSettings.ExplorerAccepted)
+        {
+            return;
+        }
+
+        var dialog = new ContentDialog
+        {
+            Title = "Explorer",
+            Content = "Contenu non curé venant du réseau ouvert, filtré uniquement par les denylists.",
+            PrimaryButtonText = "Continuer",
+            CloseButtonText = "Annuler",
+            DefaultButton = ContentDialogButton.Close,
+            XamlRoot = Content.XamlRoot,
+        };
+
+        var result = await dialog.ShowAsync();
+        if (result == ContentDialogResult.Primary)
+        {
+            LocalSettings.ExplorerAccepted = true;
+        }
+        else
+        {
+            _revertingPivotSelection = true;
+            CatalogPivot.SelectedIndex = 0;
+            _revertingPivotSelection = false;
+        }
+    }
+
+    private async void OnSubscribeByLinkClick(object sender, RoutedEventArgs e)
+    {
+        await Model.SubscribeByLinkAsync();
+    }
+
+    /// <summary>
+    /// Bascule l'abonnement d'un groupe (créateur/channel) — le bouton porte le
+    /// <see cref="ChannelGroup"/> entier en Tag (état actuel relu au clic).
+    /// </summary>
+    private async void OnToggleSubscriptionClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button { Tag: ChannelGroup group })
+        {
+            await Model.ToggleSubscriptionAsync(group.Issuer, group.IsSubscribed);
+        }
+    }
+
+    private void OnCopyMyLinkClick(object sender, RoutedEventArgs e)
+    {
+        var link = Model.MyChannelLink();
+        if (string.IsNullOrEmpty(link))
+        {
+            return;
+        }
+
+        var package = new DataPackage();
+        package.SetText(link);
+        Clipboard.SetContent(package);
     }
 
     /// <summary>Reçoit le chemin du index.m3u8 reconstruit et lance la lecture.</summary>

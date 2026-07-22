@@ -6,29 +6,48 @@ using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.IO;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using Champinium.Core; // bindings générés par `just gen-csharp`
 
 namespace Champinium;
 
-/// <summary>Une ligne affichable : un contenu rattaché à son créateur/feed.</summary>
+/// <summary>Une ligne de contenu affichable, rattachée à son groupe (créateur/feed).</summary>
 public sealed class CatalogCid
 {
-    public string Issuer { get; init; } = "";
-    public ulong Seq { get; init; }
     public string Cid { get; init; } = "";
     public string Title { get; init; } = "";
     public IReadOnlyList<string> Tags { get; init; } = Array.Empty<string>();
-
-    /// <summary>Libellé court du créateur, pour l'en-tête de section.</summary>
-    public string Header => $"créateur {Issuer} — seq {Seq}";
 
     /// <summary>Libellé principal : le titre, ou le CID si sans titre.</summary>
     public string Display => Title.Length > 0 ? Title : Cid;
 
     /// <summary>Tags joints pour l'affichage (vide si aucun).</summary>
     public string TagsText => string.Join(" · ", Tags);
+}
+
+/// <summary>
+/// Un groupe par créateur/channel : en-tête (nom, seq, bouton abonnement) +
+/// ses contenus. Le bouton S'abonner/Se désabonner vit ICI (au niveau du
+/// groupe), jamais sur une ligne de contenu — même décision que le jumeau
+/// macOS (ContentView.swift).
+/// </summary>
+public sealed class ChannelGroup
+{
+    public string Issuer { get; init; } = "";
+    public ulong Seq { get; init; }
+    public bool IsSubscribed { get; init; }
+    public ObservableCollection<CatalogCid> Items { get; } = new();
+
+    /// <summary>Nom du channel, ou PeerId tronqué si le channel n'a pas de nom.</summary>
+    public string DisplayName { get; init; } = "";
+
+    public string SeqText => $"seq {Seq}";
+
+    /// <summary>Libellé du bouton — calculé depuis l'état d'abonnement réel
+    /// (dans l'onglet Abonnements, toujours vrai par construction).</summary>
+    public string SubscribeLabel => IsSubscribed ? "Se désabonner" : "S'abonner";
 }
 
 /// <summary>
@@ -89,11 +108,26 @@ public sealed class NodeViewModel : INotifyPropertyChanged
         set => Set(ref _peerField, value);
     }
 
-    /// <summary>Catalogue aplati (un élément par contenu) pour la liste ;
-    /// filtré par la recherche locale quand <see cref="SearchQuery"/> est saisi.</summary>
-    public ObservableCollection<CatalogCid> Entries { get; } = new();
+    /// <summary>Lien ou PeerId collé pour s'abonner (liaison TextBox, onglet Explorer).</summary>
+    private string _channelLinkField = "";
+    public string ChannelLinkField
+    {
+        get => _channelLinkField;
+        set => Set(ref _channelLinkField, value);
+    }
 
-    /// <summary>Requête de recherche locale (liaison TextBox) ; vide = catalogue.</summary>
+    /// <summary>Catalogue restreint aux émetteurs souscrits (`catalog_subscribed()` —
+    /// aucun filtrage côté C#, le core fait le tri).</summary>
+    public ObservableCollection<ChannelGroup> SubscribedGroups { get; } = new();
+
+    /// <summary>Catalogue complet du réseau (`catalog()`) — onglet Explorer.</summary>
+    public ObservableCollection<ChannelGroup> ExploreGroups { get; } = new();
+
+    /// <summary>Résultats de la recherche locale (titres/tags) — remplace les deux
+    /// listes ci-dessus tant que <see cref="SearchQuery"/> n'est pas vide.</summary>
+    public ObservableCollection<CatalogCid> SearchResults { get; } = new();
+
+    /// <summary>Requête de recherche locale (liaison TextBox) ; vide = catalogues normaux.</summary>
     private string _searchQuery = "";
     public string SearchQuery
     {
@@ -103,6 +137,19 @@ public sealed class NodeViewModel : INotifyPropertyChanged
             Set(ref _searchQuery, value);
             RefreshCatalog();
         }
+    }
+
+    /// <summary>PeerIds actuellement souscrits (pour calculer l'état des boutons Explorer).</summary>
+    private HashSet<string> _subscriptions = new();
+
+    /// <summary>Émis quand un abonnement/désabonnement échoue ou réussit — la vue
+    /// affiche un message court (distinct des erreurs réseau pour un refus de
+    /// modération, distinct des soucis réseau).</summary>
+    private string? _subscriptionStatus;
+    public string? SubscriptionStatus
+    {
+        get => _subscriptionStatus;
+        private set => Set(ref _subscriptionStatus, value);
     }
 
     /// <summary>
@@ -147,6 +194,7 @@ public sealed class NodeViewModel : INotifyPropertyChanged
             await node.SetCatalogListener(_listener);
 
             Status = "nœud en ligne";
+            RefreshCatalog();
         }
         catch (Exception ex)
         {
@@ -177,25 +225,27 @@ public sealed class NodeViewModel : INotifyPropertyChanged
     }
 
     /// <summary>
-    /// Met à jour la liste : catalogue complet, ou résultats de la recherche
-    /// locale (le core fait la recherche — le VM ne fait que présenter).
+    /// Met à jour les deux catalogues (Abonnements + Explorer) et l'état des
+    /// abonnements depuis le noyau — aucun filtrage côté C#, `catalog_subscribed()`
+    /// et `catalog()` viennent déjà triés du core.
     /// </summary>
     public void RefreshCatalog()
     {
-        Entries.Clear();
         if (_node is null)
         {
             return;
         }
 
+        _subscriptions = _node.Subscriptions().ToHashSet();
+
         if (!string.IsNullOrWhiteSpace(SearchQuery))
         {
+            SearchResults.Clear();
             var hits = _node.Search(SearchQuery);
             foreach (var hit in hits)
             {
-                Entries.Add(new CatalogCid
+                SearchResults.Add(new CatalogCid
                 {
-                    Issuer = hit.issuer,
                     Cid = hit.cid,
                     Title = hit.title,
                     Tags = hit.tags,
@@ -205,23 +255,116 @@ public sealed class NodeViewModel : INotifyPropertyChanged
             return;
         }
 
-        var issuers = 0;
-        foreach (var entry in _node.Catalog())
+        Fill(SubscribedGroups, _node.CatalogSubscribed());
+        Fill(ExploreGroups, _node.Catalog());
+        Status = $"catalogue: {ExploreGroups.Count} créateur(s), {SubscribedGroups.Count} souscrit(s)";
+    }
+
+    private void Fill(ObservableCollection<ChannelGroup> target, IReadOnlyList<FfiCatalogEntry> entries)
+    {
+        target.Clear();
+        foreach (var entry in entries)
         {
-            issuers++;
+            var group = new ChannelGroup
+            {
+                Issuer = entry.issuer,
+                Seq = entry.seq,
+                IsSubscribed = _subscriptions.Contains(entry.issuer),
+                DisplayName = entry.channel.name.Length > 0 ? entry.channel.name : Truncate(entry.issuer),
+            };
             foreach (var item in entry.items)
             {
-                Entries.Add(new CatalogCid
+                group.Items.Add(new CatalogCid
                 {
-                    Issuer = entry.issuer,
-                    Seq = entry.seq,
                     Cid = item.cid,
                     Title = item.title,
                     Tags = item.tags,
                 });
             }
+            target.Add(group);
         }
-        Status = $"catalogue: {issuers} créateur(s)";
+    }
+
+    private static string Truncate(string peerId) =>
+        peerId.Length > 14 ? $"{peerId[..8]}…{peerId[^4..]}" : peerId;
+
+    /// <summary>S'abonne via le lien/PeerId collé dans <see cref="ChannelLinkField"/>.</summary>
+    public async Task SubscribeByLinkAsync()
+    {
+        var link = ChannelLinkField.Trim();
+        if (link.Length == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            await _node!.SubscribeChannel(link);
+            ChannelLinkField = "";
+            SubscriptionStatus = "abonné";
+            RefreshCatalog();
+        }
+        catch (Exception ex)
+        {
+            SubscriptionStatus = DescribeSubscriptionError(ex);
+        }
+    }
+
+    /// <summary>
+    /// Bascule l'abonnement d'un émetteur (bouton par groupe/channel, disponible
+    /// depuis Abonnements ET Explorer — même décision que le jumeau macOS).
+    /// </summary>
+    public async Task ToggleSubscriptionAsync(string peerId, bool currentlySubscribed)
+    {
+        if (_node is null)
+        {
+            return;
+        }
+
+        try
+        {
+            if (currentlySubscribed)
+            {
+                await _node.UnsubscribeChannel(peerId);
+                SubscriptionStatus = "désabonné";
+            }
+            else
+            {
+                await _node.SubscribeChannel(peerId);
+                SubscriptionStatus = "abonné";
+            }
+            RefreshCatalog();
+        }
+        catch (Exception ex)
+        {
+            SubscriptionStatus = DescribeSubscriptionError(ex);
+        }
+    }
+
+    /// <summary>Erreur typée du contrat : un refus de modération est un blocage
+    /// volontaire, présenté comme tel (distinct d'une panne réseau).</summary>
+    private static string DescribeSubscriptionError(Exception ex) => ex switch
+    {
+        FfiException.InvalidInput => "saisie invalide",
+        FfiException.Moderated => "contenu bloqué par la modération",
+        _ => "erreur réseau",
+    };
+
+    /// <summary>Lien partageable du channel de ce nœud, pour le bouton "copier".</summary>
+    public string? MyChannelLink()
+    {
+        if (_node is null)
+        {
+            return null;
+        }
+        try
+        {
+            return _node.ChannelLink(_node.PeerId());
+        }
+        catch (Exception)
+        {
+            return null;
+        }
     }
 
     /// <summary>Récupère un HLS (manifeste) et signale qu'il est prêt à lire.</summary>
