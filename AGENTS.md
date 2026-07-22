@@ -20,7 +20,7 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
   capacité absente, ils **ouvrent une demande de changement de contrat** (voir
   protocole plus bas) — ils ne contournent pas via du code natif ad hoc.
 
-### Contrat actuel — v5 (`CONTRACT_VERSION = 5`)
+### Contrat actuel — v6 (`CONTRACT_VERSION = 6`)
 
 > v1 → v2 : ajout de `subscribe_denylist(json) -> u64` sur `ChampiniumNode`
 > (modération fédérée activable depuis les fronts). Purement additif.
@@ -45,7 +45,15 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
 > le record) ; `set_channel_profile(profile)` (async — persiste et republie le
 > feed courant), `channel_profile()` (sync). Côté fil : schéma unique
 > `champinium-feed/v3` (bloc channel signé), formats v1/v2 supprimés.
-
+>
+> v5 → v6 : **abonnements**. Abonnements = **état local privé, jamais publié**
+> sur le réseau. `subscribe_channel(link_or_peer_id)` (async — persiste
+> immédiatement puis déclenche un fetch immédiat en tâche de fond ; accepte un
+> lien `champinium://channel/<clé>` OU un PeerId nu, entrée invalide →
+> `InvalidInput`), `unsubscribe_channel(peer_id)` (async), `subscriptions()`
+> (sync — PeerIds triés), `catalog_subscribed()` (sync — catalogue restreint
+> aux émetteurs souscrits), `channel_link(peer_id)` (sync — pour le bouton
+> « copier le lien de mon channel »). Purement additif.
 
 Fonctions libres (smoke test async, conservées de v0) :
 
@@ -74,6 +82,11 @@ Objet **`ChampiniumNode`** (méthodes) :
 | `search_tag(tag) -> Vec<FfiSearchHit>` | **async** | découverte par tag via la DHT (hors gossip) |
 | `set_channel_profile(profile) -> ()` | **async** | définit le profil de channel : persiste et republie le feed courant |
 | `channel_profile() -> FfiChannelProfile` | sync | profil de channel courant de ce nœud |
+| `subscribe_channel(link_or_peer_id) -> ()` | **async** | s'abonne (lien ou PeerId nu) : persiste + fetch immédiat en tâche de fond |
+| `unsubscribe_channel(peer_id) -> ()` | **async** | se désabonne d'un émetteur |
+| `subscriptions() -> Vec<String>` | sync | abonnements courants (PeerIds triés) |
+| `catalog_subscribed() -> Vec<FfiCatalogEntry>` | sync | catalogue restreint aux émetteurs souscrits |
+| `channel_link(peer_id) -> String` | sync | lien partageable `champinium://channel/<peerid>` |
 
 Records `FfiCatalogEntry { issuer, seq, cids, items, channel }`,
 `FfiContentItem { cid, title, tags }`, `FfiSearchHit { issuer, cid, title, tags }`,
