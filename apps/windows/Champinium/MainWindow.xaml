@@ -21,60 +21,63 @@
     mc:Ignorable="d"
     Title="Champinium">
 
-    <Window.Resources>
-        <local:EmptyStringToVisibilityConverter x:Key="EmptyStringToVisibility" />
-        <local:NonEmptyStringToVisibilityConverter x:Key="NonEmptyStringToVisibility" />
-
-        <!-- Gabarit partagé : un groupe (créateur/channel) = en-tête (nom, seq,
-             bouton abonnement) + ses contenus. Le bouton d'abonnement est au
-             niveau du GROUPE, jamais sur une ligne de contenu individuelle. -->
-        <DataTemplate x:Key="ChannelGroupTemplate" x:DataType="local:ChannelGroup">
-            <StackPanel Spacing="4" Padding="0,8">
-                <Grid ColumnSpacing="8">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="Auto" />
-                    </Grid.ColumnDefinitions>
-                    <StackPanel Grid.Column="0" Spacing="0">
-                        <TextBlock Text="{x:Bind DisplayName}"
-                                   Style="{StaticResource BodyStrongTextBlockStyle}" />
-                        <TextBlock Text="{x:Bind SeqText}"
-                                   Style="{StaticResource CaptionTextBlockStyle}"
-                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
-                    </StackPanel>
-                    <!-- Tag = PeerId de l'émetteur ; l'état actuel (souscrit ou
-                         non) est relu sur le ChannelGroup lui-même au clic. -->
-                    <Button Grid.Column="1" Content="{x:Bind SubscribeLabel}"
-                            Tag="{x:Bind}" Click="OnToggleSubscriptionClick" />
-                </Grid>
-                <ItemsControl ItemsSource="{x:Bind Items}">
-                    <ItemsControl.ItemTemplate>
-                        <DataTemplate x:DataType="local:CatalogCid">
-                            <Grid ColumnSpacing="8" Padding="12,2,0,2">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <StackPanel Grid.Column="0">
-                                    <TextBlock Text="{x:Bind Display}"
-                                               TextTrimming="CharacterEllipsis"
-                                               TextWrapping="NoWrap" />
-                                    <TextBlock Text="{x:Bind TagsText}"
-                                               Style="{StaticResource CaptionTextBlockStyle}"
-                                               Foreground="{ThemeResource TextFillColorTertiaryBrush}"
-                                               TextWrapping="NoWrap" />
-                                </StackPanel>
-                                <Button Grid.Column="1" Content="Lire"
-                                        Tag="{x:Bind Cid}" Click="OnPlayClick" />
-                            </Grid>
-                        </DataTemplate>
-                    </ItemsControl.ItemTemplate>
-                </ItemsControl>
-            </StackPanel>
-        </DataTemplate>
-    </Window.Resources>
-
+    <!-- Window n'a pas de propriété XAML `Resources` en WinUI 3 (WMC0011) —
+         les ressources partagées vivent dans Grid.Resources de la racine ;
+         toutes leurs utilisations sont à l'intérieur de cette grille. -->
     <Grid Padding="16" RowSpacing="12">
+        <Grid.Resources>
+            <local:EmptyStringToVisibilityConverter x:Key="EmptyStringToVisibility" />
+            <local:NonEmptyStringToVisibilityConverter x:Key="NonEmptyStringToVisibility" />
+
+            <!-- Gabarit partagé : un groupe (créateur/channel) = en-tête (nom, seq,
+                 bouton abonnement) + ses contenus. Le bouton d'abonnement est au
+                 niveau du GROUPE, jamais sur une ligne de contenu individuelle. -->
+            <DataTemplate x:Key="ChannelGroupTemplate" x:DataType="local:ChannelGroup">
+                <StackPanel Spacing="4" Padding="0,8">
+                    <Grid ColumnSpacing="8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Grid.Column="0" Spacing="0">
+                            <TextBlock Text="{x:Bind DisplayName}"
+                                       Style="{StaticResource BodyStrongTextBlockStyle}" />
+                            <TextBlock Text="{x:Bind SeqText}"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                        </StackPanel>
+                        <!-- Tag = PeerId de l'émetteur ; l'état actuel (souscrit ou
+                             non) est relu sur le ChannelGroup lui-même au clic. -->
+                        <Button Grid.Column="1" Content="{x:Bind SubscribeLabel}"
+                                Tag="{x:Bind}" Click="OnToggleSubscriptionClick" />
+                    </Grid>
+                    <ItemsControl ItemsSource="{x:Bind Items}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="local:CatalogCid">
+                                <Grid ColumnSpacing="8" Padding="12,2,0,2">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel Grid.Column="0">
+                                        <TextBlock Text="{x:Bind Display}"
+                                                   TextTrimming="CharacterEllipsis"
+                                                   TextWrapping="NoWrap" />
+                                        <TextBlock Text="{x:Bind TagsText}"
+                                                   Style="{StaticResource CaptionTextBlockStyle}"
+                                                   Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                                   TextWrapping="NoWrap" />
+                                    </StackPanel>
+                                    <Button Grid.Column="1" Content="Lire"
+                                            Tag="{x:Bind Cid}" Click="OnPlayClick" />
+                                </Grid>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </StackPanel>
+            </DataTemplate>
+        </Grid.Resources>
+
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
