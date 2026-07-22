@@ -83,7 +83,11 @@ async fn subscribe_triggers_immediate_dht_fetch() {
 
     node_b.subscribe(node_a.peer_id()).unwrap();
 
-    tokio::time::timeout(Duration::from_secs(10), async {
+    // Délai généreux (voir periodic_follow_picks_up_new_feed_versions) :
+    // sous charge CI, un `timeout` trop serré flake sans que le comportement
+    // testé soit en cause (juste le scheduler qui met plus longtemps à
+    // exécuter les tâches réseau).
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let subbed = node_b.catalog_subscribed();
             if subbed.iter().any(|e| e.issuer == node_a.peer_id()) {
@@ -109,7 +113,14 @@ async fn subscribe_triggers_immediate_dht_fetch() {
 ///
 /// Auto-vérification de l'isolation (voir rapport) : avec
 /// `follow_interval` figé à 1 h, ce test échoue par timeout (aucune autre
-/// voie ne peut livrer le feed) ; avec 200 ms, il passe.
+/// voie ne peut livrer le feed) ; avec 100 ms, il passe.
+///
+/// `follow_interval` à 100 ms et un délai de convergence de 30 s (plutôt que
+/// 10 s) : sous charge CI (runners partagés, threads contendus), 10 s s'est
+/// avéré trop serré pour garantir plusieurs tentatives de la boucle
+/// périodique dans la fenêtre — flake observé en CI (ubuntu-latest), pas en
+/// local. Un intervalle plus court + un délai plus large font plus de
+/// tentatives tenir dans la fenêtre sans changer ce que le test prouve.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn periodic_follow_picks_up_new_feed_versions() {
     let dir = tempfile::tempdir().unwrap();
@@ -131,7 +142,7 @@ async fn periodic_follow_picks_up_new_feed_versions() {
     // immédiat spawné par `subscribe()` échoue silencieusement (best-effort)
     // et ne repassera plus jamais.
     let node_b = node(dir.path(), "b").await;
-    node_b.set_follow_interval_for_tests(Duration::from_millis(200));
+    node_b.set_follow_interval_for_tests(Duration::from_millis(100));
     node_b.subscribe(node_a.peer_id()).unwrap();
 
     // B ne se connecte à A qu'à présent, une fois v1 ET v2 déjà publiées.
@@ -143,7 +154,7 @@ async fn periodic_follow_picks_up_new_feed_versions() {
         .unwrap();
     node_b.dial(addr_a).await.unwrap();
 
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let subbed = node_b.catalog_subscribed();
             if subbed
@@ -192,7 +203,9 @@ async fn startup_initial_pass_catches_up_offline_updates() {
         node_b.dial(addr_a).await.unwrap();
         node_b.subscribe(node_a.peer_id()).unwrap();
 
-        tokio::time::timeout(Duration::from_secs(10), async {
+        // Délai généreux (voir periodic_follow_picks_up_new_feed_versions) :
+        // sous charge CI, 10 s s'est avéré trop serré.
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let subbed = node_b.catalog_subscribed();
                 if subbed
@@ -239,7 +252,10 @@ async fn startup_initial_pass_catches_up_offline_updates() {
         .unwrap();
     node_b.dial(addr_a).await.unwrap();
 
-    tokio::time::timeout(Duration::from_secs(15), async {
+    // Délai généreux (voir periodic_follow_picks_up_new_feed_versions) : sous
+    // charge CI, la fenêtre précédente (15 s) était plus courte que celle de
+    // la passe périodique — élargie à 30 s pour symétrie.
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let subbed = node_b.catalog_subscribed();
             if subbed
