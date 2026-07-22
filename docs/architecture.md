@@ -2,7 +2,7 @@
 
 > Public : quiconque veut comprendre comment le projet fonctionne de bout en
 > bout. Les renvois pointent vers le code (chemins cliquables) et les ADRs
-> (`docs/adr/`) pour les décisions. État au contrat FFI **v5** / release
+> (`docs/adr/`) pour les décisions. État au contrat FFI **v6** / release
 > **v0.6.x**.
 
 ## 1. Ce que c'est, en une phrase
@@ -57,11 +57,12 @@ un front est un bug). Carte des modules :
 | [`blockstore`](../crates/champinium-core/src/blockstore.rs) | stockage content-addressed sur disque : un fichier par CID, **écriture atomique** (tempfile+persist), intégrité vérifiée à la lecture, `remove` pour la purge de modération |
 | [`identity`](../crates/champinium-core/src/identity.rs) | paire Ed25519 persistée (`node.key`, mode 0600) → PeerId |
 | [`feed`](../crates/champinium-core/src/feed.rs) | feed signé d'un créateur, versionné par `seq` (LWW) ; **v3** = métadonnées titre/tags par entrée + identité de channel (nom/description/avatar) signées, v1/v2 supprimés |
-| [`catalog`](../crates/champinium-core/src/catalog.rs) | CRDT maison : map last-writer-wins par émetteur, bornée (1024 émetteurs) ; recherche locale |
+| [`catalog`](../crates/champinium-core/src/catalog.rs) | CRDT maison : map last-writer-wins par émetteur, bornée (1024 émetteurs, sauf émetteurs souscrits — §6) ; recherche locale |
 | [`moderation`](../crates/champinium-core/src/moderation.rs) | denylist compilée (non désactivable) + denylists signées souscrites (fédéré) |
 | [`report`](../crates/champinium-core/src/report.rs) | signalement P2P : rapport signé + agrégateur borné de rapporteurs distincts |
 | [`ingest`](../crates/champinium-core/src/ingest.rs) | orchestration ffmpeg → segments HLS alignés keyframes → manifeste `champinium-hls/v1` |
-| [`p2p`](../crates/champinium-core/src/p2p.rs) | le cœur : `Node`, la boucle d'évènements libp2p, tous les flux (§4, §6) |
+| [`p2p`](../crates/champinium-core/src/p2p.rs) | le cœur : `Node`, la boucle d'évènements libp2p, tous les flux (§4, §6), le suivi actif des abonnements |
+| [`channel_link`](../crates/champinium-core/src/channel_link.rs) | lien partageable `champinium://channel/<peerid>` d'un channel (format/parse, tolérant à un PeerId nu) |
 | [`relay`](../crates/champinium-core/src/relay.rs) | serveur de relais stateless (utilisé par `infra/relay`) |
 | [`paths`](../crates/champinium-core/src/paths.rs) | répertoire de données durable par OS |
 | [`ffi`](../crates/champinium-core/src/ffi.rs) | la surface UniFFI = **le contrat** avec les fronts (§8) |
@@ -173,6 +174,31 @@ fichier → [modération #1] → ffmpeg (segments HLS) → blocs CID + manifeste
    que le catalogue déjà reconstruit — limite assumée : pas de recherche
    globale exhaustive sur un réseau décentralisé (risque #4).
 
+### Abonnements : suivi actif d'un émetteur choisi
+
+Au-delà des trois chemins de découverte passive ci-dessus, un nœud peut
+**s'abonner** à un émetteur (`subscribe_channel(lien-ou-peerid)`) — la liste
+d'abonnements est **locale, privée et jamais publiée** (fichier
+`.subscriptions` à côté des blocs, comme `.channel_profile`). L'abonnement :
+
+- persiste immédiatement, puis déclenche un **fetch immédiat** en tâche de
+  fond ;
+- est ensuite suivi **activement** par une boucle périodique
+  (`FOLLOW_INTERVAL`) qui refait `fetch_feed` pour chaque émetteur souscrit,
+  sans dépendre du gossip ni d'une action de l'utilisateur ;
+- est **rechargé au démarrage** du nœud, avant le premier tour de boucle, de
+  sorte qu'un redémarrage rattrape les feeds manqués pendant l'arrêt.
+
+Un émetteur souscrit **franchit la borne anti-DoS du catalogue** (1024
+émetteurs, §7) : même si le catalogue est plein, ses feeds sont toujours
+appliqués — s'abonner garantit de voir ce channel. Les liens partageables
+`champinium://channel/<peerid>` (module `channel_link`) sont la forme
+échangée entre utilisateurs (« copier le lien de mon channel ») ; `parse` est
+tolérant et accepte aussi un `PeerId` nu. Se désabonner (`unsubscribe_channel`)
+retire seulement le suivi et la vue — au lot (b), il n'y a pas encore de stock
+proactif à purger (voir §11, lot channels (c) : seed proactif + éviction +
+retrait de seed-what-you-consume).
+
 ### Lecture + seed-what-you-consume
 
 ```
@@ -225,7 +251,7 @@ Autour, deux mécanismes d'écosystème :
   catalogue borné à 1024 émetteurs (refus-quand-plein, pas d'éviction), c'est
   la défense contre l'inondation par clés jetables.
 
-## 8. La frontière FFI : le contrat v5
+## 8. La frontière FFI : le contrat v6
 
 La surface UniFFI de [`ffi.rs`](../crates/champinium-core/src/ffi.rs) est
 **le contrat** entre le noyau et les fronts (tableau exhaustif et protocole de
@@ -245,15 +271,28 @@ changement dans [`AGENTS.md`](../AGENTS.md)). Ce qui la caractérise :
 - **Bindings générés au build, jamais commités** : Swift via
   UniFFI/XCFramework (`just macos-prepare`), C# via `uniffi-bindgen-cs`
   (`just gen-csharp`). Le front Linux consomme le crate **directement** (pas
-  de FFI). `CONTRACT_VERSION` (=5) permet aux fronts de détecter une
+  de FFI). `CONTRACT_VERSION` (=6) permet aux fronts de détecter une
   incompatibilité au démarrage.
+- **Abonnements (v6)** : `subscribe_channel`/`unsubscribe_channel` (lien
+  `champinium://channel/<peerid>` ou PeerId nu), `subscriptions` (liste
+  locale), `catalog_subscribed` (catalogue restreint aux émetteurs souscrits)
+  et `channel_link` (lien partageable du channel de ce nœud). Aucune de ces
+  méthodes ne touche au réseau de façon synchrone-bloquante côté front : le
+  suivi actif tourne dans la boucle de fond du noyau (§6).
 
 Les trois fronts ([`apps/macos`](../apps/macos),
 [`apps/windows`](../apps/windows), [`apps/linux`](../apps/linux)) font tous la
 même chose et rien d'autre : ouvrir le nœud (répertoire durable par OS),
 écouter, se connecter, afficher le catalogue (réactif), chercher, lire avec le
 lecteur natif (AVPlayer / MediaPlayerElement / GStreamer), nettoyer leurs
-répertoires de lecture temporaires.
+répertoires de lecture temporaires. Chacun offre deux vues : **Abonnements**
+(par défaut, restreinte à `catalog_subscribed`) et **Explorer** (catalogue
+complet, opt-in derrière un avertissement — un nœud non souscrit peut exposer
+du contenu que l'utilisateur n'a pas choisi de suivre), avec désabonnement
+possible depuis les deux vues. Coller un lien `champinium://channel/…` reste
+une action manuelle dans l'app : l'enregistrement du scheme auprès de l'OS
+(Info.plist / appxmanifest Protocol / .desktop, pour un clic direct depuis un
+navigateur) est différé au packaging (Phase 6).
 
 ## 9. Cycle de vie local d'un nœud
 
@@ -295,11 +334,13 @@ qui compte vit dans le réseau, chaque nœud n'en garde qu'une vue.
 | NAT | relay v2 + DCUtR testés ; relays multipliables | risque #6 |
 | Signature payante | palier gratuit livré ; notarisation/Authenticode différés | `packaging.md` |
 | Windows/C# | validé par CI ; pas de stack intendant | `.intendant.toml` |
+| Channels lot (c) | seed proactif des channels souscrits + quota + éviction + cache de lecture séparé + retrait de seed-what-you-consume — pas encore implémenté (le désabonnement au lot (b) ne purge rien) | §6 |
+| Channels lot (d) | blocage local de channel, denylists par clé, agrégation des signalements par channel — pas encore implémenté | §7 |
 
 ## 12. Carte des documents
 
 - [`CLAUDE.md`](../CLAUDE.md) — principes + état d'avancement (source de vérité).
-- [`AGENTS.md`](../AGENTS.md) — contrat FFI (tableau v5) + garde-fous d'équipe.
+- [`AGENTS.md`](../AGENTS.md) — contrat FFI (tableau v6) + garde-fous d'équipe.
 - [`docs/adr/`](adr/) — décisions : libp2p vs iroh (0001), modération côté
   nœud (0002), feeds signés (0003), transport de blocs (0006), IPNS (0007)…
 - [`docs/mvp-demo.md`](mvp-demo.md) / [`docs/gui-demo.md`](gui-demo.md) —

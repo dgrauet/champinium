@@ -220,22 +220,42 @@ sur deux machines physiques.
 - **Channels lot (a) ✔** : feed `champinium-feed/v3` (identité de channel
   signée : nom/description/avatar, formats v1/v2 supprimés — zéro
   utilisateur), profil persisté (`.channel_profile`) avec republication au
-  changement, contrat FFI **v5** (`FfiChannelProfile`,
+  changement, contrat FFI v5 (`FfiChannelProfile`,
   `set_channel_profile`/`channel_profile`, `FfiCatalogEntry.channel`). Spec :
   `~/Work/.superpowers/champinium/specs/2026-07-22-channels-subscriptions-design.md`.
+- **Channels lot (b) ✔** : abonnements à un émetteur, **locaux et privés —
+  jamais publiés** (store `.subscriptions` à côté des blocs, à côté de
+  `.channel_profile`). Suivi actif de chaque channel souscrit : fetch
+  immédiat à l'abonnement, passe **périodique** en tâche de fond
+  (`FOLLOW_INTERVAL`), rattrapage au **démarrage** du nœud (les abonnements
+  persistés sont rechargés avant le premier tour de boucle). Un émetteur
+  souscrit **franchit la borne du catalogue** (1024 émetteurs, sinon
+  refus-quand-plein) — s'abonner garantit de voir le channel même si le
+  catalogue est plein. Liens partageables `champinium://channel/<peerid>`
+  (module `channel_link`, tolérant à un PeerId nu). Contrat FFI **v6**
+  (`subscribe_channel`, `unsubscribe_channel`, `subscriptions`,
+  `catalog_subscribed`, `channel_link`). CLI : `subscribe <lien-ou-peerid>` /
+  `unsubscribe <peerid>` / `subscriptions` / `catalog --subscribed`. Les
+  trois fronts ont une vue **Abonnements** (par défaut) et une vue
+  **Explorer** (catalogue complet, opt-in derrière un avertissement) avec
+  désabonnement possible depuis les deux. L'enregistrement OS du scheme
+  `champinium://` (Info.plist / appxmanifest / .desktop) est différé au
+  packaging (Phase 6) — coller le lien reste manuel jusque-là.
 - **Restent** (issues) : IPNS durable (#21), réplication opportuniste au-delà du
-  reseed à la consommation.
+  reseed à la consommation, seed proactif des channels souscrits (lot c).
 
 Phasing : 0 (spike async FFI ✔ contrat) → **1 (P2P nu CLI ✔)** → **2 (modération ✔,
 feeds/gossipsub/catalogue ✔, ingestion ffmpeg ✔)** → **3 (contrat UniFFI v3 ✔,
 UI macOS compile ✔, critère MVP déroulé ✔)** → **4 (close : 3 fronts ✔, relay
 NAT ✔, seeding ✔, feed DHT ✔, fetch concurrent ✔, déploiement tiers documenté ✔ ;
 bitswap différé)** → 5 (en cours : peer scoring ✔, signalement P2P ✔, réplication
-mesurée ✔, recherche ✔ (#20) ; IPNS #21). Voir le spec.
+mesurée ✔, recherche ✔ (#20), channels lot (a) identité ✔ et lot (b) abonnements
+✔ ; IPNS #21, channels lot (c) seed proactif et lot (d) blocage local à venir).
+Voir le spec.
 
 **Dernière release : voir `.release-please-manifest.json` / CHANGELOG** —
 pas de version en dur ici, elle dérive (règle intendant DG006). Release-please
 gère le versionnement (`bump-minor-pre-major` actif :
 un breaking change bumpe la mineure tant qu'on est < 1.0.0 — la 1.0 sera un
 choix délibéré de stabilisation d'API). Versionnement du contrat FFI distinct :
-`CONTRACT_VERSION = 5` (voir `AGENTS.md`).
+`CONTRACT_VERSION = 6` (voir `AGENTS.md`).
