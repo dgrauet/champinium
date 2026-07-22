@@ -1,17 +1,35 @@
-// Vue principale : barre de connexion, catalogue, et lecteur AVPlayer.
+// Vue principale : barre de connexion, catalogue (Abonnements/Explorer), et
+// lecteur AVPlayer. Aucune logique métier — le filtrage par abonnement vient
+// du core (`catalogSubscribed()`), cette vue ne fait que présenter.
+import AppKit
 import AVKit
 import ChampiniumCore
 import SwiftUI
+
+/// Onglet de vue du catalogue — Abonnements par défaut (voir spec §2).
+private enum CatalogTab: String, CaseIterable {
+    case subscriptions = "Abonnements"
+    case explorer = "Explorer"
+}
 
 struct ContentView: View {
     @StateObject private var model = NodeModel()
     @State private var peerField: String = ""
     @State private var searchQuery: String = ""
+    @State private var tab: CatalogTab = .subscriptions
+    @State private var showExplorerWarning = false
+    @AppStorage("explorerAccepted") private var explorerAccepted = false
+    @State private var channelLinkField: String = ""
+    @State private var subscriptionStatus: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             header
             connectBar
+            tabPicker
+            if tab == .explorer {
+                explorerToolbar
+            }
             searchBar
             Divider()
             if searchQuery.isEmpty {
@@ -27,6 +45,15 @@ struct ContentView: View {
         }
         .padding()
         .task { await model.start() }
+        .alert("Explorer", isPresented: $showExplorerWarning) {
+            Button("Annuler", role: .cancel) {}
+            Button("Continuer") {
+                explorerAccepted = true
+                tab = .explorer
+            }
+        } message: {
+            Text("Contenu non curé venant du réseau ouvert, filtré uniquement par les denylists.")
+        }
     }
 
     private var header: some View {
@@ -48,24 +75,96 @@ struct ContentView: View {
         }
     }
 
+    /// Sélecteur segmenté « Abonnements / Explorer ». Le premier passage sur
+    /// Explorer déclenche l'avertissement (mémorisé via `explorerAccepted`).
+    private var tabPicker: some View {
+        Picker("Vue", selection: $tab) {
+            ForEach(CatalogTab.allCases, id: \.self) { candidate in
+                Text(candidate.rawValue).tag(candidate)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .onChange(of: tab) { newValue in
+            guard newValue == .explorer, !explorerAccepted else { return }
+            tab = .subscriptions
+            showExplorerWarning = true
+        }
+    }
+
+    /// Abonnement par lien + copie du lien de mon propre channel — visibles
+    /// uniquement dans l'onglet Explorer.
+    private var explorerToolbar: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                TextField("Coller un lien de channel…", text: $channelLinkField)
+                    .textFieldStyle(.roundedBorder)
+                Button("S'abonner") { Task { await subscribeByLink() } }
+                    .disabled(channelLinkField.trimmingCharacters(in: .whitespacesAndNewlines)
+                        .isEmpty)
+            }
+            Button("Copier le lien de mon channel") { copyMyChannelLink() }
+            if let subscriptionStatus {
+                Text(subscriptionStatus).font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+    }
+
     private var searchBar: some View {
         TextField("Rechercher (titre ou tag)…", text: $searchQuery)
             .textFieldStyle(.roundedBorder)
             .onChange(of: searchQuery, perform: { model.search($0) })
     }
 
+    /// Liste courante selon l'onglet — Abonnements ou Explorer, toutes deux
+    /// rafraîchies ensemble par `NodeModel.refreshCatalog()`.
     private var catalogList: some View {
         List {
-            ForEach(model.entries, id: \.issuer) { entry in
-                Section("créateur \(entry.issuer) — seq \(entry.seq)") {
+            ForEach(currentEntries, id: \.issuer) { entry in
+                Section(header: channelHeader(for: entry)) {
                     ForEach(entry.items, id: \.cid) { item in
-                        contentRow(
-                            title: item.title, tags: item.tags, cid: item.cid
-                        )
+                        contentRow(title: item.title, tags: item.tags, cid: item.cid)
                     }
                 }
             }
         }
+    }
+
+    private var currentEntries: [FfiCatalogEntry] {
+        tab == .subscriptions ? model.subscribedEntries : model.entries
+    }
+
+    /// En-tête de section : nom du channel (ou PeerId tronqué), seq, et — en
+    /// Explorer uniquement — le bouton S'abonner/Se désabonner.
+    private func channelHeader(for entry: FfiCatalogEntry) -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(displayName(for: entry)).font(.subheadline).bold()
+                Text("seq \(entry.seq)").font(.caption2).foregroundStyle(.tertiary)
+            }
+            Spacer()
+            if tab == .explorer {
+                subscribeButton(for: entry)
+            }
+        }
+    }
+
+    private func displayName(for entry: FfiCatalogEntry) -> String {
+        entry.channel.name.isEmpty ? truncated(entry.issuer) : entry.channel.name
+    }
+
+    private func truncated(_ peerId: String) -> String {
+        guard peerId.count > 14 else { return peerId }
+        return String(peerId.prefix(8)) + "…" + String(peerId.suffix(4))
+    }
+
+    private func subscribeButton(for entry: FfiCatalogEntry) -> some View {
+        let subscribed = model.subscriptions.contains(entry.issuer)
+        return Button(subscribed ? "Se désabonner" : "S'abonner") {
+            Task { await toggleSubscription(peerId: entry.issuer, subscribed: subscribed) }
+        }
+        .font(.caption)
+        .buttonStyle(.bordered)
     }
 
     private var searchResults: some View {
@@ -94,5 +193,52 @@ struct ContentView: View {
             Spacer()
             Button("Lire") { Task { await model.play(manifestCid: cid) } }
         }
+    }
+
+    private func toggleSubscription(peerId: String, subscribed: Bool) async {
+        do {
+            if subscribed {
+                try await model.unsubscribeChannel(peerId)
+                subscriptionStatus = "désabonné"
+            } else {
+                try await model.subscribeChannel(peerId)
+                subscriptionStatus = "abonné"
+            }
+        } catch {
+            subscriptionStatus = describeSubscriptionError(error)
+        }
+    }
+
+    private func subscribeByLink() async {
+        let link = channelLinkField.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !link.isEmpty else { return }
+        do {
+            try await model.subscribeChannel(link)
+            channelLinkField = ""
+            subscriptionStatus = "abonné"
+        } catch {
+            subscriptionStatus = describeSubscriptionError(error)
+        }
+    }
+
+    private func describeSubscriptionError(_ error: Error) -> String {
+        guard let ffiError = error as? FfiError else { return "erreur réseau" }
+        switch ffiError {
+        case .InvalidInput:
+            return "saisie invalide"
+        default:
+            return "erreur réseau"
+        }
+    }
+
+    private func copyMyChannelLink() {
+        guard let link = model.myChannelLink() else {
+            subscriptionStatus = "lien indisponible"
+            return
+        }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(link, forType: .string)
+        subscriptionStatus = "lien copié"
     }
 }
