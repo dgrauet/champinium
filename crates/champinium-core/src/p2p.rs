@@ -753,22 +753,30 @@ impl Node {
 
         // Contenu propre : retenu au SeedIndex, ÉPINGLÉ d'office (jamais
         // évincé sous quota) — c'est le créateur, il seed toujours ce qu'il
-        // publie lui-même (spec channels lot c).
+        // publie lui-même (spec channels lot c). Garde `contains_manifest` :
+        // `SeedIndex::insert` ne déduplique PAS (elle pousse toujours une
+        // nouvelle entrée) — un ré-ingest du même contenu (même manifeste,
+        // même CID) ne doit pas compter deux fois ses octets dans le quota.
+        // L'épinglage, lui, est idempotent (`BTreeSet::insert`) et refait
+        // dans tous les cas.
         {
             let mut idx = self
                 .seed_index
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            idx.insert(
-                self.peer_id.to_string(),
-                SeededPublication {
-                    manifest_cid: manifest_cid.to_string(),
-                    segment_cids,
-                    total_bytes,
-                    order: 0, // ignoré par `insert`, réassigné par l'index.
-                },
-            );
-            idx.pin(&manifest_cid.to_string());
+            let manifest_cid_str = manifest_cid.to_string();
+            if !idx.contains_manifest(&manifest_cid_str) {
+                idx.insert(
+                    self.peer_id.to_string(),
+                    SeededPublication {
+                        manifest_cid: manifest_cid_str.clone(),
+                        segment_cids,
+                        total_bytes,
+                        order: 0, // ignoré par `insert`, réassigné par l'index.
+                    },
+                );
+            }
+            idx.pin(&manifest_cid_str);
             if let Err(e) = seeding::save_seed_index(&self.blockstore, &idx) {
                 tracing::warn!("persistance de l'index de seed échouée: {e}");
             }
@@ -900,6 +908,14 @@ impl Node {
             remove_unshared_blocks(&self.blockstore, &self.seed_index, &evicted);
             let _ = self.seed_events.send(());
         }
+        // Réveille `seed_loop` même si rien n'a été purgé (ex. désabonnement
+        // d'un émetteur sans publication indexée) : la place libérée par une
+        // purge peut suffire à faire rentrer une publication ailleurs
+        // sautée faute de quota, ET `seed_loop` vide `quota_blocked` sur
+        // cette branche (cf. son `tokio::select!`) — sans ce réveil, une
+        // publication mémorisée bloquée resterait sautée indéfiniment même
+        // après que le désabonnement a libéré son quota.
+        let _ = self.seed_wake.send(());
         Ok(())
     }
 
@@ -1532,12 +1548,28 @@ struct SeedLoopState {
 }
 
 /// Fait de la place pour `extra` octets supplémentaires sous le quota
-/// courant : si `total_bytes() + extra` dépasse déjà le quota, évince (ordre
-/// [`eviction_order`], réplication mesurée en DHT pour chaque candidat
-/// évictable) jusqu'à rentrer dans le quota. Renvoie `false` si, même après
-/// avoir épuisé tous les candidats évictables (non épinglés), ça ne rentre
-/// toujours pas — le publication en cours doit alors être sautée.
-async fn make_room_for(state: &SeedLoopState, extra: u64) -> bool {
+/// courant, au profit d'un candidat dont la réplication mesurée est
+/// `candidate_replication` : si `total_bytes() + extra` dépasse déjà le
+/// quota, évince (ordre [`eviction_order`], réplication mesurée en DHT pour
+/// chaque candidat évictable) jusqu'à rentrer dans le quota. Renvoie `false`
+/// si, même après avoir épuisé tous les candidats évictables (non épinglés),
+/// ça ne rentre toujours pas — la publication en cours doit alors être
+/// sautée.
+///
+/// **Dampening anti-oscillation** (retour de review) : une éviction n'a lieu
+/// que si la victime potentielle a une réplication STRICTEMENT supérieure à
+/// celle du candidat (`victime > candidat`, jamais `>=`). Sans ce garde-fou,
+/// deux publications à réplication ÉGALE et un quota qui n'en tient qu'une
+/// s'évincent mutuellement à chaque passe (P2 évince P1, la passe suivante
+/// visite les manifestes dans un ordre différent, P1 évince P2, etc. —
+/// re-téléchargement sans fin, `quota_blocked` ne s'engage jamais puisque
+/// chaque tentative individuelle "réussit" en évinçant l'autre). Avec le
+/// garde-fou : à réplication égale (ou si le candidat est LUI-MÊME mieux
+/// répliqué que la victime potentielle, donc moins légitime à la garder),
+/// aucune éviction n'a lieu — le candidat est sauté et mémorisé dans
+/// `quota_blocked` par l'appelant, ce qui fixe le résultat de la passe
+/// (premier arrivé, premier servi) jusqu'au prochain évènement catalogue/quota.
+async fn make_room_for(state: &SeedLoopState, extra: u64, candidate_replication: usize) -> bool {
     let quota = *state
         .seed_quota
         .lock()
@@ -1594,6 +1626,13 @@ async fn make_room_for(state: &SeedLoopState, extra: u64) -> bool {
         let Some(victim) = victim else {
             return false;
         };
+        let victim_replication = replication.get(&victim).copied().unwrap_or(0);
+        if victim_replication <= candidate_replication {
+            // La victime potentielle n'est pas MOINS légitime à rester
+            // seedée que le candidat (réplication égale ou même inférieure)
+            // — pas d'éviction. Voir le commentaire de dampening ci-dessus.
+            return false;
+        }
         evict_publication(state, &victim);
     }
 }
@@ -1631,9 +1670,18 @@ async fn seed_publication(
     issuer: PeerId,
     manifest_cid: Cid,
 ) -> CoreResult<()> {
-    if !make_room_for(state, 0).await {
-        // Même le manifeste ne rentre pas et rien n'est évictable : on ne
-        // tente même pas la récupération réseau.
+    // Réplication du candidat lui-même, mesurée UNE fois et réutilisée pour
+    // tout le reste de cette tentative (manifeste + chaque segment) — le
+    // dampening anti-oscillation de `make_room_for` compare la victime
+    // potentielle à CE candidat, pas à un segment particulier.
+    let candidate_replication = get_providers_inner(&state.cmd_tx, manifest_cid)
+        .await
+        .map(|peers| peers.len())
+        .unwrap_or(0);
+    if !make_room_for(state, 0, candidate_replication).await {
+        // Même le manifeste ne rentre pas et rien n'est évictable (ou rien
+        // d'assez répliqué pour justifier une éviction) : on ne tente même
+        // pas la récupération réseau.
         mark_quota_blocked(state, manifest_cid);
         return Ok(());
     }
@@ -1665,7 +1713,9 @@ async fn seed_publication(
                 return Err(CoreError::Cid(e));
             }
         };
-        if !state.blockstore.has(&cid) && !make_room_for(state, fetched_bytes).await {
+        if !state.blockstore.has(&cid)
+            && !make_room_for(state, fetched_bytes, candidate_replication).await
+        {
             // Plus de place et rien à évincer : publication sautée, on
             // nettoie ce qui a été récupéré pour elle jusqu'ici.
             remove_unindexed_fetch(state, &fetched_cids);
@@ -1746,10 +1796,20 @@ fn remove_unindexed_fetch(state: &SeedLoopState, fetched_cids: &[String]) {
 }
 
 /// Seed (au sens `seed_publication`) les publications non encore retenues du
-/// feed courant d'un émetteur, du plus récent au plus ancien (convention :
-/// une publication plus récente est ajoutée en fin de la liste d'un feed
-/// republié, donc « le plus récent d'abord » = itérer `cids` en sens
-/// inverse).
+/// feed courant d'un émetteur, en itérant `entry.cids` en ordre INVERSE.
+///
+/// **Pas de garantie temporelle** (correction post-review) : `entry.cids`
+/// vient de `feed.entries`, dans l'ordre où l'émetteur les a passées à
+/// `publish_feed`/`publish_feed_with` — rien dans `feed.rs`/`catalog.rs` ne
+/// contraint cet ordre à être chronologique. En pratique, le chemin
+/// « publier tout » de `champinium-cli` (`publish`/`republish`) construit ses
+/// CIDs depuis `Blockstore::list()`, qui énumère `std::fs::read_dir` SANS
+/// tri — un ordre de système de fichiers, sans rapport avec l'ordre
+/// d'ingestion. L'inversion ici est donc une heuristique (« si quelqu'un
+/// republie systématiquement en ajoutant en fin de liste, ça favorise le
+/// contenu récent ») et PAS une garantie « le plus récent d'abord ». Un vrai
+/// ordre de récence nécessiterait un horodatage porté par `FeedEntry` — hors
+/// périmètre de cette tâche, noté comme suite possible dans le rapport.
 async fn seed_channel(state: &SeedLoopState, issuer: PeerId) {
     let entry = {
         let cat = state

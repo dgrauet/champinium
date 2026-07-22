@@ -61,6 +61,26 @@ async fn publish_one_segment(creator: &Node, payload: &[u8]) -> (cid::Cid, cid::
     (manifest_cid, seg_cid)
 }
 
+/// Publie (localement, `add`) un manifeste HLS listant exactement
+/// `segment_cids` (déjà présents localement chez `creator`) — permet de
+/// construire deux manifestes partageant un segment.
+async fn publish_manifest_with_segments(creator: &Node, segment_cids: &[cid::Cid]) -> cid::Cid {
+    let manifest = HlsManifest::new(
+        1.0,
+        segment_cids
+            .iter()
+            .map(|c| HlsSegment {
+                cid: c.to_string(),
+                duration: 1.0,
+            })
+            .collect(),
+    );
+    creator
+        .add(manifest.to_json().unwrap().as_bytes())
+        .await
+        .unwrap()
+}
+
 /// Injecte, côté `subscriber`, le feed signé de `issuer_kp` listant `cids` —
 /// simule la réception d'un feed sans dépendre du gossip réel (déjà couvert
 /// par `feed_gossip.rs`/`subscriptions.rs`).
@@ -310,6 +330,109 @@ async fn own_ingested_content_is_pinned_and_never_evicted() {
     assert!(
         !node_b.blockstore().has(&third_seg),
         "la publication tierce ne doit pas être seedée faute de place évictable"
+    );
+}
+
+/// (f) — retour de review : sous pression de quota avec deux publications à
+/// réplication ÉGALE (aucune n'est fournie ailleurs — le cas qui thrashait
+/// avant le dampening de `make_room_for`), une passe doit atteindre un point
+/// fixe : le jeu seedé ne doit plus changer d'une fenêtre de plusieurs passes
+/// à l'autre (pas d'éviction mutuelle sans fin P2→P1→P2→…).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quota_pressure_reaches_a_fixpoint_without_oscillation() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let kp_a = Keypair::generate_ed25519();
+    let bs_a = Blockstore::open(dir.path().join("a")).unwrap();
+    let node_a = Node::with_moderation(kp_a.clone(), bs_a, Moderation::empty())
+        .await
+        .unwrap();
+    let (m1, s1) = publish_one_segment(&node_a, b"publication un, meme taille").await;
+    let (m2, _s2) = publish_one_segment(&node_a, b"publication deux, meme taille").await;
+    // Tailles quasi identiques (mêmes formes de payload) : le quota ne tient
+    // qu'UNE des deux publications complètes.
+    let one_publication_size =
+        node_a.blockstore().size_of(&m1).unwrap() + node_a.blockstore().size_of(&s1).unwrap();
+
+    let node_b = node_with_quota(dir.path(), "b", one_publication_size).await;
+    connect(&node_a, &node_b).await;
+    node_b.subscribe(node_a.peer_id()).unwrap();
+    inject_feed(&node_b, &kp_a, 1, &[m1, m2]);
+
+    // Laisse plusieurs passes tourner (FAST = 100 ms) sans qu'aucun évènement
+    // catalogue/quota supplémentaire n'intervienne, puis échantillonne l'état
+    // seedé deux fois, séparées par plusieurs passes de plus.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let first_window = (node_b.blockstore().has(&m1), node_b.blockstore().has(&m2));
+    assert_ne!(
+        first_window.0, first_window.1,
+        "exactement une des deux publications doit être seedée sous ce quota, obtenu {first_window:?}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let second_window = (node_b.blockstore().has(&m1), node_b.blockstore().has(&m2));
+    assert_eq!(
+        first_window, second_window,
+        "le jeu seedé ne doit plus changer d'une fenêtre à l'autre (oscillation détectée)"
+    );
+
+    let (used, quota) = node_b.storage_stats();
+    assert!(used <= quota, "le quota ne doit jamais être dépassé");
+}
+
+/// (g) — retour de review : deux publications d'un même émetteur PARTAGENT un
+/// segment (même CID). L'une est épinglée, l'autre non. Au désabonnement, le
+/// segment partagé doit survivre — il est toujours référencé par la
+/// publication épinglée restante (`all_cids` de l'index restant), même si la
+/// publication non épinglée qui le référençait aussi est purgée.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsubscribe_keeps_segment_shared_with_a_pinned_publication() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let kp_a = Keypair::generate_ed25519();
+    let bs_a = Blockstore::open(dir.path().join("a")).unwrap();
+    let node_a = Node::with_moderation(kp_a.clone(), bs_a, Moderation::empty())
+        .await
+        .unwrap();
+    let shared_seg = node_a
+        .add(b"segment partage entre deux publications")
+        .await
+        .unwrap();
+    let only_seg = node_a
+        .add(b"segment propre a la publication non epinglee")
+        .await
+        .unwrap();
+    let pinned_manifest = publish_manifest_with_segments(&node_a, &[shared_seg]).await;
+    let other_manifest = publish_manifest_with_segments(&node_a, &[shared_seg, only_seg]).await;
+
+    let node_b = node(dir.path(), "b").await;
+    connect(&node_a, &node_b).await;
+    node_b.subscribe(node_a.peer_id()).unwrap();
+    inject_feed(&node_b, &kp_a, 1, &[pinned_manifest, other_manifest]);
+
+    tokio::time::timeout(CONVERGE, async {
+        loop {
+            let (seeded, total) = node_b.seed_status(node_a.peer_id());
+            if seeded == total && total == 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    })
+    .await
+    .expect("les deux publications doivent être seedées avant le désabonnement");
+    assert!(node_b.blockstore().has(&shared_seg));
+
+    node_b.pin(pinned_manifest).unwrap();
+    node_b.unsubscribe(node_a.peer_id()).unwrap();
+
+    assert!(
+        node_b.blockstore().has(&pinned_manifest) && node_b.blockstore().has(&shared_seg),
+        "la publication épinglée ET le segment qu'elle référence doivent survivre"
+    );
+    assert!(
+        !node_b.blockstore().has(&other_manifest) && !node_b.blockstore().has(&only_seg),
+        "la publication non épinglée et son segment propre doivent être purgés"
     );
 }
 
