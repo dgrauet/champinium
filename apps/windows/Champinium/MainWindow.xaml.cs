@@ -12,7 +12,12 @@ namespace Champinium;
 
 public sealed partial class MainWindow : Window
 {
-    /// <summary>Modèle de vue lié au XAML (x:Bind).</summary>
+    /// <summary>Modèle de vue — posé comme DataContext de la Grid racine (voir
+    /// constructeur) ; tous les `{Binding …}` de MainWindow.xaml résolvent
+    /// dessus (Binding classique partout, pas de x:Bind — voir MainWindow.xaml
+    /// pour la raison : un x:Bind dans un DataTemplate en ressource nommée,
+    /// partagée par plusieurs ListView à l'intérieur d'un Pivot, générait un
+    /// connecteur ancré sur la Window plutôt que sur l'item).</summary>
     public NodeViewModel Model { get; } = new();
 
     /// <summary>Index de l'onglet Explorer dans <c>CatalogPivot</c>.</summary>
@@ -25,6 +30,10 @@ public sealed partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+
+        // Root.DataContext = Model : source de résolution de tous les
+        // `{Binding …}` du XAML (Binding classique intégral, voir plus haut).
+        Root.DataContext = Model;
 
         // Quand un média est prêt, branche son playlist HLS sur le lecteur.
         Model.PlaybackReady += OnPlaybackReady;

@@ -10,7 +10,17 @@
      alors que SelectorBar n'a été ajouté qu'à partir de WindowsAppSDK 1.4 —
      choix conservateur vu la version de PackageReference du csproj (2.3.1,
      non alignée sur le schéma de versions WinAppSDK habituel — à vérifier en
-     CI, voir rapport de tâche). -->
+     CI, voir rapport de tâche).
+
+     Binding classique PARTOUT dans ce fichier (zéro x:Bind) — un DataTemplate
+     x:Bind en ressource nommée partagée par plusieurs ListView générait un
+     connecteur ancré sur la Window (CS1503, plusieurs itérations en CI) ; par
+     prudence, plus aucun x:Bind n'est utilisé, y compris au niveau Window, une
+     fois que la structure du fichier inclut un Pivot (ItemsControl). Le
+     DataContext de la Grid racine est posé sur `Model` en code-behind
+     (MainWindow.xaml.cs, après InitializeComponent) — tous les
+     `{Binding …}` de ce fichier résolvent dessus, sauf ceux des DataTemplate
+     dont le DataContext est l'item (ChannelGroup/CatalogCid). -->
 <Window
     x:Class="Champinium.MainWindow"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -24,7 +34,7 @@
     <!-- Window n'a pas de propriété XAML `Resources` en WinUI 3 (WMC0011) —
          les ressources partagées vivent dans Grid.Resources de la racine ;
          toutes leurs utilisations sont à l'intérieur de cette grille. -->
-    <Grid Padding="16" RowSpacing="12">
+    <Grid x:Name="Root" Padding="16" RowSpacing="12">
         <Grid.Resources>
             <local:EmptyStringToVisibilityConverter x:Key="EmptyStringToVisibility" />
             <local:NonEmptyStringToVisibilityConverter x:Key="NonEmptyStringToVisibility" />
@@ -99,11 +109,11 @@
         <!-- En-tête : titre, statut, PeerId -->
         <StackPanel Grid.Row="0" Spacing="2">
             <TextBlock Text="Champinium" Style="{StaticResource TitleTextBlockStyle}" />
-            <TextBlock Text="{x:Bind Model.Status, Mode=OneWay}"
+            <TextBlock Text="{Binding Status, Mode=OneWay}"
                        Style="{StaticResource CaptionTextBlockStyle}"
                        Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
             <!-- PeerId du nœud (vide tant que le nœud n'est pas ouvert). -->
-            <TextBlock Text="{x:Bind Model.PeerId, Mode=OneWay}"
+            <TextBlock Text="{Binding PeerId, Mode=OneWay}"
                        Style="{StaticResource CaptionTextBlockStyle}"
                        Foreground="{ThemeResource TextFillColorTertiaryBrush}"
                        TextWrapping="NoWrap" />
@@ -118,7 +128,7 @@
             </Grid.ColumnDefinitions>
             <TextBox Grid.Column="0"
                      PlaceholderText="/ip4/…/tcp/…/p2p/&lt;peerid&gt;"
-                     Text="{x:Bind Model.PeerField, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                     Text="{Binding PeerField, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
             <Button Grid.Column="1" Content="Connecter" Click="OnConnectClick" />
             <Button Grid.Column="2" Content="Rafraîchir" Click="OnRefreshClick" />
         </Grid>
@@ -126,7 +136,7 @@
         <!-- Recherche locale : titres et tags du catalogue reconstruit -->
         <TextBox Grid.Row="2"
                  PlaceholderText="Rechercher (titre ou tag)…"
-                 Text="{x:Bind Model.SearchQuery, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                 Text="{Binding SearchQuery, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
 
         <Border Grid.Row="3" Height="1"
                 Background="{ThemeResource DividerStrokeColorDefaultBrush}" />
@@ -134,27 +144,27 @@
         <!-- Résultats de recherche : remplacent les onglets tant que la requête
              n'est pas vide (les deux catalogues restent inchangés en dessous). -->
         <ListView Grid.Row="4"
-                  Visibility="{x:Bind Model.SearchQuery, Mode=OneWay, Converter={StaticResource NonEmptyStringToVisibility}}"
-                  ItemsSource="{x:Bind Model.SearchResults, Mode=OneWay}"
+                  Visibility="{Binding SearchQuery, Mode=OneWay, Converter={StaticResource NonEmptyStringToVisibility}}"
+                  ItemsSource="{Binding SearchResults, Mode=OneWay}"
                   SelectionMode="None">
             <ListView.ItemTemplate>
-                <DataTemplate x:DataType="local:CatalogCid">
+                <DataTemplate>
                     <Grid ColumnSpacing="8" Padding="0,4">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*" />
                             <ColumnDefinition Width="Auto" />
                         </Grid.ColumnDefinitions>
                         <StackPanel Grid.Column="0">
-                            <TextBlock Text="{x:Bind Display}"
+                            <TextBlock Text="{Binding Display}"
                                        TextTrimming="CharacterEllipsis"
                                        TextWrapping="NoWrap" />
-                            <TextBlock Text="{x:Bind TagsText}"
+                            <TextBlock Text="{Binding TagsText}"
                                        Style="{StaticResource CaptionTextBlockStyle}"
                                        Foreground="{ThemeResource TextFillColorTertiaryBrush}"
                                        TextWrapping="NoWrap" />
                         </StackPanel>
                         <Button Grid.Column="1" Content="Lire"
-                                Tag="{x:Bind Cid}" Click="OnPlayClick" />
+                                Tag="{Binding Cid}" Click="OnPlayClick" />
                     </Grid>
                 </DataTemplate>
             </ListView.ItemTemplate>
@@ -162,11 +172,11 @@
 
         <!-- Onglets Abonnements (défaut) / Explorer, visibles hors recherche. -->
         <Pivot Grid.Row="4" x:Name="CatalogPivot"
-               Visibility="{x:Bind Model.SearchQuery, Mode=OneWay, Converter={StaticResource EmptyStringToVisibility}}"
+               Visibility="{Binding SearchQuery, Mode=OneWay, Converter={StaticResource EmptyStringToVisibility}}"
                SelectedIndex="0"
                SelectionChanged="OnPivotSelectionChanged">
             <PivotItem Header="Abonnements">
-                <ListView ItemsSource="{x:Bind Model.SubscribedGroups, Mode=OneWay}"
+                <ListView ItemsSource="{Binding SubscribedGroups, Mode=OneWay}"
                           ItemTemplate="{StaticResource ChannelGroupTemplate}"
                           SelectionMode="None" />
             </PivotItem>
@@ -183,15 +193,15 @@
                             </Grid.ColumnDefinitions>
                             <TextBox Grid.Column="0"
                                      PlaceholderText="Coller un lien de channel…"
-                                     Text="{x:Bind Model.ChannelLinkField, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                     Text="{Binding ChannelLinkField, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
                             <Button Grid.Column="1" Content="S'abonner" Click="OnSubscribeByLinkClick" />
                         </Grid>
                         <Button Content="Copier le lien de mon channel" Click="OnCopyMyLinkClick" />
-                        <TextBlock Text="{x:Bind Model.SubscriptionStatus, Mode=OneWay}"
+                        <TextBlock Text="{Binding SubscriptionStatus, Mode=OneWay}"
                                    Style="{StaticResource CaptionTextBlockStyle}"
                                    Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                     </StackPanel>
-                    <ListView ItemsSource="{x:Bind Model.ExploreGroups, Mode=OneWay}"
+                    <ListView ItemsSource="{Binding ExploreGroups, Mode=OneWay}"
                               ItemTemplate="{StaticResource ChannelGroupTemplate}"
                               SelectionMode="None" />
                 </StackPanel>
