@@ -217,6 +217,12 @@ sur deux machines physiques.
 - **Réplication mesurée ✔** : `Node::replication_factor(cid)` (fournisseurs
   DHT), CLI `replication <cid> --peer …`. Testé : 1 → 2 après
   seed-what-you-consume.
+- **Channels lot (a) ✔** : feed `champinium-feed/v3` (identité de channel
+  signée : nom/description/avatar, formats v1/v2 supprimés — zéro
+  utilisateur), profil persisté (`.channel_profile`) avec republication au
+  changement, contrat FFI **v5** (`FfiChannelProfile`,
+  `set_channel_profile`/`channel_profile`, `FfiCatalogEntry.channel`). Spec :
+  `~/Work/.superpowers/champinium/specs/2026-07-22-channels-subscriptions-design.md`.
 - **Restent** (issues) : recherche décentralisée (#20 — exige un feed v2 avec
   métadonnées titre/tags + contrat FFI v4), IPNS durable (#21), réplication
   opportuniste au-delà du reseed à la consommation.
@@ -233,4 +239,4 @@ pas de version en dur ici, elle dérive (règle intendant DG006). Release-please
 gère le versionnement (`bump-minor-pre-major` actif :
 un breaking change bumpe la mineure tant qu'on est < 1.0.0 — la 1.0 sera un
 choix délibéré de stabilisation d'API). Versionnement du contrat FFI distinct :
-`CONTRACT_VERSION = 3` (voir `AGENTS.md`).
+`CONTRACT_VERSION = 5` (voir `AGENTS.md`).
