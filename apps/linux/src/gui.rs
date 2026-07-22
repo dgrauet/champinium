@@ -152,7 +152,11 @@ fn build_ui(app: &Application) {
     {
         let ui = ui.clone();
         let window = window.clone();
-        stack.connect_notify_local(Some("visible-child-name"), move |stack, _| {
+        // Méthode générée par gtk4 directement sur `Stack` (pas de trait
+        // générique `ObjectExt`) : évite l'ambiguïté d'inférence entre le
+        // `ObjectExt` de glib réexporté par gtk4 et celui réexporté par
+        // gstreamer, tous deux en portée dans ce fichier.
+        stack.connect_visible_child_name_notify(move |stack| {
             if stack.visible_child_name().as_deref() == Some("explorer")
                 && !ui.explorer_warned.get()
             {
