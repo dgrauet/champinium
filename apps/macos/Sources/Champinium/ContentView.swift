@@ -134,8 +134,8 @@ struct ContentView: View {
         tab == .subscriptions ? model.subscribedEntries : model.entries
     }
 
-    /// En-tête de section : nom du channel (ou PeerId tronqué), seq, et — en
-    /// Explorer uniquement — le bouton S'abonner/Se désabonner.
+    /// En-tête de section : nom du channel (ou PeerId tronqué), seq, et bouton
+    /// S'abonner/Se désabonner selon le contexte (Explorer/Abonnements).
     private func channelHeader(for entry: FfiCatalogEntry) -> some View {
         HStack {
             VStack(alignment: .leading, spacing: 1) {
@@ -143,9 +143,7 @@ struct ContentView: View {
                 Text("seq \(entry.seq)").font(.caption2).foregroundStyle(.tertiary)
             }
             Spacer()
-            if tab == .explorer {
-                subscribeButton(for: entry)
-            }
+            subscribeButton(for: entry)
         }
     }
 
@@ -160,8 +158,20 @@ struct ContentView: View {
 
     private func subscribeButton(for entry: FfiCatalogEntry) -> some View {
         let subscribed = model.subscriptions.contains(entry.issuer)
-        return Button(subscribed ? "Se désabonner" : "S'abonner") {
-            Task { await toggleSubscription(peerId: entry.issuer, subscribed: subscribed) }
+        let isAbonnements = tab == .subscriptions
+
+        // In Abonnements, button is always unsubscribe (all entries are subscribed by definition).
+        // In Explorer, button toggles based on subscription status.
+        let isCurrentlySubscribed = isAbonnements ? true : subscribed
+        let label = isCurrentlySubscribed ? "Se désabonner" : "S'abonner"
+
+        return Button(label) {
+            Task {
+                await toggleSubscription(
+                    peerId: entry.issuer,
+                    subscribed: isCurrentlySubscribed
+                )
+            }
         }
         .font(.caption)
         .buttonStyle(.bordered)
@@ -226,6 +236,8 @@ struct ContentView: View {
         switch ffiError {
         case .InvalidInput:
             return "saisie invalide"
+        case .Moderated:
+            return "contenu bloqué par la modération"
         default:
             return "erreur réseau"
         }
