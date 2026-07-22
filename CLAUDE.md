@@ -231,7 +231,7 @@ feeds/gossipsub/catalogue ✔, ingestion ffmpeg ✔)** → **3 (contrat UniFFI v
 UI macOS compile ✔, critère MVP déroulé ✔)** → **4 (close : 3 fronts ✔, relay
 NAT ✔, seeding ✔, feed DHT ✔, fetch concurrent ✔, déploiement tiers documenté ✔ ;
 bitswap différé)** → 5 (en cours : peer scoring ✔, signalement P2P ✔, réplication
-mesurée ✔ ; recherche #20, IPNS #21). Voir le spec.
+mesurée ✔, recherche ✔ (#20) ; IPNS #21). Voir le spec.
 
 **Dernière release : voir `.release-please-manifest.json` / CHANGELOG** —
 pas de version en dur ici, elle dérive (règle intendant DG006). Release-please
