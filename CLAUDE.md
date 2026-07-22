@@ -225,7 +225,8 @@ sur deux machines physiques.
   `~/Work/.superpowers/champinium/specs/2026-07-22-channels-subscriptions-design.md`.
 - **Channels lot (b) ✔** : abonnements à un émetteur, **locaux et privés —
   jamais publiés** (store `.subscriptions` à côté des blocs, à côté de
-  `.channel_profile`). Suivi actif de chaque channel souscrit : fetch
+  `.channel_profile` ; nuance : le suivi actif reste observable sur le réseau,
+  voir `docs/architecture.md` §6). Suivi actif de chaque channel souscrit : fetch
   immédiat à l'abonnement, passe **périodique** en tâche de fond
   (`FOLLOW_INTERVAL`), rattrapage au **démarrage** du nœud (les abonnements
   persistés sont rechargés avant le premier tour de boucle). Un émetteur

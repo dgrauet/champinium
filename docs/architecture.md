@@ -199,6 +199,14 @@ retire seulement le suivi et la vue — au lot (b), il n'y a pas encore de stock
 proactif à purger (voir §11, lot channels (c) : seed proactif + éviction +
 retrait de seed-what-you-consume).
 
+Nuance à connaître : la **liste** d'abonnements elle-même n'est jamais
+publiée, mais le suivi actif émet un `fetch_feed` — donc un GET DHT — vers
+`/champinium/feed/<peerid>` à chaque passe périodique. L'intérêt d'un nœud
+pour un channel donné est donc **observable** par les pairs Kademlia situés
+sur le chemin de cette requête. C'est inhérent au suivi actif voulu par la
+spec (§2), pas un défaut d'implémentation — mais ça mérite d'être dit
+explicitement plutôt que de laisser croire à une confidentialité totale.
+
 ### Lecture + seed-what-you-consume
 
 ```
