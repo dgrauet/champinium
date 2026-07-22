@@ -36,7 +36,7 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
@@ -58,6 +58,9 @@ const MAX_FEED_SIZE: usize = 4 * 1024 * 1024;
 const MAX_PROVIDED_KEYS: usize = 1_000_000;
 /// Nombre max de records DHT stockés localement (feeds d'autres créateurs).
 const MAX_DHT_RECORDS: usize = 100_000;
+/// Intervalle du suivi actif périodique des channels souscrits (spec channels
+/// §2). Surchargeable en test via [`Node::set_follow_interval_for_tests`].
+const FOLLOW_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Demande d'un bloc par CID (octets du CID).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +220,16 @@ pub struct Node {
     /// Abonnements locaux (channels suivis) — état **privé** du nœud, jamais
     /// publié sur le réseau (spec channels §2).
     subscriptions: Arc<Mutex<BTreeSet<PeerId>>>,
+    /// Intervalle du suivi actif périodique, partagé avec la tâche de fond
+    /// pour permettre la surcharge en test.
+    follow_interval: Arc<Mutex<Duration>>,
+    /// Marqueur de vivacité : la tâche de suivi périodique n'en tient qu'un
+    /// [`Weak`], ce qui lui permet de s'arrêter dès que toutes les poignées
+    /// `Node` (qui clonent ce `Arc`) sont tombées, sans jamais retenir un
+    /// `Node` fort qui empêcherait la boucle d'évènements de s'arrêter. Jamais
+    /// lu directement : seul son compteur de références (via `Clone`) importe.
+    #[allow(dead_code)]
+    alive: Arc<()>,
     cmd_tx: mpsc::Sender<Command>,
 }
 
@@ -301,6 +314,24 @@ impl Node {
         // channels §1) : un profil corrompu ne doit pas empêcher le démarrage.
         let channel_profile = Arc::new(Mutex::new(load_channel_profile(&blockstore)));
 
+        let follow_interval = Arc::new(Mutex::new(FOLLOW_INTERVAL));
+        let alive = Arc::new(());
+
+        // Suivi actif périodique des channels souscrits (spec channels §2) : ne
+        // tient qu'un `Weak<()>` — dès que la dernière poignée `Node` tombe,
+        // `alive_weak.upgrade()` échoue et la boucle s'arrête, libérant son
+        // clone de `cmd_tx` (sinon la boucle d'évènements ne s'arrêterait
+        // jamais : `cmd_rx.recv()` ne renvoie `None` que quand tous les
+        // émetteurs sont tombés).
+        tokio::spawn(follow_loop(
+            Arc::downgrade(&alive),
+            cmd_tx.clone(),
+            catalog.clone(),
+            catalog_events.clone(),
+            subscriptions.clone(),
+            follow_interval.clone(),
+        ));
+
         Ok(Self {
             peer_id,
             keypair,
@@ -312,6 +343,8 @@ impl Node {
             feed_seq,
             channel_profile,
             subscriptions,
+            follow_interval,
+            alive,
             cmd_tx,
         })
     }
@@ -551,38 +584,14 @@ impl Node {
     /// Vérifie la signature et l'émetteur, retient le `seq` le plus élevé, et
     /// l'applique au catalogue local. Renvoie `None` si aucun feed valide trouvé.
     pub async fn fetch_feed(&self, issuer: PeerId) -> CoreResult<Option<Feed>> {
-        let (tx, rx) = oneshot::channel();
-        self.send(Command::GetRecord {
-            key: feed_record_key(&issuer),
-            tx,
-        })
-        .await?;
-        let values = rx.await.map_err(|_| CoreError::Shutdown)?;
-
-        let mut best: Option<Feed> = None;
-        for value in values {
-            let Ok(feed) = Feed::from_json(&value) else {
-                continue;
-            };
-            if feed.verify().is_err() || feed.issuer_peer_id().ok() != Some(issuer) {
-                continue;
-            }
-            if best.as_ref().is_none_or(|b| feed.seq > b.seq) {
-                best = Some(feed);
-            }
-        }
-        if let Some(feed) = &best {
-            let subs = self.subscriptions_snapshot();
-            let changed = self
-                .catalog
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .apply(feed.clone(), &subs);
-            if changed.unwrap_or(false) {
-                let _ = self.catalog_events.send(());
-            }
-        }
-        Ok(best)
+        fetch_feed_inner(
+            &self.cmd_tx,
+            &self.catalog,
+            &self.catalog_events,
+            &self.subscriptions,
+            issuer,
+        )
+        .await
     }
 
     /// Ingestion : segmente `input` en HLS via ffmpeg, stocke chaque segment
@@ -656,15 +665,31 @@ impl Node {
     }
 
     /// S'abonne à un émetteur (channel) : persiste immédiatement (état privé,
-    /// spec channels §2 — jamais publié sur le réseau). Pas encore de fetch
-    /// actif (tâche 2).
+    /// spec channels §2 — jamais publié sur le réseau), puis déclenche un
+    /// `fetch_feed` **best-effort** en tâche de fond (ne bloque pas le retour ;
+    /// la boucle de suivi périodique prendra le relais si ce coup d'essai
+    /// échoue).
     pub fn subscribe(&self, issuer: PeerId) -> CoreResult<()> {
-        let mut subs = self
-            .subscriptions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        subs.insert(issuer);
-        save_subscriptions(&self.blockstore, &subs)
+        {
+            let mut subs = self
+                .subscriptions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            subs.insert(issuer);
+            save_subscriptions(&self.blockstore, &subs)?;
+        }
+        let cmd_tx = self.cmd_tx.clone();
+        let catalog = self.catalog.clone();
+        let catalog_events = self.catalog_events.clone();
+        let subscriptions = self.subscriptions.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                fetch_feed_inner(&cmd_tx, &catalog, &catalog_events, &subscriptions, issuer).await
+            {
+                tracing::debug!("fetch immédiat à l'abonnement échoué pour {issuer}: {e}");
+            }
+        });
+        Ok(())
     }
 
     /// Se désabonne d'un émetteur : persiste immédiatement. Le feed déjà
@@ -696,6 +721,17 @@ impl Node {
             .into_iter()
             .filter(|e| subs.contains(&e.issuer))
             .collect()
+    }
+
+    /// Surcharge l'intervalle du suivi actif périodique (tests uniquement :
+    /// la constante de production [`FOLLOW_INTERVAL`] est de 5 minutes, bien
+    /// trop longue pour un test).
+    #[doc(hidden)]
+    pub fn set_follow_interval_for_tests(&self, interval: Duration) {
+        *self
+            .follow_interval
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = interval;
     }
 
     /// Injecte un feed tiers directement dans le catalogue local, hors réseau
@@ -1035,6 +1071,102 @@ fn save_subscriptions(blockstore: &Blockstore, subs: &BTreeSet<PeerId>) -> CoreR
         .map_err(|e| CoreError::Network(format!("json abonnements: {e}")))?;
     std::fs::write(subscriptions_path(blockstore), json)?;
     Ok(())
+}
+
+/// Cœur de `Node::fetch_feed`, factorisé pour être réutilisable par la boucle
+/// de suivi périodique (qui ne détient qu'un clone des champs nécessaires, pas
+/// un `Node` entier — voir `follow_loop`). Récupère le feed d'un créateur
+/// depuis la DHT, vérifie signature + émetteur, retient le `seq` le plus
+/// élevé, l'applique au catalogue (avec exemption de borne s'il est souscrit).
+async fn fetch_feed_inner(
+    cmd_tx: &mpsc::Sender<Command>,
+    catalog: &Arc<Mutex<Catalog>>,
+    catalog_events: &tokio::sync::broadcast::Sender<()>,
+    subscriptions: &Arc<Mutex<BTreeSet<PeerId>>>,
+    issuer: PeerId,
+) -> CoreResult<Option<Feed>> {
+    let (tx, rx) = oneshot::channel();
+    cmd_tx
+        .send(Command::GetRecord {
+            key: feed_record_key(&issuer),
+            tx,
+        })
+        .await
+        .map_err(|_| CoreError::Shutdown)?;
+    let values = rx.await.map_err(|_| CoreError::Shutdown)?;
+
+    let mut best: Option<Feed> = None;
+    for value in values {
+        let Ok(feed) = Feed::from_json(&value) else {
+            continue;
+        };
+        if feed.verify().is_err() || feed.issuer_peer_id().ok() != Some(issuer) {
+            continue;
+        }
+        if best.as_ref().is_none_or(|b| feed.seq > b.seq) {
+            best = Some(feed);
+        }
+    }
+    if let Some(feed) = &best {
+        let subs: HashSet<PeerId> = subscriptions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .copied()
+            .collect();
+        let changed = catalog
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .apply(feed.clone(), &subs);
+        if changed.unwrap_or(false) {
+            let _ = catalog_events.send(());
+        }
+    }
+    Ok(best)
+}
+
+/// Boucle de suivi actif des channels souscrits (spec channels §2) : à chaque
+/// itération, tente un `fetch_feed` pour chaque abonné courant (best-effort,
+/// un échec individuel n'interrompt pas la passe), puis dort `follow_interval`
+/// avant de recommencer. La toute première itération a lieu **avant** la
+/// première attente : elle couvre les abonnements persistés au démarrage
+/// (spec : un abonné retrouve ce qui a été publié pendant qu'il était hors
+/// ligne).
+///
+/// Ne détient qu'un [`Weak`] marqueur de vivacité : dès que toutes les
+/// poignées `Node` sont tombées (donc `alive.upgrade()` échoue), la boucle
+/// s'arrête et relâche son clone de `cmd_tx` — sinon la boucle d'évènements ne
+/// s'arrêterait jamais (`cmd_rx.recv()` attend que tous les émetteurs tombent).
+async fn follow_loop(
+    alive: Weak<()>,
+    cmd_tx: mpsc::Sender<Command>,
+    catalog: Arc<Mutex<Catalog>>,
+    catalog_events: tokio::sync::broadcast::Sender<()>,
+    subscriptions: Arc<Mutex<BTreeSet<PeerId>>>,
+    follow_interval: Arc<Mutex<Duration>>,
+) {
+    loop {
+        if alive.upgrade().is_none() {
+            return;
+        }
+        let issuers: Vec<PeerId> = subscriptions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .copied()
+            .collect();
+        for issuer in issuers {
+            if let Err(e) =
+                fetch_feed_inner(&cmd_tx, &catalog, &catalog_events, &subscriptions, issuer).await
+            {
+                tracing::debug!("suivi périodique de {issuer} échoué: {e}");
+            }
+        }
+        let wait = *follow_interval
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tokio::time::sleep(wait).await;
+    }
 }
 
 /// Préfixe des clés DHT de feeds.
