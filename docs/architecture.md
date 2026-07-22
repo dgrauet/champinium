@@ -2,7 +2,7 @@
 
 > Public : quiconque veut comprendre comment le projet fonctionne de bout en
 > bout. Les renvois pointent vers le code (chemins cliquables) et les ADRs
-> (`docs/adr/`) pour les décisions. État au contrat FFI **v4** / release
+> (`docs/adr/`) pour les décisions. État au contrat FFI **v5** / release
 > **v0.6.x**.
 
 ## 1. Ce que c'est, en une phrase
@@ -56,7 +56,7 @@ un front est un bug). Carte des modules :
 | [`content`](../crates/champinium-core/src/content.rs) | CIDv1 (raw/sha2-256, compatible IPFS), vérification octets↔CID, `push_field` (encodage signé anti-malléabilité, §5) |
 | [`blockstore`](../crates/champinium-core/src/blockstore.rs) | stockage content-addressed sur disque : un fichier par CID, **écriture atomique** (tempfile+persist), intégrité vérifiée à la lecture, `remove` pour la purge de modération |
 | [`identity`](../crates/champinium-core/src/identity.rs) | paire Ed25519 persistée (`node.key`, mode 0600) → PeerId |
-| [`feed`](../crates/champinium-core/src/feed.rs) | feed signé d'un créateur, versionné par `seq` (LWW) ; **v2** = métadonnées titre/tags signées |
+| [`feed`](../crates/champinium-core/src/feed.rs) | feed signé d'un créateur, versionné par `seq` (LWW) ; **v3** = métadonnées titre/tags par entrée + identité de channel (nom/description/avatar) signées, v1/v2 supprimés |
 | [`catalog`](../crates/champinium-core/src/catalog.rs) | CRDT maison : map last-writer-wins par émetteur, bornée (1024 émetteurs) ; recherche locale |
 | [`moderation`](../crates/champinium-core/src/moderation.rs) | denylist compilée (non désactivable) + denylists signées souscrites (fédéré) |
 | [`report`](../crates/champinium-core/src/report.rs) | signalement P2P : rapport signé + agrégateur borné de rapporteurs distincts |
@@ -124,12 +124,22 @@ déplacer du contenu d'un champ à l'autre à signature constante
   avant usage. Un « contenu » vidéo = 1 manifeste + N segments, chacun un bloc.
 - **Manifeste HLS** (`champinium-hls/v1`, JSON) : ordre + durée des segments →
   leurs CIDs. `fetch_hls` le retransforme en `index.m3u8` jouable localement.
-- **Feed** (`champinium-feed/v2`, JSON signé) : LA publication d'un créateur.
-  `{schema, issuer_pubkey, seq, entries[{cid, title, tags}], signature}`.
-  Versionné par `seq` **monotone et persisté** (`.feed_seq` à côté des blocs :
-  un créateur qui redémarre ne régresse pas, sinon le LWW des pairs
-  l'ignorerait). Bornes vérifiées à la réception (titre ≤ 256, ≤ 16 tags).
-  v1 (CIDs nus) reste lisible.
+- **Feed** (`champinium-feed/v3`, JSON signé) : LA publication d'un créateur.
+  `{schema, issuer_pubkey, seq, channel{name, description, avatar_cid},
+  entries[{cid, title, tags}], signature}`. Versionné par `seq` **monotone et
+  persisté** (`.feed_seq` à côté des blocs : un créateur qui redémarre ne
+  régresse pas, sinon le LWW des pairs l'ignorerait). Bornes vérifiées à la
+  réception (titre ≤ 256, ≤ 16 tags). Le bloc `channel` porte l'identité
+  éditoriale du créateur, signée avec le reste du feed (pas de canal séparé
+  ni de confiance implicite) : nom ≤ 64, description ≤ 1024. `avatar_cid` est
+  optionnel et, s'il est présent, doit être un CID valide — **c'est un CID
+  comme un autre** : il traverse les mêmes checkpoints de modération que
+  n'importe quel contenu (pas de contournement pour les avatars). Le profil
+  courant est persisté par le créateur (`.channel_profile`, à côté du feed) et
+  republié (nouveau `seq`) à chaque changement. Les formats **v1 et v2 ont été
+  supprimés** (zéro utilisateur en usage réel au moment du retrait) : un feed
+  v1/v2 reçu est rejeté au parsing plutôt que toléré en compatibilité
+  descendante.
 - **Denylist** (`champinium-denylist/v1`, JSON signé) : liste de CIDs bloqués,
   signée par son éditeur. Voir [`deny/README.md`](../deny/README.md).
 - **Rapport** (`champinium-report/v1`, JSON signé) : « ce CID a été refusé par
@@ -141,7 +151,7 @@ déplacer du contenu d'un champ à l'autre à signature constante
 
 ```
 fichier → [modération #1] → ffmpeg (segments HLS) → blocs CID + manifeste
-       → feed v2 signé { seq+1, entries }
+       → feed v3 signé { seq+1, channel, entries }
             ├─► catalogue local (+ tic catalog_events)
             ├─► gossipsub feeds/v1                     (live, secondes)
             ├─► DHT PUT /champinium/feed/<peerid>      (découverte hors gossip)
@@ -215,7 +225,7 @@ Autour, deux mécanismes d'écosystème :
   catalogue borné à 1024 émetteurs (refus-quand-plein, pas d'éviction), c'est
   la défense contre l'inondation par clés jetables.
 
-## 8. La frontière FFI : le contrat v4
+## 8. La frontière FFI : le contrat v5
 
 La surface UniFFI de [`ffi.rs`](../crates/champinium-core/src/ffi.rs) est
 **le contrat** entre le noyau et les fronts (tableau exhaustif et protocole de
@@ -235,7 +245,7 @@ changement dans [`AGENTS.md`](../AGENTS.md)). Ce qui la caractérise :
 - **Bindings générés au build, jamais commités** : Swift via
   UniFFI/XCFramework (`just macos-prepare`), C# via `uniffi-bindgen-cs`
   (`just gen-csharp`). Le front Linux consomme le crate **directement** (pas
-  de FFI). `CONTRACT_VERSION` (=4) permet aux fronts de détecter une
+  de FFI). `CONTRACT_VERSION` (=5) permet aux fronts de détecter une
   incompatibilité au démarrage.
 
 Les trois fronts ([`apps/macos`](../apps/macos),
@@ -289,7 +299,7 @@ qui compte vit dans le réseau, chaque nœud n'en garde qu'une vue.
 ## 12. Carte des documents
 
 - [`CLAUDE.md`](../CLAUDE.md) — principes + état d'avancement (source de vérité).
-- [`AGENTS.md`](../AGENTS.md) — contrat FFI (tableau v4) + garde-fous d'équipe.
+- [`AGENTS.md`](../AGENTS.md) — contrat FFI (tableau v5) + garde-fous d'équipe.
 - [`docs/adr/`](adr/) — décisions : libp2p vs iroh (0001), modération côté
   nœud (0002), feeds signés (0003), transport de blocs (0006), IPNS (0007)…
 - [`docs/mvp-demo.md`](mvp-demo.md) / [`docs/gui-demo.md`](gui-demo.md) —
