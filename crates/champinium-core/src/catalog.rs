@@ -12,7 +12,7 @@ use cid::Cid;
 use libp2p::PeerId;
 use std::collections::{HashMap, HashSet};
 
-/// Un contenu du catalogue avec ses métadonnées (feed v2 ; vides pour un v1).
+/// Un contenu du catalogue avec ses métadonnées signées (titre, tags).
 #[derive(Debug, Clone)]
 pub struct CatalogItem {
     pub cid: Cid,

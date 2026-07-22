@@ -95,7 +95,7 @@ pub struct FfiCatalogEntry {
     pub seq: u64,
     /// CIDs publiés (chaînes).
     pub cids: Vec<String>,
-    /// Contenus enrichis (mêmes CIDs, avec titre/tags — vides pour un feed v1).
+    /// Contenus enrichis (mêmes CIDs, avec titre/tags signés).
     pub items: Vec<FfiContentItem>,
 }
 

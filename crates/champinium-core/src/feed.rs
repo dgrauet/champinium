@@ -447,4 +447,12 @@ mod tests {
         feed.verify().unwrap();
         assert_eq!(feed.entries[0].tags, vec!["nature", "nuit"]);
     }
+
+    #[test]
+    fn legacy_json_blobs_fail_at_parse() {
+        // Un vrai feed v1/v2 sérialisé n'atteint jamais verify() : le champ
+        // obligatoire `channel` manque, le parsing JSON échoue en amont.
+        let legacy = r#"{"schema":"champinium-feed/v1","issuer_pubkey":"AAAA","seq":1,"cids":["bafkreig"],"signature":"AAAA"}"#;
+        assert!(Feed::from_json(legacy.as_bytes()).is_err());
+    }
 }
