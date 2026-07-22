@@ -46,10 +46,14 @@
                                        Style="{StaticResource CaptionTextBlockStyle}"
                                        Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
                         </StackPanel>
-                        <!-- Tag = PeerId de l'émetteur ; l'état actuel (souscrit ou
-                             non) est relu sur le ChannelGroup lui-même au clic. -->
+                        <!-- Tag = le ChannelGroup entier ; l'état actuel (souscrit ou
+                             non) est relu dessus au clic. `{x:Bind Self}` (chemin
+                             explicite) plutôt que `{x:Bind}` (sans chemin) : ce dernier
+                             générait, dans ce DataTemplate déclaré en ressource, un
+                             binding ancré sur la Window (pas un FrameworkElement en
+                             WinUI 3) au lieu de l'item — CS1503 en CI. -->
                         <Button Grid.Column="1" Content="{x:Bind SubscribeLabel}"
-                                Tag="{x:Bind}" Click="OnToggleSubscriptionClick" />
+                                Tag="{x:Bind Self}" Click="OnToggleSubscriptionClick" />
                     </Grid>
                     <ItemsControl ItemsSource="{x:Bind Items}">
                         <ItemsControl.ItemTemplate>
