@@ -98,12 +98,14 @@ public sealed partial class MainWindow : Window
     }
 
     /// <summary>
-    /// Bascule l'abonnement d'un groupe (créateur/channel) — le bouton porte le
-    /// <see cref="ChannelGroup"/> entier en Tag (état actuel relu au clic).
+    /// Bascule l'abonnement d'un groupe (créateur/channel). Le bouton est dans un
+    /// gabarit lié par `Binding` classique (pas `x:Bind` — voir MainWindow.xaml) :
+    /// le conteneur d'item pose le <see cref="ChannelGroup"/> comme DataContext,
+    /// c'est là qu'on le relit (état actuel), pas via Tag.
     /// </summary>
     private async void OnToggleSubscriptionClick(object sender, RoutedEventArgs e)
     {
-        if (sender is Button { Tag: ChannelGroup group })
+        if (sender is FrameworkElement { DataContext: ChannelGroup group })
         {
             await Model.ToggleSubscriptionAsync(group.Issuer, group.IsSubscribed);
         }

@@ -31,8 +31,19 @@
 
             <!-- Gabarit partagé : un groupe (créateur/channel) = en-tête (nom, seq,
                  bouton abonnement) + ses contenus. Le bouton d'abonnement est au
-                 niveau du GROUPE, jamais sur une ligne de contenu individuelle. -->
-            <DataTemplate x:Key="ChannelGroupTemplate" x:DataType="local:ChannelGroup">
+                 niveau du GROUPE, jamais sur une ligne de contenu individuelle.
+
+                 `Binding` classique (PAS `x:Bind`) : un `DataTemplate` déclaré en
+                 ressource nommée (`x:Key`), partagé par deux `ListView`, génère un
+                 connecteur `x:Bind` ancré sur la `Window` plutôt que sur l'item —
+                 `Window` n'étant pas un `FrameworkElement` en WinUI 3, ça ne
+                 compile pas (CS1503, deux tentatives de variantes `x:Bind` déjà
+                 essayées sans succès en CI). Le `Binding` classique n'a pas ce
+                 problème : chaque conteneur d'item pose son `DataContext` sur
+                 l'instance (`ChannelGroup`/`CatalogCid`) — pas besoin de `x:DataType`
+                 ni de `Tag` pour la retrouver, `OnToggleSubscriptionClick` la relit
+                 via `(sender as FrameworkElement)?.DataContext`. -->
+            <DataTemplate x:Key="ChannelGroupTemplate">
                 <StackPanel Spacing="4" Padding="0,8">
                     <Grid ColumnSpacing="8">
                         <Grid.ColumnDefinitions>
@@ -40,40 +51,34 @@
                             <ColumnDefinition Width="Auto" />
                         </Grid.ColumnDefinitions>
                         <StackPanel Grid.Column="0" Spacing="0">
-                            <TextBlock Text="{x:Bind DisplayName}"
+                            <TextBlock Text="{Binding DisplayName}"
                                        Style="{StaticResource BodyStrongTextBlockStyle}" />
-                            <TextBlock Text="{x:Bind SeqText}"
+                            <TextBlock Text="{Binding SeqText}"
                                        Style="{StaticResource CaptionTextBlockStyle}"
                                        Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
                         </StackPanel>
-                        <!-- Tag = le ChannelGroup entier ; l'état actuel (souscrit ou
-                             non) est relu dessus au clic. `{x:Bind Self}` (chemin
-                             explicite) plutôt que `{x:Bind}` (sans chemin) : ce dernier
-                             générait, dans ce DataTemplate déclaré en ressource, un
-                             binding ancré sur la Window (pas un FrameworkElement en
-                             WinUI 3) au lieu de l'item — CS1503 en CI. -->
-                        <Button Grid.Column="1" Content="{x:Bind SubscribeLabel}"
-                                Tag="{x:Bind Self}" Click="OnToggleSubscriptionClick" />
+                        <Button Grid.Column="1" Content="{Binding SubscribeLabel}"
+                                Click="OnToggleSubscriptionClick" />
                     </Grid>
-                    <ItemsControl ItemsSource="{x:Bind Items}">
+                    <ItemsControl ItemsSource="{Binding Items}">
                         <ItemsControl.ItemTemplate>
-                            <DataTemplate x:DataType="local:CatalogCid">
+                            <DataTemplate>
                                 <Grid ColumnSpacing="8" Padding="12,2,0,2">
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="*" />
                                         <ColumnDefinition Width="Auto" />
                                     </Grid.ColumnDefinitions>
                                     <StackPanel Grid.Column="0">
-                                        <TextBlock Text="{x:Bind Display}"
+                                        <TextBlock Text="{Binding Display}"
                                                    TextTrimming="CharacterEllipsis"
                                                    TextWrapping="NoWrap" />
-                                        <TextBlock Text="{x:Bind TagsText}"
+                                        <TextBlock Text="{Binding TagsText}"
                                                    Style="{StaticResource CaptionTextBlockStyle}"
                                                    Foreground="{ThemeResource TextFillColorTertiaryBrush}"
                                                    TextWrapping="NoWrap" />
                                     </StackPanel>
                                     <Button Grid.Column="1" Content="Lire"
-                                            Tag="{x:Bind Cid}" Click="OnPlayClick" />
+                                            Tag="{Binding Cid}" Click="OnPlayClick" />
                                 </Grid>
                             </DataTemplate>
                         </ItemsControl.ItemTemplate>

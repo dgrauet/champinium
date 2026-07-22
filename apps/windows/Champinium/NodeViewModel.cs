@@ -48,12 +48,6 @@ public sealed class ChannelGroup
     /// <summary>Libellé du bouton — calculé depuis l'état d'abonnement réel
     /// (dans l'onglet Abonnements, toujours vrai par construction).</summary>
     public string SubscribeLabel => IsSubscribed ? "Se désabonner" : "S'abonner";
-
-    /// <summary>Alias vers soi-même, pour porter l'instance entière via un
-    /// `x:Bind` à chemin explicite (un `{x:Bind}` sans chemin, dans un
-    /// DataTemplate déclaré en ressource, générait un binding ancré sur la
-    /// Window plutôt que sur l'item — CS1503, voir NodeViewModel/MainWindow).</summary>
-    public ChannelGroup Self => this;
 }
 
 /// <summary>
