@@ -223,9 +223,8 @@ sur deux machines physiques.
   changement, contrat FFI **v5** (`FfiChannelProfile`,
   `set_channel_profile`/`channel_profile`, `FfiCatalogEntry.channel`). Spec :
   `~/Work/.superpowers/champinium/specs/2026-07-22-channels-subscriptions-design.md`.
-- **Restent** (issues) : recherche décentralisée (#20 — exige un feed v2 avec
-  métadonnées titre/tags + contrat FFI v4), IPNS durable (#21), réplication
-  opportuniste au-delà du reseed à la consommation.
+- **Restent** (issues) : IPNS durable (#21), réplication opportuniste au-delà du
+  reseed à la consommation.
 
 Phasing : 0 (spike async FFI ✔ contrat) → **1 (P2P nu CLI ✔)** → **2 (modération ✔,
 feeds/gossipsub/catalogue ✔, ingestion ffmpeg ✔)** → **3 (contrat UniFFI v3 ✔,

@@ -2,7 +2,7 @@
 
 > Public : quiconque veut comprendre comment le projet fonctionne de bout en
 > bout. Les renvois pointent vers le code (chemins cliquables) et les ADRs
-> (`docs/adr/`) pour les décisions. État au contrat FFI **v4** / release
+> (`docs/adr/`) pour les décisions. État au contrat FFI **v5** / release
 > **v0.6.x**.
 
 ## 1. Ce que c'est, en une phrase
@@ -225,7 +225,7 @@ Autour, deux mécanismes d'écosystème :
   catalogue borné à 1024 émetteurs (refus-quand-plein, pas d'éviction), c'est
   la défense contre l'inondation par clés jetables.
 
-## 8. La frontière FFI : le contrat v4
+## 8. La frontière FFI : le contrat v5
 
 La surface UniFFI de [`ffi.rs`](../crates/champinium-core/src/ffi.rs) est
 **le contrat** entre le noyau et les fronts (tableau exhaustif et protocole de
@@ -245,7 +245,7 @@ changement dans [`AGENTS.md`](../AGENTS.md)). Ce qui la caractérise :
 - **Bindings générés au build, jamais commités** : Swift via
   UniFFI/XCFramework (`just macos-prepare`), C# via `uniffi-bindgen-cs`
   (`just gen-csharp`). Le front Linux consomme le crate **directement** (pas
-  de FFI). `CONTRACT_VERSION` (=4) permet aux fronts de détecter une
+  de FFI). `CONTRACT_VERSION` (=5) permet aux fronts de détecter une
   incompatibilité au démarrage.
 
 Les trois fronts ([`apps/macos`](../apps/macos),
@@ -299,7 +299,7 @@ qui compte vit dans le réseau, chaque nœud n'en garde qu'une vue.
 ## 12. Carte des documents
 
 - [`CLAUDE.md`](../CLAUDE.md) — principes + état d'avancement (source de vérité).
-- [`AGENTS.md`](../AGENTS.md) — contrat FFI (tableau v4) + garde-fous d'équipe.
+- [`AGENTS.md`](../AGENTS.md) — contrat FFI (tableau v5) + garde-fous d'équipe.
 - [`docs/adr/`](adr/) — décisions : libp2p vs iroh (0001), modération côté
   nœud (0002), feeds signés (0003), transport de blocs (0006), IPNS (0007)…
 - [`docs/mvp-demo.md`](mvp-demo.md) / [`docs/gui-demo.md`](gui-demo.md) —
