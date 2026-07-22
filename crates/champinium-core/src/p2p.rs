@@ -14,7 +14,7 @@ use crate::blockstore::Blockstore;
 use crate::catalog::{Catalog, CatalogEntry};
 use crate::content::{cid_for, verify};
 use crate::error::{CoreError, Result as CoreResult};
-use crate::feed::{Feed, FeedEntry};
+use crate::feed::{ChannelMeta, Feed, FeedEntry};
 use crate::identity;
 use crate::ingest::{self, HlsManifest, HlsSegment};
 use crate::moderation::{Denylist, Moderation};
@@ -212,6 +212,7 @@ pub struct Node {
     catalog_events: tokio::sync::broadcast::Sender<()>,
     reports: Arc<Mutex<ReportBook>>,
     feed_seq: Arc<Mutex<u64>>,
+    channel_profile: Arc<Mutex<ChannelMeta>>,
     cmd_tx: mpsc::Sender<Command>,
 }
 
@@ -288,6 +289,9 @@ impl Node {
         // Reprend le seq de feed là où il s'était arrêté (sinon un nœud redémarré
         // republierait un seq plus petit, ignoré par le LWW des catalogues pairs).
         let feed_seq = Arc::new(Mutex::new(load_feed_seq(&blockstore)));
+        // Recharge le profil de channel persisté (identité éditoriale, spec
+        // channels §1) : un profil corrompu ne doit pas empêcher le démarrage.
+        let channel_profile = Arc::new(Mutex::new(load_channel_profile(&blockstore)));
 
         Ok(Self {
             peer_id,
@@ -298,6 +302,7 @@ impl Node {
             catalog_events,
             reports,
             feed_seq,
+            channel_profile,
             cmd_tx,
         })
     }
@@ -444,7 +449,8 @@ impl Node {
             }
             *guard
         };
-        let feed = Feed::build_signed_with(&self.keypair, seq, entries)?;
+        let profile = self.channel_profile();
+        let feed = Feed::build_signed_with(&self.keypair, seq, &profile, entries)?;
         // Le créateur figure dans son propre catalogue.
         let changed = self
             .catalog
@@ -625,6 +631,56 @@ impl Node {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entries()
+    }
+
+    /// Profil de channel courant (instantané).
+    pub fn channel_profile(&self) -> ChannelMeta {
+        self.channel_profile
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Définit le profil de channel : valide les bornes, persiste, puis
+    /// republie le feed courant s'il existe (le changement de nom se propage
+    /// sans attendre la prochaine publication).
+    pub async fn set_channel_profile(&self, meta: ChannelMeta) -> CoreResult<()> {
+        if meta.name.len() > crate::feed::MAX_CHANNEL_NAME_LEN
+            || meta.description.len() > crate::feed::MAX_CHANNEL_DESC_LEN
+        {
+            return Err(CoreError::Network("profil de channel hors bornes".into()));
+        }
+        if let Some(avatar) = &meta.avatar_cid {
+            avatar
+                .parse::<Cid>()
+                .map_err(|_| CoreError::Network("avatar_cid invalide".into()))?;
+        }
+        let json = serde_json::to_string(&meta)
+            .map_err(|e| CoreError::Network(format!("json profil: {e}")))?;
+        std::fs::write(channel_profile_path(&self.blockstore), json)?;
+        *self
+            .channel_profile
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = meta;
+
+        // Republie le feed courant (mêmes entries) pour propager le profil.
+        let own = self
+            .catalog_entries()
+            .into_iter()
+            .find(|e| e.issuer == self.peer_id());
+        if let Some(entry) = own {
+            let entries: Vec<FeedEntry> = entry
+                .items
+                .iter()
+                .map(|i| FeedEntry {
+                    cid: i.cid.to_string(),
+                    title: i.title.clone(),
+                    tags: i.tags.clone(),
+                })
+                .collect();
+            self.publish_feed_with(&entries).await?;
+        }
+        Ok(())
     }
 
     /// Tous les CIDs connus du catalogue.
@@ -852,6 +908,20 @@ fn load_feed_seq(blockstore: &Blockstore) -> u64 {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0)
+}
+
+/// Chemin du profil de channel persisté (identité éditoriale, spec channels §1).
+fn channel_profile_path(blockstore: &Blockstore) -> PathBuf {
+    blockstore.root().join(".channel_profile")
+}
+
+/// Charge le profil persisté (défaut si absent/illisible — un profil corrompu
+/// ne doit pas empêcher le nœud de démarrer).
+fn load_channel_profile(blockstore: &Blockstore) -> ChannelMeta {
+    std::fs::read_to_string(channel_profile_path(blockstore))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 /// Préfixe des clés DHT de feeds.

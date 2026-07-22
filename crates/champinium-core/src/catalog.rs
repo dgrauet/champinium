@@ -7,7 +7,7 @@
 //! émetteur, le feed de `seq` le plus élevé, signature vérifiée).
 
 use crate::error::Result as CoreResult;
-use crate::feed::Feed;
+use crate::feed::{ChannelMeta, Feed};
 use cid::Cid;
 use libp2p::PeerId;
 use std::collections::{HashMap, HashSet};
@@ -28,6 +28,8 @@ pub struct CatalogEntry {
     pub cids: Vec<Cid>,
     /// Contenus avec métadonnées (mêmes CIDs que `cids`, enrichis).
     pub items: Vec<CatalogItem>,
+    /// Identité éditoriale du channel de cet émetteur (signée avec le feed).
+    pub channel: ChannelMeta,
 }
 
 /// Un résultat de recherche locale.
@@ -94,32 +96,23 @@ impl Catalog {
             .iter()
             .filter_map(|(issuer, feed)| {
                 let cids = feed.cids().ok()?;
-                // v2 : métadonnées des entries ; v1 : items sans titre ni tags.
-                let items = if feed.entries.is_empty() {
-                    cids.iter()
-                        .map(|cid| CatalogItem {
-                            cid: *cid,
-                            title: String::new(),
-                            tags: Vec::new(),
+                let items = feed
+                    .entries
+                    .iter()
+                    .filter_map(|e| {
+                        e.cid.parse::<Cid>().ok().map(|cid| CatalogItem {
+                            cid,
+                            title: e.title.clone(),
+                            tags: e.tags.clone(),
                         })
-                        .collect()
-                } else {
-                    feed.entries
-                        .iter()
-                        .filter_map(|e| {
-                            e.cid.parse::<Cid>().ok().map(|cid| CatalogItem {
-                                cid,
-                                title: e.title.clone(),
-                                tags: e.tags.clone(),
-                            })
-                        })
-                        .collect()
-                };
+                    })
+                    .collect();
                 Some(CatalogEntry {
                     issuer: *issuer,
                     seq: feed.seq,
                     cids,
                     items,
+                    channel: feed.channel.clone(),
                 })
             })
             .collect()
@@ -263,6 +256,7 @@ mod tests {
             Feed::build_signed_with(
                 &k1,
                 1,
+                &ChannelMeta::default(),
                 &[meta(cid_for(b"a"), "Aurores boréales", &["nature", "nuit"])],
             )
             .unwrap(),
@@ -272,6 +266,7 @@ mod tests {
             Feed::build_signed_with(
                 &k2,
                 1,
+                &ChannelMeta::default(),
                 &[meta(cid_for(b"b"), "Recette de pâtes", &["cuisine"])],
             )
             .unwrap(),
@@ -299,7 +294,13 @@ mod tests {
         let k = Keypair::generate_ed25519();
         let mut cat = Catalog::new();
         cat.apply(
-            Feed::build_signed_with(&k, 1, &[meta(cid_for(b"a"), "Titre", &["tag"])]).unwrap(),
+            Feed::build_signed_with(
+                &k,
+                1,
+                &ChannelMeta::default(),
+                &[meta(cid_for(b"a"), "Titre", &["tag"])],
+            )
+            .unwrap(),
         )
         .unwrap();
         let entries = cat.entries();
@@ -308,5 +309,19 @@ mod tests {
         assert_eq!(entries[0].items[0].tags, vec!["tag"]);
         // `cids` reste dérivé (compat).
         assert_eq!(entries[0].cids, vec![cid_for(b"a")]);
+    }
+
+    #[test]
+    fn entries_expose_channel_metadata() {
+        let k = Keypair::generate_ed25519();
+        let mut cat = Catalog::new();
+        let ch = crate::feed::ChannelMeta {
+            name: "Aurores".into(),
+            description: "Ciels nocturnes".into(),
+            avatar_cid: None,
+        };
+        cat.apply(Feed::build_signed_with(&k, 1, &ch, &[meta(cid_for(b"a"), "T", &[])]).unwrap())
+            .unwrap();
+        assert_eq!(cat.entries()[0].channel, ch);
     }
 }
