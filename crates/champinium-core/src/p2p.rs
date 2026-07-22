@@ -59,7 +59,15 @@ const MAX_PROVIDED_KEYS: usize = 1_000_000;
 /// Nombre max de records DHT stockés localement (feeds d'autres créateurs).
 const MAX_DHT_RECORDS: usize = 100_000;
 /// Intervalle du suivi actif périodique des channels souscrits (spec channels
-/// §2). Surchargeable en test via [`Node::set_follow_interval_for_tests`].
+/// §2). Surchargeable en test via
+/// [`Node::with_moderation_and_follow_interval`] — **pas** via un setter
+/// post-construction : `follow_loop` lit `follow_interval` une seule fois par
+/// itération, sans jamais céder la main entre temps (zéro `.await`) avant de
+/// s'engager sur un `sleep`, donc un setter appelé après coup entre en course
+/// avec la toute première lecture. Sous charge (CI), cette course a été
+/// perdue en pratique : le `sleep` se figeait sur cette constante de 5 min et
+/// le test expirait. D'où l'intervalle passé **au constructeur**, effectif
+/// avant même le `tokio::spawn` de la boucle — aucune course possible.
 const FOLLOW_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Demande d'un bloc par CID (octets du CID).
@@ -220,9 +228,6 @@ pub struct Node {
     /// Abonnements locaux (channels suivis) — état **privé** du nœud, jamais
     /// publié sur le réseau (spec channels §2).
     subscriptions: Arc<Mutex<BTreeSet<PeerId>>>,
-    /// Intervalle du suivi actif périodique, partagé avec la tâche de fond
-    /// pour permettre la surcharge en test.
-    follow_interval: Arc<Mutex<Duration>>,
     /// Marqueur de vivacité : la tâche de suivi périodique n'en tient qu'un
     /// [`Weak`], ce qui lui permet de s'arrêter dès que toutes les poignées
     /// `Node` (qui clonent ce `Arc`) sont tombées, sans jamais retenir un
@@ -263,6 +268,25 @@ impl Node {
         keypair: Keypair,
         blockstore: Blockstore,
         moderation: Moderation,
+    ) -> CoreResult<Self> {
+        Self::with_moderation_and_follow_interval(keypair, blockstore, moderation, FOLLOW_INTERVAL)
+            .await
+    }
+
+    /// Comme [`Node::with_moderation`], mais avec un `follow_interval` de
+    /// suivi actif explicite plutôt que la constante de production
+    /// [`FOLLOW_INTERVAL`] (5 min, bien trop longue pour un test). Réservé
+    /// aux tests : contrairement à un setter post-construction (qui entrerait
+    /// en course avec la toute première lecture de `follow_interval` par
+    /// `follow_loop` — voir le commentaire sur `FOLLOW_INTERVAL`),
+    /// l'intervalle est effectif **avant** le `tokio::spawn` de la boucle,
+    /// donc sans course possible.
+    #[doc(hidden)]
+    pub async fn with_moderation_and_follow_interval(
+        keypair: Keypair,
+        blockstore: Blockstore,
+        moderation: Moderation,
+        follow_interval: Duration,
     ) -> CoreResult<Self> {
         let peer_id = identity::peer_id(&keypair);
         let mut swarm = build_swarm(keypair.clone())?;
@@ -314,7 +338,6 @@ impl Node {
         // channels §1) : un profil corrompu ne doit pas empêcher le démarrage.
         let channel_profile = Arc::new(Mutex::new(load_channel_profile(&blockstore)));
 
-        let follow_interval = Arc::new(Mutex::new(FOLLOW_INTERVAL));
         let alive = Arc::new(());
 
         // Suivi actif périodique des channels souscrits (spec channels §2) : ne
@@ -322,14 +345,16 @@ impl Node {
         // `alive_weak.upgrade()` échoue et la boucle s'arrête, libérant son
         // clone de `cmd_tx` (sinon la boucle d'évènements ne s'arrêterait
         // jamais : `cmd_rx.recv()` ne renvoie `None` que quand tous les
-        // émetteurs sont tombés).
+        // émetteurs sont tombés). `follow_interval` est fixé une fois pour
+        // toutes ici, avant ce spawn — voir le commentaire sur
+        // [`FOLLOW_INTERVAL`] pour la course que ça évite.
         tokio::spawn(follow_loop(
             Arc::downgrade(&alive),
             cmd_tx.clone(),
             catalog.clone(),
             catalog_events.clone(),
             subscriptions.clone(),
-            follow_interval.clone(),
+            follow_interval,
         ));
 
         Ok(Self {
@@ -343,7 +368,6 @@ impl Node {
             feed_seq,
             channel_profile,
             subscriptions,
-            follow_interval,
             alive,
             cmd_tx,
         })
@@ -721,17 +745,6 @@ impl Node {
             .into_iter()
             .filter(|e| subs.contains(&e.issuer))
             .collect()
-    }
-
-    /// Surcharge l'intervalle du suivi actif périodique (tests uniquement :
-    /// la constante de production [`FOLLOW_INTERVAL`] est de 5 minutes, bien
-    /// trop longue pour un test).
-    #[doc(hidden)]
-    pub fn set_follow_interval_for_tests(&self, interval: Duration) {
-        *self
-            .follow_interval
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = interval;
     }
 
     /// Injecte un feed tiers directement dans le catalogue local, hors réseau
@@ -1133,6 +1146,12 @@ async fn fetch_feed_inner(
 /// (spec : un abonné retrouve ce qui a été publié pendant qu'il était hors
 /// ligne).
 ///
+/// `follow_interval` est fixé une fois pour toutes à l'appel (constante de
+/// production [`FOLLOW_INTERVAL`], ou surchargée en test via
+/// [`Node::with_moderation_and_follow_interval`]) — **pas** un `Arc<Mutex<_>>`
+/// mutable après coup : voir le commentaire sur `FOLLOW_INTERVAL` pour la
+/// course qu'un tel setter causerait avec cette toute première itération.
+///
 /// Ne détient qu'un [`Weak`] marqueur de vivacité : dès que toutes les
 /// poignées `Node` sont tombées (donc `alive.upgrade()` échoue), la boucle
 /// s'arrête et relâche son clone de `cmd_tx` — sinon la boucle d'évènements ne
@@ -1143,7 +1162,7 @@ async fn follow_loop(
     catalog: Arc<Mutex<Catalog>>,
     catalog_events: tokio::sync::broadcast::Sender<()>,
     subscriptions: Arc<Mutex<BTreeSet<PeerId>>>,
-    follow_interval: Arc<Mutex<Duration>>,
+    follow_interval: Duration,
 ) {
     loop {
         if alive.upgrade().is_none() {
@@ -1162,10 +1181,7 @@ async fn follow_loop(
                 tracing::debug!("suivi périodique de {issuer} échoué: {e}");
             }
         }
-        let wait = *follow_interval
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        tokio::time::sleep(wait).await;
+        tokio::time::sleep(follow_interval).await;
     }
 }
 

@@ -15,6 +15,21 @@ async fn node(dir: &std::path::Path, name: &str) -> Node {
         .unwrap()
 }
 
+/// Comme [`node`], mais avec un `follow_interval` de suivi actif explicite —
+/// passé au constructeur (`with_moderation_and_follow_interval`), donc
+/// effectif AVANT le `tokio::spawn` de `follow_loop`. Un setter
+/// post-construction serait en course avec la toute première lecture de
+/// l'intervalle par la boucle (aucun `.await` entre le spawn et cette
+/// lecture) — course perdue en pratique sous charge CI (voir rapport), d'où
+/// ce paramètre au constructeur plutôt qu'un setter.
+async fn node_with_follow_interval(dir: &std::path::Path, name: &str, interval: Duration) -> Node {
+    let kp = load_or_generate(dir.join(format!("{name}.key"))).unwrap();
+    let bs = Blockstore::open(dir.join(name)).unwrap();
+    Node::with_moderation_and_follow_interval(kp, bs, Moderation::empty(), interval)
+        .await
+        .unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subscriptions_persist_across_restart() {
     let dir = tempfile::tempdir().unwrap();
@@ -140,9 +155,10 @@ async fn periodic_follow_picks_up_new_feed_versions() {
 
     // B se souscrit à A alors qu'il n'est PAS encore connecté : le fetch
     // immédiat spawné par `subscribe()` échoue silencieusement (best-effort)
-    // et ne repassera plus jamais.
-    let node_b = node(dir.path(), "b").await;
-    node_b.set_follow_interval_for_tests(Duration::from_millis(100));
+    // et ne repassera plus jamais. `follow_interval` (100 ms) est passé au
+    // constructeur, donc effectif avant même le spawn de `follow_loop` —
+    // voir `node_with_follow_interval`.
+    let node_b = node_with_follow_interval(dir.path(), "b", Duration::from_millis(100)).await;
     node_b.subscribe(node_a.peer_id()).unwrap();
 
     // B ne se connecte à A qu'à présent, une fois v1 ET v2 déjà publiées.
@@ -232,12 +248,12 @@ async fn startup_initial_pass_catches_up_offline_updates() {
     node_a.publish_feed(&[c2]).await.unwrap();
 
     // B redémarre (même répertoire → abonnement à A rechargé depuis le
-    // disque) SANS se resouscrire. Accélère l'intervalle avant tout `.await`
-    // réseau : si la toute première tentative de la passe initiale échoue
-    // (pas encore reconnecté à A), la suivante arrive vite plutôt qu'après les
-    // 5 min de la constante de production (voir set_follow_interval_for_tests).
-    let node_b = node(dir.path(), "b").await;
-    node_b.set_follow_interval_for_tests(Duration::from_millis(200));
+    // disque) SANS se resouscrire. `follow_interval` (200 ms plutôt que les
+    // 5 min de la constante de production) est passé au constructeur — voir
+    // `node_with_follow_interval` — donc effectif dès la toute première
+    // itération de `follow_loop` : si celle-ci échoue (pas encore reconnecté
+    // à A), la suivante arrive vite.
+    let node_b = node_with_follow_interval(dir.path(), "b", Duration::from_millis(200)).await;
     assert_eq!(
         node_b.subscriptions(),
         vec![node_a.peer_id()],
