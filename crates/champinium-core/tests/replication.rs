@@ -1,8 +1,19 @@
-//! Test d'intégration : seed-what-you-consume → réplication.
+//! Test d'intégration : retrait de seed-what-you-consume.
 //!
-//! A publie un bloc ; B le consomme (donc le met en cache ET le réannonce) ;
-//! A est ensuite mis hors ligne ; un troisième nœud C, connecté UNIQUEMENT à B,
-//! récupère quand même le bloc — preuve que le consommateur B le reseede.
+//! Nouveau contrat (spec channels lot c) : `get` (politique par défaut
+//! `Stream`) ne met plus le bloc consommé en cache et n'annonce plus le
+//! consommateur comme fournisseur. A publie un bloc ; B le consomme via
+//! `get` ; ni le blockstore de B ni le facteur de réplication (mesuré depuis
+//! A) ne doivent bouger — preuve directe et déterministe que B ne reseede
+//! plus par défaut (on évite ici de faire dépendre le test du timing d'un
+//! arrêt de processus, comme le faisait l'ancien test via un 3ᵉ nœud C
+//! connecté à B après avoir mis A hors ligne).
+//!
+//! (Le contraire — `get_with(Seed)` reproduit l'ancien comportement — est
+//! testé dans le module interne `p2p::tests`, `StorePolicy` étant
+//! crate-interne. `replicate_under_provided` est supprimé avec ce lot : la
+//! réplication opportuniste au-delà du défaut sera reprise sur des bases
+//! explicites par un lot ultérieur.)
 
 use champinium_core::identity::load_or_generate;
 use champinium_core::{Blockstore, Moderation, Node};
@@ -30,9 +41,9 @@ async fn fetch(node: &Node, cid: champinium_core::Cid) -> Vec<u8> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn consumer_reseeds_to_other_peers() {
+async fn consumer_does_not_reseed_by_default() {
     let dir = tempfile::tempdir().unwrap();
-    let payload = b"contenu replique par seed-what-you-consume".to_vec();
+    let payload = b"contenu simplement consomme, plus reseede".to_vec();
 
     // A publie.
     let node_a = node(dir.path(), "a").await;
@@ -42,56 +53,8 @@ async fn consumer_reseeds_to_other_peers() {
         .unwrap();
     let cid = node_a.add(&payload).await.unwrap();
 
-    // B consomme depuis A → met en cache ET réannonce.
+    // B consomme via `get` (Stream) : ni cache, ni annonce.
     let node_b = node(dir.path(), "b").await;
-    let addr_b = node_b
-        .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
-        .await
-        .unwrap();
-    node_b
-        .add_address(node_a.peer_id(), addr_a.clone())
-        .await
-        .unwrap();
-    node_b.dial(addr_a).await.unwrap();
-    assert_eq!(fetch(&node_b, cid).await, payload);
-    assert!(node_b.blockstore().has(&cid));
-
-    // A passe hors ligne.
-    drop(node_a);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // C, connecté UNIQUEMENT à B, récupère le bloc → il vient forcément de B.
-    let node_c = node(dir.path(), "c").await;
-    node_c
-        .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
-        .await
-        .unwrap();
-    node_c
-        .add_address(node_b.peer_id(), addr_b.clone())
-        .await
-        .unwrap();
-    node_c.dial(addr_b).await.unwrap();
-    assert_eq!(fetch(&node_c, cid).await, payload);
-}
-
-/// Le facteur de réplication d'un CID est mesurable : après qu'un consommateur
-/// a récupéré (et donc réannoncé) un bloc, la DHT compte DEUX fournisseurs.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn replication_factor_counts_providers() {
-    let dir = tempfile::tempdir().unwrap();
-    let node_a = node(dir.path(), "rf-a").await;
-    let addr_a = node_a
-        .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
-        .await
-        .unwrap();
-    let payload = b"bloc replique mesurable".to_vec();
-    let cid = node_a.add(&payload).await.unwrap();
-
-    // Le publieur seul : facteur 1.
-    assert_eq!(node_a.replication_factor(cid).await.unwrap(), 1);
-
-    // B consomme → devient fournisseur → facteur 2 (vu de B).
-    let node_b = node(dir.path(), "rf-b").await;
     node_b
         .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
         .await
@@ -102,81 +65,22 @@ async fn replication_factor_counts_providers() {
         .unwrap();
     node_b.dial(addr_a).await.unwrap();
     assert_eq!(fetch(&node_b, cid).await, payload);
-
-    tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            if node_b.replication_factor(cid).await.unwrap() >= 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
-    })
-    .await
-    .expect("le facteur de réplication doit atteindre 2 après le reseed");
-}
-
-/// Réplication OPPORTUNISTE (au-delà de seed-what-you-consume) : un nœud qui
-/// connaît un contenu par son catalogue (feed gossip) mais ne l'a PAS consommé
-/// le réplique proactivement s'il est sous-répliqué — manifeste HLS ET
-/// segments — et devient fournisseur.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn under_provided_content_is_replicated_opportunistically() {
-    use champinium_core::ingest::{HlsManifest, HlsSegment};
-
-    let dir = tempfile::tempdir().unwrap();
-    let node_a = node(dir.path(), "op-a").await;
-    let addr_a = node_a
-        .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
-        .await
-        .unwrap();
-
-    // A publie un « contenu » : un segment + un manifeste HLS qui le référence.
-    let seg = node_a.add(b"segment video opportuniste").await.unwrap();
-    let manifest = HlsManifest::new(
-        4.0,
-        vec![HlsSegment {
-            cid: seg.to_string(),
-            duration: 4.0,
-        }],
-    );
-    let manifest_cid = node_a
-        .add(manifest.to_json().unwrap().as_bytes())
-        .await
-        .unwrap();
-
-    // B apprend l'existence du contenu par le feed (catalogue), sans le consommer.
-    let node_b = node(dir.path(), "op-b").await;
-    node_b
-        .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
-        .await
-        .unwrap();
-    node_b
-        .add_address(node_a.peer_id(), addr_a.clone())
-        .await
-        .unwrap();
-    node_b.dial(addr_a).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            node_a.publish_feed(&[manifest_cid]).await.unwrap();
-            if node_b.catalog_cids().contains(&manifest_cid) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-    })
-    .await
-    .expect("le feed doit atteindre B");
     assert!(
-        !node_b.blockstore().has(&manifest_cid),
-        "pas encore consommé"
+        !node_b.blockstore().has(&cid),
+        "Stream ne doit pas mettre le bloc en cache chez B"
     );
 
-    // Facteur observé : 1 (A seul) < cible 2 → B doit répliquer.
-    let replicated = node_b.replicate_under_provided(2, 10).await.unwrap();
-    assert_eq!(replicated, 1, "un contenu répliqué");
-    assert!(node_b.blockstore().has(&manifest_cid), "manifeste répliqué");
-    assert!(node_b.blockstore().has(&seg), "segments répliqués aussi");
-
-    // Une seconde passe ne refait rien : le contenu est désormais local.
-    assert_eq!(node_b.replicate_under_provided(2, 10).await.unwrap(), 0);
+    // Laisse le temps à une éventuelle (mauvaise) réannonce, puis vérifie que
+    // le facteur de réplication n'a pas bougé : B n'est PAS devenu fournisseur.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        node_a.replication_factor(cid).await.unwrap(),
+        1,
+        "le facteur de réplication ne doit pas monter après un `get` simple"
+    );
+    let providers = node_a.get_providers(cid).await.unwrap();
+    assert!(
+        !providers.contains(&node_b.peer_id()),
+        "B ne doit pas apparaître comme fournisseur après un `get` simple"
+    );
 }

@@ -213,6 +213,24 @@ enum Command {
     },
 }
 
+/// Politique de stockage appliquée par [`Node::get_with`] lors d'une
+/// récupération réseau (retrait de seed-what-you-consume, spec channels
+/// lot c) : un hit local est toujours servi tel quel et le checkpoint
+/// modération #2 s'applique dans les deux cas — seul le sort du bloc
+/// *nouvellement récupéré depuis le réseau* diffère.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StorePolicy {
+    /// Ancien comportement : le bloc est mis en cache ET réannoncé (le nœud
+    /// devient fournisseur). Réservé aux cas où le nœud choisit explicitement
+    /// de seeder ce contenu (channel souscrit, ingestion, réparation d'un
+    /// cache local corrompu).
+    Seed,
+    /// Rien n'est écrit ni annoncé : les octets sont rendus à l'appelant et
+    /// oubliés. C'est le nouveau défaut de [`Node::get`] — consommer un
+    /// contenu ne doit plus, par défaut, engager le nœud à le seeder.
+    Stream,
+}
+
 /// Poignée vers un nœud P2P en fonctionnement.
 #[derive(Clone)]
 pub struct Node {
@@ -656,12 +674,25 @@ impl Node {
     }
 
     async fn fetch_hls_inner(&self, manifest_cid: Cid, out_dir: &Path) -> CoreResult<PathBuf> {
-        let bytes = self.get(manifest_cid).await?;
+        // Politique : `Seed` si le manifeste appartient à un channel souscrit
+        // (suivi actif — on veut le resservir), `Stream` sinon (simple
+        // consultation, ex. Explorer) — le retrait de seed-what-you-consume ne
+        // doit pas priver un channel suivi de sa réplication.
+        let policy = if self
+            .catalog_subscribed()
+            .iter()
+            .any(|e| e.cids.contains(&manifest_cid))
+        {
+            StorePolicy::Seed
+        } else {
+            StorePolicy::Stream
+        };
+        let bytes = self.get_with(manifest_cid, policy).await?;
         let manifest = HlsManifest::from_json(&bytes)?;
         tokio::fs::create_dir_all(out_dir).await?;
         for seg in &manifest.segments {
             let cid: Cid = seg.cid.parse().map_err(CoreError::Cid)?;
-            let data = self.get(cid).await?;
+            let data = self.get_with(cid, policy).await?;
             tokio::fs::write(out_dir.join(format!("{}.ts", seg.cid)), &data).await?;
         }
         let playlist = out_dir.join("index.m3u8");
@@ -877,73 +908,44 @@ impl Node {
 
     /// Facteur de réplication **mesuré** d'un CID : nombre de fournisseurs
     /// annoncés dans la DHT (soi-même compris). Observabilité de la mitigation
-    /// du risque #1 (persistance) : seed-what-you-consume doit le faire croître.
+    /// du risque #1 (persistance) : un `get_with(Seed)` doit le faire croître,
+    /// un `get` (Stream) par défaut ne le doit plus.
     pub async fn replication_factor(&self, cid: Cid) -> CoreResult<usize> {
         Ok(self.get_providers(cid).await?.len())
     }
 
-    /// Réplication **opportuniste** (au-delà de seed-what-you-consume,
-    /// mitigation du risque #1 persistance) : parcourt les contenus connus du
-    /// catalogue, mesure leur facteur de réplication, et réplique ceux qui ont
-    /// moins de `target` fournisseurs — manifeste HLS **et** segments (tout
-    /// passe par `get`, donc le checkpoint modération #2 s'applique). Au plus
-    /// `max_items` contenus par passe (borne bande passante/disque). Renvoie le
-    /// nombre de contenus répliqués.
-    pub async fn replicate_under_provided(
-        &self,
-        target: usize,
-        max_items: usize,
-    ) -> CoreResult<usize> {
-        if target == 0 {
-            return Ok(0);
-        }
-        let mut replicated = 0;
-        for cid in self.catalog_cids() {
-            if replicated >= max_items {
-                break;
-            }
-            if self.blockstore.has(&cid) || self.is_blocked(&cid) {
-                continue;
-            }
-            if self.replication_factor(cid).await? >= target {
-                continue;
-            }
-            match self.replicate(cid).await {
-                Ok(()) => replicated += 1,
-                // Best-effort : un contenu irrécupérable (fournisseur parti,
-                // segment bloqué) ne doit pas stopper la passe.
-                Err(e) => tracing::debug!("réplication de {cid} échouée: {e}"),
-            }
-        }
-        Ok(replicated)
-    }
-
-    /// Réplique un contenu : récupère le bloc (mise en cache + réannonce via
-    /// `get`) et, si c'est un manifeste HLS, tous ses segments.
-    async fn replicate(&self, cid: Cid) -> CoreResult<()> {
-        let bytes = self.get(cid).await?;
-        if let Ok(manifest) = HlsManifest::from_json(&bytes) {
-            for seg in &manifest.segments {
-                let seg_cid: Cid = seg.cid.parse().map_err(CoreError::Cid)?;
-                self.get(seg_cid).await?;
-            }
-        }
-        Ok(())
+    /// Récupère un bloc SANS engager le nœud à le seeder : alias de
+    /// [`Node::get_with`] avec [`StorePolicy::Stream`]. C'est le nouveau
+    /// défaut depuis le retrait de seed-what-you-consume — un hit local est
+    /// toujours servi, mais une récupération réseau n'est ni mise en cache ni
+    /// annoncée. Pour l'ancien comportement (stocker + fournir), utiliser
+    /// `get_with(cid, StorePolicy::Seed)`.
+    pub async fn get(&self, cid: Cid) -> CoreResult<Vec<u8>> {
+        self.get_with(cid, StorePolicy::Stream).await
     }
 
     /// Récupère un bloc : cache local → sinon découverte DHT + transfert + vérif.
     /// Interroge **tous les fournisseurs en parallèle** et retient la première
-    /// réponse valide. Applique seed-what-you-consume : le bloc est mis en cache
-    /// **et réannoncé** (le consommateur devient fournisseur → réplication).
+    /// réponse valide. `policy` gouverne le sort d'un bloc nouvellement récupéré
+    /// depuis le réseau : `Seed` le met en cache et le réannonce (le nœud
+    /// devient fournisseur), `Stream` se contente de rendre les octets.
+    ///
+    /// Exception : si le bloc était présent localement mais **corrompu**, la
+    /// réparation stocke et réannonce toujours, indépendamment de `policy` — le
+    /// nœud le détenait déjà légitimement (par `add` ou un `get_with(Seed)`
+    /// antérieur), la réparation restaure cet état plutôt que d'en décider un
+    /// nouveau.
     ///
     /// CHECKPOINT MODÉRATION #2 (réception) : un contenu matché n'est ni récupéré,
-    /// ni mis en cache, ni reseedé — et le refus est **signalé** aux pairs
-    /// (rapport signé sur le topic des signalements, best-effort).
-    pub async fn get(&self, cid: Cid) -> CoreResult<Vec<u8>> {
+    /// ni mis en cache, ni fourni — quelle que soit `policy` — et le refus est
+    /// **signalé** aux pairs (rapport signé sur le topic des signalements,
+    /// best-effort).
+    pub(crate) async fn get_with(&self, cid: Cid, policy: StorePolicy) -> CoreResult<Vec<u8>> {
         if self.is_blocked(&cid) {
             self.emit_report(&cid, "denylist").await;
             return Err(CoreError::Moderated(cid.to_string()));
         }
+        let mut repairing_corruption = false;
         if self.blockstore.has(&cid) {
             match self.blockstore.get(&cid) {
                 Ok(bytes) => return Ok(bytes),
@@ -952,6 +954,7 @@ impl Node {
                 // le `put` en fin de fetch réparera le fichier.
                 Err(CoreError::IntegrityMismatch) => {
                     tracing::warn!("bloc local corrompu, re-téléchargement: {cid}");
+                    repairing_corruption = true;
                 }
                 Err(e) => return Err(e),
             }
@@ -973,9 +976,10 @@ impl Node {
         while let Some(result) = inflight.next().await {
             match result {
                 Ok(bytes) => {
-                    self.blockstore.put(&bytes)?;
-                    // seed-what-you-consume : devient fournisseur (best-effort).
-                    let _ = self.provide(cid).await;
+                    if repairing_corruption || policy == StorePolicy::Seed {
+                        self.blockstore.put(&bytes)?;
+                        let _ = self.provide(cid).await;
+                    }
                     return Ok(bytes);
                 }
                 Err(e) => tracing::debug!("fournisseur rejeté pour {cid}: {e}"),
@@ -1863,5 +1867,162 @@ mod tests {
         .await
         .expect("le feed légitime doit survivre à la tentative d'écrasement");
         assert_eq!(feed.cids().unwrap(), published);
+    }
+
+    /// Nouveau contrat (retrait de seed-what-you-consume) : `get` par défaut
+    /// (`StorePolicy::Stream`) rend les octets mais n'engage plus le nœud à
+    /// seeder — ni cache local, ni provider record.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_default_does_not_store_or_provide() {
+        let dir = tempfile::tempdir().unwrap();
+        let node_a = spawn_node(dir.path(), "sa").await;
+        let node_b = spawn_node(dir.path(), "sb").await;
+
+        let addr_a = node_a
+            .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        node_b
+            .add_address(node_a.peer_id(), addr_a.clone())
+            .await
+            .unwrap();
+        node_b.dial(addr_a).await.unwrap();
+
+        let payload = b"contenu simplement streame".to_vec();
+        let cid = node_a.add(&payload).await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Ok(b) = node_b.get(cid).await {
+                    return b;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+        .await
+        .expect("le transfert doit aboutir");
+        assert_eq!(received, payload);
+
+        assert!(
+            !node_b.blockstore().has(&cid),
+            "Stream ne doit pas mettre le bloc en cache"
+        );
+        // Laisse le temps à une éventuelle (mauvaise) réannonce de se produire.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let providers = node_a.get_providers(cid).await.unwrap();
+        assert!(
+            !providers.contains(&node_b.peer_id()),
+            "Stream ne doit pas faire de B un fournisseur"
+        );
+    }
+
+    /// `get_with(Seed)` reproduit l'ancien comportement : cache local ET
+    /// annonce (le nœud devient fournisseur découvrable).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_with_seed_stores_and_provides() {
+        let dir = tempfile::tempdir().unwrap();
+        let node_a = spawn_node(dir.path(), "sda").await;
+        let node_b = spawn_node(dir.path(), "sdb").await;
+
+        let addr_a = node_a
+            .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        node_b
+            .add_address(node_a.peer_id(), addr_a.clone())
+            .await
+            .unwrap();
+        node_b.dial(addr_a).await.unwrap();
+
+        let payload = b"contenu explicitement seede".to_vec();
+        let cid = node_a.add(&payload).await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Ok(b) = node_b.get_with(cid, StorePolicy::Seed).await {
+                    return b;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+        .await
+        .expect("le transfert doit aboutir");
+        assert_eq!(received, payload);
+        assert!(
+            node_b.blockstore().has(&cid),
+            "Seed doit mettre le bloc en cache"
+        );
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let providers = node_a.get_providers(cid).await.unwrap();
+                if providers.contains(&node_b.peer_id()) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+        .await
+        .expect("Seed doit faire de B un fournisseur découvrable");
+    }
+
+    /// Le checkpoint modération #2 s'applique dans les deux politiques : un
+    /// CID matché est refusé sans jamais être stocké, que la politique
+    /// demandée soit `Stream` ou `Seed`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn moderation_checkpoint_applies_in_both_policies() {
+        let dir = tempfile::tempdir().unwrap();
+        let forbidden = b"contenu interdit, seed ou stream".to_vec();
+        let bad_cid = cid_for(&forbidden);
+
+        let kp_a = Keypair::generate_ed25519();
+        let bs_a = Blockstore::open(dir.path().join("ma")).unwrap();
+        let node_a = Node::new(kp_a, bs_a).await.unwrap();
+        let addr_a = node_a
+            .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        node_a.add(&forbidden).await.unwrap();
+
+        let issuer = identity::load_or_generate(dir.path().join("issuer.key")).unwrap();
+        let dl =
+            Denylist::build_signed("test", "2026-06-24T00:00:00Z", &issuer, &[bad_cid]).unwrap();
+        let mut moderation = Moderation::empty();
+        moderation.subscribe(&dl).unwrap();
+
+        for (name, policy) in [
+            ("mb-stream", StorePolicy::Stream),
+            ("mb-seed", StorePolicy::Seed),
+        ] {
+            let kp_b = Keypair::generate_ed25519();
+            let bs_b = Blockstore::open(dir.path().join(name)).unwrap();
+            let node_b = Node::with_moderation(kp_b, bs_b, moderation.clone())
+                .await
+                .unwrap();
+            node_b
+                .add_address(node_a.peer_id(), addr_a.clone())
+                .await
+                .unwrap();
+            node_b.dial(addr_a.clone()).await.unwrap();
+
+            let err = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match node_b.get_with(bad_cid, policy).await {
+                        Err(CoreError::Moderated(_)) => return true,
+                        Err(CoreError::NoProviders(_)) | Err(CoreError::BlockNotFound(_)) => {
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                        }
+                        other => panic!("résultat inattendu: {other:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("le refus doit survenir");
+            assert!(err, "le checkpoint #2 doit refuser {policy:?}");
+            assert!(
+                !node_b.blockstore().has(&bad_cid),
+                "aucun stockage sous {policy:?}"
+            );
+        }
     }
 }

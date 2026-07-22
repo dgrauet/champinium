@@ -1,10 +1,12 @@
 //! champinium-seed — démon de seeding en arrière-plan (hors UI).
 //!
-//! Incarne le modèle SEED-WHAT-YOU-CONSUME côté service : un nœud qui reste en
-//! ligne pour **resservir** ce qu'il détient. Au démarrage et périodiquement, il
-//! **réannonce** tous ses CIDs dans la DHT (provider records) et **republie** son
-//! feed signé. Conçu pour tourner sous launchd (macOS), un service Windows, ou un
-//! systemd user service (Linux) — voir `infra/services/`.
+//! Depuis le retrait de seed-what-you-consume (spec channels lot c), le démon
+//! ne fait plus que **resservir ce qu'il détient déjà** : au démarrage et
+//! périodiquement, il **réannonce** tous ses CIDs dans la DHT (provider
+//! records). Il ne publie PLUS de feed — la publication appartient au nœud
+//! créateur, pas au démon de seeding. Conçu pour tourner sous launchd (macOS),
+//! un service Windows, ou un systemd user service (Linux) — voir
+//! `infra/services/`.
 //!
 //! La modération par défaut reste active : un seeder ne ressert jamais un contenu
 //! matché (les checkpoints du noyau s'appliquent au service comme au reste).
@@ -33,16 +35,9 @@ struct Cli {
     /// Pairs de bootstrap `/ip4/.../tcp/.../p2p/<peerid>` (répétable).
     #[arg(long)]
     bootstrap: Vec<String>,
-    /// Intervalle de réannonce/republication, en secondes.
+    /// Intervalle de réannonce, en secondes.
     #[arg(long, default_value = "3600")]
     reprovide_interval: u64,
-    /// Cible de réplication opportuniste : le démon réplique les contenus du
-    /// catalogue ayant moins de N fournisseurs (0 = désactivé).
-    #[arg(long, default_value = "2")]
-    replication_target: usize,
-    /// Nombre max de contenus répliqués par passe (borne bande passante/disque).
-    #[arg(long, default_value = "16")]
-    replicate_max: usize,
 }
 
 #[tokio::main]
@@ -75,7 +70,6 @@ async fn main() -> Result<()> {
     let interval = Duration::from_secs(cli.reprovide_interval.max(1));
     loop {
         reseed(&node).await;
-        replicate(&node, cli.replication_target, cli.replicate_max).await;
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}
             _ = tokio::signal::ctrl_c() => {
@@ -86,30 +80,12 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Réplication opportuniste : réplique les contenus du catalogue sous-répliqués
-/// (mitigation du risque #1 persistance, au-delà de seed-what-you-consume).
-async fn replicate(node: &Node, target: usize, max_items: usize) {
-    if target == 0 {
-        return;
-    }
-    match node.replicate_under_provided(target, max_items).await {
-        Ok(0) => {}
-        Ok(n) => tracing::info!("réplication opportuniste de {n} contenu(s)"),
-        Err(e) => tracing::warn!("réplication opportuniste échouée: {e}"),
-    }
-}
-
-/// Réannonce tous les CIDs détenus et republie le feed.
+/// Réannonce tous les CIDs détenus (provider records). La publication du feed
+/// n'appartient PAS au démon — c'est le nœud créateur qui publie ce qu'il
+/// crée ; le démon de seeding ne fait que resservir ce qu'il détient déjà.
 async fn reseed(node: &Node) {
     match node.reprovide_all().await {
         Ok(n) => tracing::info!("réannonce de {n} CID(s)"),
         Err(e) => tracing::warn!("réannonce échouée: {e}"),
-    }
-    if let Ok(cids) = node.blockstore().list() {
-        if !cids.is_empty() {
-            if let Err(e) = node.publish_feed(&cids).await {
-                tracing::warn!("republication du feed échouée: {e}");
-            }
-        }
     }
 }
