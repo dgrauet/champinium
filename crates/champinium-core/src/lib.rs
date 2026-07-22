@@ -32,6 +32,7 @@ pub mod p2p;
 pub mod paths;
 pub mod relay;
 pub mod report;
+pub mod seeding;
 
 pub use blockstore::Blockstore;
 pub use catalog::{Catalog, CatalogEntry};
@@ -42,6 +43,7 @@ pub use moderation::{Denylist, Moderation};
 pub use p2p::Node;
 pub use relay::{start_relay, RelayHandle};
 pub use report::Report;
+pub use seeding::{SeedIndex, SeededPublication};
 
 // Réexports pratiques pour les consommateurs Rust du crate (cli, front Linux).
 pub use cid::Cid;
