@@ -96,26 +96,27 @@ async fn subscribe_triggers_immediate_dht_fetch() {
     .expect("le fetch immédiat à l'abonnement doit retrouver le feed de A");
 }
 
-/// Suivi actif (tâche 2), volet périodique : une fois B convergé sur la v1
-/// (fetch immédiat au subscribe), A publie une v2 SANS que B ne se resouscrive
-/// — seule la boucle de fond `follow_loop` (relance toutes les
-/// `follow_interval`) doit retrouver la nouvelle version.
+/// Suivi actif (tâche 2), volet périodique : A publie v1 PUIS v2 avant toute
+/// connexion à B — gossipsub ne rejoue jamais les messages passés à un pair
+/// qui rejoint après coup, donc ni v1 ni v2 ne sont jamais gossipés à B, quoi
+/// qu'il advienne ensuite. B se souscrit à A **avant** de se connecter : le
+/// fetch immédiat déclenché par `subscribe()` échoue faute de route vers A à
+/// cet instant et n'est **jamais retenté** (tâche unique, `tokio::spawn`
+/// ponctuel) — il ne peut donc pas être la voie de convergence testée ici.
+/// Une fois B connecté (v1/v2 déjà publiées, donc invisibles en gossip pour
+/// lui), la SEULE voie de convergence restante est la boucle de fond
+/// `follow_loop`, qui interroge la DHT à intervalle régulier (`follow_interval`).
 ///
-/// `set_follow_interval_for_tests` est appelé au tout début, avant tout
-/// `.await` réseau (add_address/dial/subscribe) : `follow_interval` est lu à
-/// chaque itération de la boucle (pas figé à la création), mais un `sleep`
-/// déjà lancé ne raccourcit pas rétroactivement — il faut donc gagner la
-/// course contre la toute première itération de la boucle (souscriptions
-/// vides à cet instant, donc son passage est un no-op quoi qu'il arrive) pour
-/// que le *sommeil* qui la suit soit déjà court. En pratique la fenêtre est
-/// large : le code synchrone qui suit (aucun réseau avant le premier `.await`)
-/// s'exécute largement avant qu'un thread worker ne puisse même être réveillé
-/// pour exécuter la tâche fraîchement spawnée.
+/// Auto-vérification de l'isolation (voir rapport) : avec
+/// `follow_interval` figé à 1 h, ce test échoue par timeout (aucune autre
+/// voie ne peut livrer le feed) ; avec 200 ms, il passe.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn periodic_follow_picks_up_new_feed_versions() {
     let dir = tempfile::tempdir().unwrap();
 
-    // A publie une première version de son feed (PUT DHT).
+    // A publie v1 puis v2 (PUT DHT + gossip dans le vide, personne d'autre
+    // n'étant encore connecté) — seul le dernier PUT DHT (v2) survit sous la
+    // clé `/champinium/feed/<peerid>` de A.
     let node_a = node(dir.path(), "a").await;
     node_a
         .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
@@ -123,10 +124,17 @@ async fn periodic_follow_picks_up_new_feed_versions() {
         .unwrap();
     let c1 = cid_for(b"periodic v1");
     node_a.publish_feed(&[c1]).await.unwrap();
+    let c2 = cid_for(b"periodic v2");
+    node_a.publish_feed(&[c2]).await.unwrap();
 
+    // B se souscrit à A alors qu'il n'est PAS encore connecté : le fetch
+    // immédiat spawné par `subscribe()` échoue silencieusement (best-effort)
+    // et ne repassera plus jamais.
     let node_b = node(dir.path(), "b").await;
     node_b.set_follow_interval_for_tests(Duration::from_millis(200));
+    node_b.subscribe(node_a.peer_id()).unwrap();
 
+    // B ne se connecte à A qu'à présent, une fois v1 ET v2 déjà publiées.
     let addr_a = node_a.listen_addrs().await.unwrap();
     let addr_a = addr_a.into_iter().next().expect("adresse d'écoute de A");
     node_b
@@ -134,15 +142,13 @@ async fn periodic_follow_picks_up_new_feed_versions() {
         .await
         .unwrap();
     node_b.dial(addr_a).await.unwrap();
-    node_b.subscribe(node_a.peer_id()).unwrap();
 
-    // Convergence initiale sur la v1 (fetch immédiat au subscribe).
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let subbed = node_b.catalog_subscribed();
             if subbed
                 .iter()
-                .any(|e| e.issuer == node_a.peer_id() && e.cids.contains(&c1))
+                .any(|e| e.issuer == node_a.peer_id() && e.cids.contains(&c2))
             {
                 return;
             }
@@ -150,25 +156,7 @@ async fn periodic_follow_picks_up_new_feed_versions() {
         }
     })
     .await
-    .expect("convergence initiale sur la v1 attendue");
-
-    // A publie une v2 (seq supérieur, CID différent) — B ne se resouscrit pas.
-    let c2 = cid_for(b"periodic v2");
-    node_a.publish_feed(&[c2]).await.unwrap();
-
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let subbed = node_b.catalog_subscribed();
-            if subbed.iter().any(|e| {
-                e.issuer == node_a.peer_id() && e.cids.contains(&c2) && !e.cids.contains(&c1)
-            }) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .expect("le suivi périodique doit retrouver la nouvelle version publiée par A");
+    .expect("le suivi périodique doit retrouver la dernière version publiée par A");
 }
 
 /// Suivi actif (tâche 2), volet rattrapage au démarrage : B se souscrit à A,
