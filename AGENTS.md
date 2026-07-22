@@ -20,7 +20,7 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
   capacité absente, ils **ouvrent une demande de changement de contrat** (voir
   protocole plus bas) — ils ne contournent pas via du code natif ad hoc.
 
-### Contrat actuel — v4 (`CONTRACT_VERSION = 4`)
+### Contrat actuel — v5 (`CONTRACT_VERSION = 5`)
 
 > v1 → v2 : ajout de `subscribe_denylist(json) -> u64` sur `ChampiniumNode`
 > (modération fédérée activable depuis les fronts). Purement additif.
@@ -39,6 +39,12 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
 > des tags dans la DHT), `search(query)` (sync — index local, ne couvre que ce
 > que le nœud a vu passer), `search_tag(tag)` (async — découverte par tag via
 > la DHT, feeds signés vérifiés).
+>
+> v4 → v5 : **channels**. Record `FfiChannelProfile { name, description,
+> avatar_cid }` ; `FfiCatalogEntry` gagne `channel` (rupture pour qui construit
+> le record) ; `set_channel_profile(profile)` (async — persiste et republie le
+> feed courant), `channel_profile()` (sync). Côté fil : schéma unique
+> `champinium-feed/v3` (bloc channel signé), formats v1/v2 supprimés.
 
 
 Fonctions libres (smoke test async, conservées de v0) :
@@ -66,9 +72,12 @@ Objet **`ChampiniumNode`** (méthodes) :
 | `publish_feed_with(items) -> ()` | **async** | publie un feed v2 (titre/tags signés) + annonce les tags DHT |
 | `search(query) -> Vec<FfiSearchHit>` | sync | recherche locale (titres/tags du catalogue reconstruit) |
 | `search_tag(tag) -> Vec<FfiSearchHit>` | **async** | découverte par tag via la DHT (hors gossip) |
+| `set_channel_profile(profile) -> ()` | **async** | définit le profil de channel : persiste et republie le feed courant |
+| `channel_profile() -> FfiChannelProfile` | sync | profil de channel courant de ce nœud |
 
-Records `FfiCatalogEntry { issuer, seq, cids, items }`,
-`FfiContentItem { cid, title, tags }`, `FfiSearchHit { issuer, cid, title, tags }`.
+Records `FfiCatalogEntry { issuer, seq, cids, items, channel }`,
+`FfiContentItem { cid, title, tags }`, `FfiSearchHit { issuer, cid, title, tags }`,
+`FfiChannelProfile { name, description, avatar_cid }`.
 Erreur **`FfiError` typée**
 (`Moderated` / `Network` / `NotFound` / `InvalidInput` / `Internal`, chacune avec
 `msg`). Callback interface **`CatalogListener`** : `on_catalog_updated()` —

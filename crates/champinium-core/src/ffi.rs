@@ -1,4 +1,4 @@
-//! Surface UniFFI exposée aux fronts natifs (contrat v4).
+//! Surface UniFFI exposée aux fronts natifs (contrat v5).
 //!
 //! C'est la **frontière de contrat** : les fronts (Swift, C#) codent contre cet
 //! objet, jamais contre l'implémentation. Toute évolution passe par l'agent NOYAU
@@ -86,6 +86,14 @@ pub struct FfiSearchHit {
     pub tags: Vec<String>,
 }
 
+/// Identité éditoriale du channel de ce nœud (spec channels §1).
+#[derive(uniffi::Record)]
+pub struct FfiChannelProfile {
+    pub name: String,
+    pub description: String,
+    pub avatar_cid: Option<String>,
+}
+
 /// Une entrée de catalogue, vue par les fronts.
 #[derive(uniffi::Record)]
 pub struct FfiCatalogEntry {
@@ -97,6 +105,8 @@ pub struct FfiCatalogEntry {
     pub cids: Vec<String>,
     /// Contenus enrichis (mêmes CIDs, avec titre/tags signés).
     pub items: Vec<FfiContentItem>,
+    /// Identité éditoriale du channel émetteur (signée avec le feed).
+    pub channel: FfiChannelProfile,
 }
 
 /// Nœud Champinium exposé aux fronts. Encapsule le noyau ; les fronts ne font que
@@ -149,6 +159,11 @@ impl ChampiniumNode {
                         tags: i.tags,
                     })
                     .collect(),
+                channel: FfiChannelProfile {
+                    name: e.channel.name,
+                    description: e.channel.description,
+                    avatar_cid: e.channel.avatar_cid,
+                },
             })
             .collect()
     }
@@ -161,6 +176,16 @@ impl ChampiniumNode {
             .into_iter()
             .map(search_hit_to_ffi)
             .collect()
+    }
+
+    /// Profil de channel courant de CE nœud.
+    pub fn channel_profile(&self) -> FfiChannelProfile {
+        let m = self.inner.channel_profile();
+        FfiChannelProfile {
+            name: m.name,
+            description: m.description,
+            avatar_cid: m.avatar_cid,
+        }
     }
 }
 
@@ -249,6 +274,30 @@ impl ChampiniumNode {
         let dl = Denylist::from_json(&denylist_json)?;
         let purged = self.inner.subscribe_denylist(&dl).await?;
         Ok(purged as u64)
+    }
+
+    /// Définit le profil de channel : persisté, republie le feed courant.
+    pub async fn set_channel_profile(&self, profile: FfiChannelProfile) -> Result<(), FfiError> {
+        if profile.name.len() > crate::feed::MAX_CHANNEL_NAME_LEN
+            || profile.description.len() > crate::feed::MAX_CHANNEL_DESC_LEN
+        {
+            return Err(FfiError::InvalidInput {
+                msg: "profil de channel hors bornes".into(),
+            });
+        }
+        if let Some(avatar) = &profile.avatar_cid {
+            avatar.parse::<Cid>().map_err(|e| FfiError::InvalidInput {
+                msg: format!("avatar_cid invalide: {e}"),
+            })?;
+        }
+        self.inner
+            .set_channel_profile(crate::feed::ChannelMeta {
+                name: profile.name,
+                description: profile.description,
+                avatar_cid: profile.avatar_cid,
+            })
+            .await?;
+        Ok(())
     }
 
     /// Récupère et reconstruit un HLS depuis un manifeste, dans `out_dir`.
@@ -395,5 +444,45 @@ mod tests {
         let entries = node.catalog();
         assert_eq!(entries[0].items[0].title, "Aurores boréales");
         assert_eq!(entries[0].items[0].tags, vec!["nature"]);
+    }
+
+    /// Contrat v5 : profil de channel — défini via FFI, porté par le catalogue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn channel_profile_flows_through_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = open_node(dir.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+
+        node.set_channel_profile(FfiChannelProfile {
+            name: "Aurores".into(),
+            description: "Ciels nocturnes".into(),
+            avatar_cid: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(node.channel_profile().name, "Aurores");
+
+        let cid = crate::content::cid_for(b"contenu v5").to_string();
+        node.publish_feed(vec![cid]).await.unwrap();
+        assert_eq!(node.catalog()[0].channel.name, "Aurores");
+    }
+
+    /// Un profil hors bornes est une InvalidInput (UX front : erreur de saisie).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oversized_profile_is_invalid_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = open_node(dir.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        let err = node
+            .set_channel_profile(FfiChannelProfile {
+                name: "n".repeat(crate::feed::MAX_CHANNEL_NAME_LEN + 1),
+                description: String::new(),
+                avatar_cid: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FfiError::InvalidInput { .. }), "{err}");
     }
 }
