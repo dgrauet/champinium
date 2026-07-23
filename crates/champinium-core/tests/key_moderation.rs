@@ -315,3 +315,151 @@ fn unsigned_feed_forging_a_blocked_issuer_pubkey_does_not_verify() {
         "signature falsifiée: verify() doit échouer"
     );
 }
+
+// ---------------------------------------------------------------------
+// Tâche 3 : blocage LOCAL de channel — invisible partout pour ce nœud,
+// jamais publié, purement local (pas de rapport, pas de record réseau —
+// vérifié par relecture du code de `Node::block_channel`/`purge_blocked_
+// issuer` : aucun appel à `emit_report_inner`/`Command::PublishReport`).
+// ---------------------------------------------------------------------
+
+/// Bloquer localement : catalogue purgé, désabonné, stock (SeedIndex +
+/// blockstore, pins compris) purgé.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn block_channel_purges_catalog_unsubscribes_and_purges_stock() {
+    let dir = tempfile::tempdir().unwrap();
+    let node_a = node(dir.path(), "a").await;
+    let seg_cid = node_a.add(b"segment local block").await.unwrap();
+    let manifest = champinium_core::HlsManifest::new(
+        4.0,
+        vec![champinium_core::ingest::HlsSegment {
+            cid: seg_cid.to_string(),
+            duration: 4.0,
+        }],
+    );
+    let manifest_cid = node_a
+        .add(manifest.to_json().unwrap().as_bytes())
+        .await
+        .unwrap();
+    node_a.publish_feed(&[manifest_cid]).await.unwrap();
+
+    let node_b = node(dir.path(), "b").await;
+    connect(&node_a, &node_b).await;
+    node_b.subscribe(node_a.peer_id()).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let _ = node_b.fetch_feed(node_a.peer_id()).await;
+            if node_b.blockstore().has(&manifest_cid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("le seed proactif doit retenir la publication avant le blocage");
+    node_b.pin(manifest_cid).unwrap();
+    assert!(node_b.subscriptions().contains(&node_a.peer_id()));
+
+    node_b.block_channel(node_a.peer_id()).await.unwrap();
+
+    assert!(
+        !node_b.subscriptions().contains(&node_a.peer_id()),
+        "le blocage doit désabonner"
+    );
+    assert!(
+        !node_b
+            .catalog_entries()
+            .iter()
+            .any(|e| e.issuer == node_a.peer_id()),
+        "l'entrée de catalogue doit être purgée"
+    );
+    assert!(
+        !node_b.blockstore().has(&manifest_cid),
+        "le stock doit être purgé, pins compris"
+    );
+    let (used, _quota) = node_b.storage_stats();
+    assert_eq!(used, 0);
+    assert_eq!(node_b.blocked_channels(), vec![node_a.peer_id()]);
+}
+
+/// Après blocage, les feeds SUIVANTS du channel bloqué sont rejetés du
+/// catalogue (même mécanisme que la tâche 2, ensembles fusionnés), et
+/// `subscribe` y est désormais refusé avec une erreur claire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn block_channel_rejects_future_feeds_and_refuses_subscribe() {
+    let dir = tempfile::tempdir().unwrap();
+    let node_a = node(dir.path(), "a").await;
+    let node_b = node(dir.path(), "b").await;
+    connect(&node_a, &node_b).await;
+
+    node_b.block_channel(node_a.peer_id()).await.unwrap();
+
+    let err = node_b.subscribe(node_a.peer_id()).unwrap_err();
+    assert!(
+        matches!(err, CoreError::Moderation(msg) if msg.contains("bloqué localement")),
+        "message clair attendu"
+    );
+
+    let cid = cid_for(b"feed apres blocage local");
+    for _ in 0..15 {
+        node_a.publish_feed(&[cid]).await.unwrap();
+        assert!(
+            !node_b
+                .catalog_entries()
+                .iter()
+                .any(|e| e.issuer == node_a.peer_id()),
+            "un feed émis après blocage local ne doit jamais entrer au catalogue"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Débloquer : le contenu revient naturellement à la prochaine réception
+/// (gossip/DHT), sans action supplémentaire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unblock_channel_lets_feed_return_via_gossip() {
+    let dir = tempfile::tempdir().unwrap();
+    let node_a = node(dir.path(), "a").await;
+    let node_b = node(dir.path(), "b").await;
+    connect(&node_a, &node_b).await;
+
+    node_b.block_channel(node_a.peer_id()).await.unwrap();
+    node_b.unblock_channel(node_a.peer_id()).unwrap();
+    assert!(node_b.blocked_channels().is_empty());
+
+    let cid = cid_for(b"feed apres deblocage");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            node_a.publish_feed(&[cid]).await.unwrap();
+            if node_b
+                .catalog_entries()
+                .iter()
+                .any(|e| e.issuer == node_a.peer_id())
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .expect("le feed doit revenir naturellement après déblocage");
+}
+
+/// Persistance au redémarrage (même patron que
+/// `subscriptions.rs::subscriptions_persist_across_restart`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_channels_persist_across_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = Keypair::generate_ed25519().public().to_peer_id();
+    {
+        let node = Node::open(dir.path()).await.unwrap();
+        node.block_channel(target).await.unwrap();
+        assert_eq!(node.blocked_channels(), vec![target]);
+    }
+    let node = Node::open(dir.path()).await.unwrap();
+    assert_eq!(node.blocked_channels(), vec![target]);
+
+    node.unblock_channel(target).unwrap();
+    assert!(node.blocked_channels().is_empty());
+}

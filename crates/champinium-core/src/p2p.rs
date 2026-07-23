@@ -285,6 +285,12 @@ pub struct Node {
     /// sans affecter les CIDs capturés pour d'autres émetteurs toujours
     /// bloqués.
     blocked_cids: Arc<Mutex<HashMap<PeerId, HashSet<Cid>>>>,
+    /// Channels bloqués LOCALEMENT (tâche 3) : préférence strictement privée
+    /// de ce nœud, jamais publiée ni signalée sur le réseau (même patron que
+    /// `subscriptions`, dotfile `.blocked_channels`). Fusionné avec les clés
+    /// bannies par denylist (`Moderation::is_blocked_key`) pour l'enforcement
+    /// aux mêmes checkpoints (voir `is_key_blocked_inner`).
+    blocked_channels: Arc<Mutex<BTreeSet<PeerId>>>,
     /// Marqueur de vivacité : la tâche de suivi périodique n'en tient qu'un
     /// [`Weak`], ce qui lui permet de s'arrêter dès que toutes les poignées
     /// `Node` (qui clonent ce `Arc`) sont tombées, sans jamais retenir un
@@ -394,6 +400,10 @@ impl Node {
         // Abonnements locaux persistés (spec channels §2) : rechargés avant le
         // démarrage de la boucle de suivi pour que le passage initial les couvre.
         let subscriptions = Arc::new(Mutex::new(load_subscriptions(&blockstore)));
+        // Channels bloqués localement (tâche 3) : rechargés avant le démarrage
+        // de la boucle de gossip (le check d'ingestion catalogue doit en tenir
+        // compte dès le premier feed reçu).
+        let blocked_channels = Arc::new(Mutex::new(load_blocked_channels(&blockstore)));
         // Canal d'événements « catalogue mis à jour » : capacité large car un
         // abonné lent ne doit pas perdre le signal (les tics sont fusionnables :
         // rater un tic mais en recevoir un plus tard suffit à se resynchroniser).
@@ -411,6 +421,7 @@ impl Node {
             catalog_events.clone(),
             reports.clone(),
             subscriptions.clone(),
+            blocked_channels.clone(),
             blocked_cids.clone(),
             topic,
             reports_topic,
@@ -450,6 +461,7 @@ impl Node {
             catalog_events.clone(),
             subscriptions.clone(),
             moderation.clone(),
+            blocked_channels.clone(),
             blocked_cids.clone(),
             follow_interval,
         ));
@@ -496,6 +508,7 @@ impl Node {
             seed_events,
             seed_wake,
             blocked_cids,
+            blocked_channels,
             alive,
             cmd_tx,
         })
@@ -623,7 +636,7 @@ impl Node {
         let blocked_entries: Vec<CatalogEntry> = self
             .catalog_entries()
             .into_iter()
-            .filter(|e| is_key_blocked_inner(&self.moderation, &e.issuer))
+            .filter(|e| is_key_blocked_inner(&self.moderation, &self.blocked_channels, &e.issuer))
             .collect();
         for entry in &blocked_entries {
             purged += self.purge_blocked_issuer(entry.issuer, &entry.cids).await;
@@ -859,6 +872,7 @@ impl Node {
             &self.catalog_events,
             &self.subscriptions,
             &self.moderation,
+            &self.blocked_channels,
             &self.blocked_cids,
             issuer,
         )
@@ -991,7 +1005,21 @@ impl Node {
     /// `fetch_feed` **best-effort** en tâche de fond (ne bloque pas le retour ;
     /// la boucle de suivi périodique prendra le relais si ce coup d'essai
     /// échoue).
+    ///
+    /// Refuse un émetteur bloqué LOCALEMENT (tâche 3) avec
+    /// `CoreError::Moderation` — pas de refus symétrique pour une clé
+    /// seulement bannie par denylist (tâche 2) : s'abonner reste possible,
+    /// mais ses feeds resteront rejetés à l'ingestion du catalogue (voir
+    /// `fetch_feed_inner`/`handle_feed_message`), donc sans effet visible.
     pub fn subscribe(&self, issuer: PeerId) -> CoreResult<()> {
+        if self
+            .blocked_channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&issuer)
+        {
+            return Err(CoreError::Moderation("channel bloqué localement".into()));
+        }
         {
             let mut subs = self
                 .subscriptions
@@ -1005,6 +1033,7 @@ impl Node {
         let catalog_events = self.catalog_events.clone();
         let subscriptions = self.subscriptions.clone();
         let moderation = self.moderation.clone();
+        let blocked_channels = self.blocked_channels.clone();
         let blocked_cids = self.blocked_cids.clone();
         tokio::spawn(async move {
             if let Err(e) = fetch_feed_inner(
@@ -1013,6 +1042,7 @@ impl Node {
                 &catalog_events,
                 &subscriptions,
                 &moderation,
+                &blocked_channels,
                 &blocked_cids,
                 issuer,
             )
@@ -1072,6 +1102,82 @@ impl Node {
     /// Abonnements courants, triés (stabilité d'affichage).
     pub fn subscriptions(&self) -> Vec<PeerId> {
         self.subscriptions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// Bloque un channel LOCALEMENT (tâche 3) : préférence strictement privée
+    /// de ce nœud — invisible partout pour lui, plus jamais retéléchargé.
+    /// **Aucun effet réseau** : pas de rapport, pas de record signé, rien
+    /// publié (contrairement au blocage par denylist, tâche 2, qui est un
+    /// choix fédéré partagé). Persiste immédiatement, désabonne si souscrit,
+    /// puis purge catalogue + SeedIndex + blockstore — **pins compris**, la
+    /// modération locale outrepasse les pins comme la modération par
+    /// denylist — et alimente `blocked_cids` (réutilise
+    /// `purge_blocked_issuer`, mécanisme partagé avec la tâche 2). Notifie
+    /// `catalog_events` et `seed_events` (UI : le channel doit disparaître
+    /// immédiatement des deux vues, seedée ou non).
+    pub async fn block_channel(&self, issuer: PeerId) -> CoreResult<()> {
+        {
+            let mut set = self
+                .blocked_channels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            set.insert(issuer);
+            save_blocked_channels(&self.blockstore, &set)?;
+        }
+        {
+            let mut subs = self
+                .subscriptions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if subs.remove(&issuer) {
+                save_subscriptions(&self.blockstore, &subs)?;
+            }
+        }
+        let entry_cids: Vec<Cid> = self
+            .catalog_entries()
+            .into_iter()
+            .find(|e| e.issuer == issuer)
+            .map(|e| e.cids)
+            .unwrap_or_default();
+        self.purge_blocked_issuer(issuer, &entry_cids).await;
+        let _ = self.catalog_events.send(());
+        let _ = self.seed_events.send(());
+        Ok(())
+    }
+
+    /// Débloque un channel bloqué localement : retire la préférence. Rien
+    /// n'est retéléchargé automatiquement — le contenu revient naturellement
+    /// via gossip/DHT au prochain feed reçu de cet émetteur (comme n'importe
+    /// quel émetteur non souscrit et non encore vu).
+    pub fn unblock_channel(&self, issuer: PeerId) -> CoreResult<()> {
+        {
+            let mut set = self
+                .blocked_channels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            set.remove(&issuer);
+            save_blocked_channels(&self.blockstore, &set)?;
+        }
+        // Retire spécifiquement les CIDs capturés pour CET émetteur —
+        // `blocked_cids` est indexé par émetteur précisément pour permettre
+        // ce retrait isolé sans affecter d'autres émetteurs encore bloqués
+        // (ex. par denylist, tâche 2) qui partageraient un CID.
+        self.blocked_cids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&issuer);
+        Ok(())
+    }
+
+    /// Channels bloqués localement, triés (stabilité d'affichage — même
+    /// patron que `subscriptions`).
+    pub fn blocked_channels(&self) -> Vec<PeerId> {
+        self.blocked_channels
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
@@ -1432,6 +1538,39 @@ fn save_subscriptions(blockstore: &Blockstore, subs: &BTreeSet<PeerId>) -> CoreR
     Ok(())
 }
 
+/// Chemin du store de channels bloqués localement persisté (tâche 3, état
+/// PRIVÉ du nœud — jamais publié sur le réseau, même patron que
+/// `.subscriptions`).
+fn blocked_channels_path(blockstore: &Blockstore) -> PathBuf {
+    blockstore.root().join(".blocked_channels")
+}
+
+/// Charge les channels bloqués localement (vide si absent/illisible — un
+/// fichier corrompu ne doit pas empêcher le démarrage ; entrées
+/// individuellement invalides ignorées, même tolérance que
+/// `load_subscriptions`).
+fn load_blocked_channels(blockstore: &Blockstore) -> BTreeSet<PeerId> {
+    std::fs::read_to_string(blocked_channels_path(blockstore))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .map(|ids| {
+            ids.into_iter()
+                .filter_map(|s| s.parse::<PeerId>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Persiste les channels bloqués localement (JSON `Vec<String>` trié —
+/// `BTreeSet` le garantit).
+fn save_blocked_channels(blockstore: &Blockstore, blocked: &BTreeSet<PeerId>) -> CoreResult<()> {
+    let ids: Vec<String> = blocked.iter().map(PeerId::to_string).collect();
+    let json = serde_json::to_string(&ids)
+        .map_err(|e| CoreError::Network(format!("json channels bloqués: {e}")))?;
+    std::fs::write(blocked_channels_path(blockstore), json)?;
+    Ok(())
+}
+
 /// Cœur de `Node::fetch_feed`, factorisé pour être réutilisable par la boucle
 /// de suivi périodique (qui ne détient qu'un clone des champs nécessaires, pas
 /// un `Node` entier — voir `follow_loop`). Récupère le feed d'un créateur
@@ -1453,6 +1592,7 @@ async fn fetch_feed_inner(
     catalog_events: &tokio::sync::broadcast::Sender<()>,
     subscriptions: &Arc<Mutex<BTreeSet<PeerId>>>,
     moderation: &Arc<RwLock<Moderation>>,
+    blocked_channels: &Arc<Mutex<BTreeSet<PeerId>>>,
     blocked_cids: &Arc<Mutex<HashMap<PeerId, HashSet<Cid>>>>,
     issuer: PeerId,
 ) -> CoreResult<Option<Feed>> {
@@ -1481,7 +1621,7 @@ async fn fetch_feed_inner(
     let Some(feed) = best else {
         return Ok(None);
     };
-    if is_key_blocked_inner(moderation, &issuer) {
+    if is_key_blocked_inner(moderation, blocked_channels, &issuer) {
         capture_blocked_cids(blocked_cids, issuer, &feed);
         return Ok(None);
     }
@@ -1527,6 +1667,7 @@ async fn follow_loop(
     catalog_events: tokio::sync::broadcast::Sender<()>,
     subscriptions: Arc<Mutex<BTreeSet<PeerId>>>,
     moderation: Arc<RwLock<Moderation>>,
+    blocked_channels: Arc<Mutex<BTreeSet<PeerId>>>,
     blocked_cids: Arc<Mutex<HashMap<PeerId, HashSet<Cid>>>>,
     follow_interval: Duration,
 ) {
@@ -1547,6 +1688,7 @@ async fn follow_loop(
                 &catalog_events,
                 &subscriptions,
                 &moderation,
+                &blocked_channels,
                 &blocked_cids,
                 issuer,
             )
@@ -1573,16 +1715,26 @@ fn is_blocked_inner(moderation: &Arc<RwLock<Moderation>>, cid: &Cid) -> bool {
         .is_blocked(cid)
 }
 
-/// Vrai si `issuer` est une clé bannie par une denylist souscrite. Utilisé
-/// aux points d'entrée du catalogue (gossip, DHT) pour rejeter les feeds
-/// d'une clé bloquée AVANT `Catalog::apply` — voir la doc de
-/// `handle_feed_message` pour la justification de ce choix (call site plutôt
-/// qu'un paramètre de `apply`).
-fn is_key_blocked_inner(moderation: &Arc<RwLock<Moderation>>, issuer: &PeerId) -> bool {
+/// Vrai si `issuer` est bloqué : par denylist souscrite (`is_blocked_key`,
+/// tâche 2) OU par blocage LOCAL de channel (`blocked_channels`, tâche 3) —
+/// ensembles fusionnés, même enforcement aux trois checkpoints. Utilisé aux
+/// points d'entrée du catalogue (gossip, DHT) pour rejeter les feeds d'une
+/// clé bloquée AVANT `Catalog::apply` — voir la doc de `handle_feed_message`
+/// pour la justification de ce choix (call site plutôt qu'un paramètre de
+/// `apply`).
+fn is_key_blocked_inner(
+    moderation: &Arc<RwLock<Moderation>>,
+    blocked_channels: &Arc<Mutex<BTreeSet<PeerId>>>,
+    issuer: &PeerId,
+) -> bool {
     moderation
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .is_blocked_key(issuer)
+        || blocked_channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(issuer)
 }
 
 /// Alimente `blocked_cids` avec les CIDs d'un feed d'une clé bloquée,
@@ -2254,6 +2406,8 @@ struct EventLoop {
     catalog_events: tokio::sync::broadcast::Sender<()>,
     reports: Arc<Mutex<ReportBook>>,
     subscriptions: Arc<Mutex<BTreeSet<PeerId>>>,
+    /// Voir la doc du champ `Node::blocked_channels`.
+    blocked_channels: Arc<Mutex<BTreeSet<PeerId>>>,
     /// Voir la doc du champ `Node::blocked_cids` — alimenté ici quand un feed
     /// gossip d'une clé bloquée est vu passer (`handle_feed_message`).
     blocked_cids: Arc<Mutex<HashMap<PeerId, HashSet<Cid>>>>,
@@ -2282,6 +2436,7 @@ impl EventLoop {
         catalog_events: tokio::sync::broadcast::Sender<()>,
         reports: Arc<Mutex<ReportBook>>,
         subscriptions: Arc<Mutex<BTreeSet<PeerId>>>,
+        blocked_channels: Arc<Mutex<BTreeSet<PeerId>>>,
         blocked_cids: Arc<Mutex<HashMap<PeerId, HashSet<Cid>>>>,
         feeds_topic: gossipsub::IdentTopic,
         reports_topic: gossipsub::IdentTopic,
@@ -2295,6 +2450,7 @@ impl EventLoop {
             catalog_events,
             reports,
             subscriptions,
+            blocked_channels,
             blocked_cids,
             feeds_topic,
             reports_topic,
@@ -2587,7 +2743,13 @@ impl EventLoop {
         let acceptance = match Feed::from_json(data) {
             Ok(feed) => match feed.verify() {
                 Ok(()) => match feed.issuer_peer_id() {
-                    Ok(issuer) if is_key_blocked_inner(&self.moderation, &issuer) => {
+                    Ok(issuer)
+                        if is_key_blocked_inner(
+                            &self.moderation,
+                            &self.blocked_channels,
+                            &issuer,
+                        ) =>
+                    {
                         capture_blocked_cids(&self.blocked_cids, issuer, &feed);
                         gossipsub::MessageAcceptance::Reject
                     }
