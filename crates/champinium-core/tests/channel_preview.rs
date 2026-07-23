@@ -133,9 +133,13 @@ async fn blocked_channel_remains_resolvable() {
     let cid = cid_for(b"contenu bloque");
     node_a.publish_feed(&[cid]).await.unwrap();
 
-    // B se souscrit d'abord pour garantir que le feed de A est bien connu
-    // (peu importe : le blocage purge le catalogue de toute façon).
-    node_b.subscribe(node_a.peer_id()).unwrap();
+    // Première résolution (A pas encore bloqué) : elle peuple le catalogue via
+    // la voie DHT normale, sans abonnement. On NE s'abonne PAS à A : un
+    // abonnement démarrerait le `follow_loop`, dont un `apply` de feed en vol
+    // pourrait atterrir au catalogue juste après le blocage et faire échouer
+    // l'assertion finale de non-réinsertion (flake CI observé). `resolve_channel`
+    // récupère le feed par DHT indépendamment de tout abonnement, donc
+    // l'abonnement était inutile ici.
     let _ = resolve_until_ok(&node_b, node_a.peer_id()).await;
 
     node_b.block_channel(node_a.peer_id()).await.unwrap();
