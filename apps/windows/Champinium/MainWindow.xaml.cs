@@ -142,7 +142,7 @@ public sealed partial class MainWindow : Window
         var dialog = new ContentDialog
         {
             Title = "Bloquer ce channel ?",
-            Content = $"« {group.DisplayName} » disparaîtra du catalogue. Réversible depuis Réglages de seed.",
+            Content = $"« {group.DisplayName} » disparaîtra du catalogue. Réversible depuis « Channels bloqués ».",
             PrimaryButtonText = "Bloquer",
             CloseButtonText = "Annuler",
             DefaultButton = ContentDialogButton.Close,
