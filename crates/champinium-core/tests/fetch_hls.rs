@@ -12,7 +12,32 @@ use champinium_core::identity::load_or_generate;
 use champinium_core::ingest::HlsSegment;
 use champinium_core::{Blockstore, Feed, HlsManifest, Moderation, Node};
 use libp2p::identity::Keypair;
+use std::path::PathBuf;
 use std::time::Duration;
+
+/// `fetch_hls` en réessayant jusqu'au succès sous une échéance : après un
+/// `dial`, la connexion est initiée mais les provider records du créateur
+/// peuvent ne pas être encore visibles côté consommateur (course
+/// d'établissement Kademlia/connexion) — un `fetch_hls` immédiat échouerait
+/// alors vite en `NoProviders`. On réessaie (déterministe, sans sleep fixe
+/// fragile) plutôt que de supposer la disponibilité instantanée (flake CI
+/// Windows observé). Réservé aux chemins qui DOIVENT réussir.
+async fn fetch_hls_until_ok(
+    node: &Node,
+    manifest_cid: champinium_core::Cid,
+    out: &std::path::Path,
+) -> PathBuf {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match node.fetch_hls(manifest_cid, out).await {
+                Ok(playlist) => return playlist,
+                Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+            }
+        }
+    })
+    .await
+    .expect("fetch_hls doit finir par réussir sous l'échéance")
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fetch_hls_leaves_no_partial_output_on_failure() {
@@ -137,13 +162,7 @@ async fn fetch_hls_stores_content_for_subscribed_channel() {
     );
 
     let out = dir.path().join("hls-out-sub");
-    let playlist = tokio::time::timeout(
-        Duration::from_secs(30),
-        node_consumer.fetch_hls(manifest_cid, &out),
-    )
-    .await
-    .expect("fetch_hls doit se terminer")
-    .expect("fetch_hls doit réussir");
+    let playlist = fetch_hls_until_ok(&node_consumer, manifest_cid, &out).await;
     assert!(playlist.exists());
 
     assert!(
@@ -208,13 +227,7 @@ async fn fetch_hls_streams_content_for_unsubscribed_channel() {
     assert!(node_consumer.catalog_subscribed().is_empty());
 
     let out = dir.path().join("hls-out-unsub");
-    let playlist = tokio::time::timeout(
-        Duration::from_secs(30),
-        node_consumer.fetch_hls(manifest_cid, &out),
-    )
-    .await
-    .expect("fetch_hls doit se terminer")
-    .expect("fetch_hls doit réussir");
+    let playlist = fetch_hls_until_ok(&node_consumer, manifest_cid, &out).await;
     assert!(playlist.exists(), "index.m3u8 doit exister dans out_dir");
 
     assert!(
