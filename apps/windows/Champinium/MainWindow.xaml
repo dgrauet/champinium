@@ -60,6 +60,7 @@
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*" />
                             <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
                         </Grid.ColumnDefinitions>
                         <StackPanel Grid.Column="0" Spacing="0">
                             <TextBlock Text="{Binding DisplayName}"
@@ -76,6 +77,11 @@
                         </StackPanel>
                         <Button Grid.Column="1" Content="{Binding SubscribeLabel}"
                                 Click="OnToggleSubscriptionClick" />
+                        <!-- Blocage local de channel (tâche d/6) — Explorer uniquement,
+                             voir ChannelGroup.CanBlock. Confirmation en code-behind. -->
+                        <Button Grid.Column="2" Content="Bloquer"
+                                Visibility="{Binding CanBlock, Converter={StaticResource BooleanToVisibility}}"
+                                Click="OnBlockClick" />
                     </Grid>
                     <ItemsControl ItemsSource="{Binding Items}">
                         <ItemsControl.ItemTemplate>
@@ -124,6 +130,7 @@
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*" />
                 <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
             <StackPanel Grid.Column="0" Spacing="2">
                 <TextBlock Text="Champinium" Style="{StaticResource TitleTextBlockStyle}" />
@@ -157,6 +164,35 @@
                             <TextBlock Text="{Binding StorageStatsText, Mode=OneWay}"
                                        Style="{StaticResource CaptionTextBlockStyle}"
                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        </StackPanel>
+                    </Flyout>
+                </Button.Flyout>
+            </Button>
+            <!-- Réglages : liste des channels bloqués localement (tâche d/6) —
+                 même patron de Flyout que "Réglages de seed". -->
+            <Button Grid.Column="2" VerticalAlignment="Top" Content="Channels bloqués">
+                <Button.Flyout>
+                    <Flyout>
+                        <StackPanel Spacing="8" Width="280">
+                            <TextBlock Text="Channels bloqués" Style="{StaticResource BaseTextBlockStyle}" />
+                            <ListView ItemsSource="{Binding BlockedChannels, Mode=OneWay}"
+                                      SelectionMode="None"
+                                      MaxHeight="200">
+                                <ListView.ItemTemplate>
+                                    <DataTemplate>
+                                        <Grid ColumnSpacing="8">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="Auto" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Grid.Column="0" Text="{Binding DisplayText}"
+                                                       FontFamily="Consolas"
+                                                       Style="{StaticResource CaptionTextBlockStyle}" />
+                                            <Button Grid.Column="1" Content="Débloquer" Click="OnUnblockClick" />
+                                        </Grid>
+                                    </DataTemplate>
+                                </ListView.ItemTemplate>
+                            </ListView>
                         </StackPanel>
                     </Flyout>
                 </Button.Flyout>

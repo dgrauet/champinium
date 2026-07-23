@@ -72,6 +72,19 @@ public sealed class ChannelGroup
     /// <summary>Libellé du bouton — calculé depuis l'état d'abonnement réel
     /// (dans l'onglet Abonnements, toujours vrai par construction).</summary>
     public string SubscribeLabel => IsSubscribed ? "Se désabonner" : "S'abonner";
+
+    /// <summary>Vrai si le bouton Bloquer doit être affiché pour ce groupe
+    /// (Explorer uniquement — même décision que le jumeau macOS ; le gabarit
+    /// d'en-tête est partagé avec Abonnements, où le bouton reste masqué).</summary>
+    public bool CanBlock { get; init; }
+}
+
+/// <summary>Un channel bloqué localement — PeerId brut + affichage tronqué
+/// (le nom n'est plus au catalogue après purge, voir contrat v8).</summary>
+public sealed class BlockedChannel
+{
+    public string PeerId { get; init; } = "";
+    public string DisplayText => PeerId.Length > 14 ? $"{PeerId[..8]}…{PeerId[^4..]}" : PeerId;
 }
 
 /// <summary>
@@ -163,6 +176,10 @@ public sealed class NodeViewModel : INotifyPropertyChanged
     /// <summary>Résultats de la recherche locale (titres/tags) — remplace les deux
     /// listes ci-dessus tant que <see cref="SearchQuery"/> n'est pas vide.</summary>
     public ObservableCollection<CatalogCid> SearchResults { get; } = new();
+
+    /// <summary>Channels bloqués localement (PeerIds triés, `blocked_channels()`) —
+    /// préférence privée de ce nœud, jamais publiée (contrat v8).</summary>
+    public ObservableCollection<BlockedChannel> BlockedChannels { get; } = new();
 
     /// <summary>Requête de recherche locale (liaison TextBox) ; vide = catalogues normaux.</summary>
     private string _searchQuery = "";
@@ -328,12 +345,19 @@ public sealed class NodeViewModel : INotifyPropertyChanged
         SetStorageStats(_node.StorageStats());
         // Abonnements seul montre le pin : épingler un contenu hors abonnement
         // n'a pas de sens dans cette UI (même décision que le jumeau macOS).
-        Fill(SubscribedGroups, _node.CatalogSubscribed(), showPin: true);
-        Fill(ExploreGroups, _node.Catalog(), showPin: false);
+        Fill(SubscribedGroups, _node.CatalogSubscribed(), showPin: true, showBlock: false);
+        Fill(ExploreGroups, _node.Catalog(), showPin: false, showBlock: true);
+
+        BlockedChannels.Clear();
+        foreach (var peerId in _node.BlockedChannels())
+        {
+            BlockedChannels.Add(new BlockedChannel { PeerId = peerId });
+        }
+
         Status = $"catalogue: {ExploreGroups.Count} créateur(s), {SubscribedGroups.Count} souscrit(s)";
     }
 
-    private void Fill(ObservableCollection<ChannelGroup> target, IReadOnlyList<FfiCatalogEntry> entries, bool showPin)
+    private void Fill(ObservableCollection<ChannelGroup> target, IReadOnlyList<FfiCatalogEntry> entries, bool showPin, bool showBlock)
     {
         target.Clear();
         foreach (var entry in entries)
@@ -346,6 +370,7 @@ public sealed class NodeViewModel : INotifyPropertyChanged
                 DisplayName = entry.channel.name.Length > 0 ? entry.channel.name : Truncate(entry.issuer),
                 SeededCount = entry.seededCount,
                 TotalCount = entry.totalCount,
+                CanBlock = showBlock,
             };
             foreach (var item in entry.items)
             {
@@ -410,6 +435,50 @@ public sealed class NodeViewModel : INotifyPropertyChanged
                 await _node.SubscribeChannel(peerId);
                 SubscriptionStatus = "abonné";
             }
+            RefreshCatalog();
+        }
+        catch (Exception ex)
+        {
+            SubscriptionStatus = DescribeSubscriptionError(ex);
+        }
+    }
+
+    /// <summary>Bloque un channel localement (bouton par groupe, Explorer
+    /// uniquement — voir <see cref="ChannelGroup.CanBlock"/>). Le channel
+    /// disparaît du catalogue via le rafraîchissement réactif du
+    /// <see cref="CatalogRefresher"/> ; le <see cref="RefreshCatalog"/> explicite
+    /// ici donne un retour immédiat.</summary>
+    public async Task BlockChannelAsync(string linkOrPeerId)
+    {
+        if (_node is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await _node.BlockChannel(linkOrPeerId);
+            SubscriptionStatus = "channel bloqué";
+            RefreshCatalog();
+        }
+        catch (Exception ex)
+        {
+            SubscriptionStatus = DescribeSubscriptionError(ex);
+        }
+    }
+
+    /// <summary>Débloque un channel bloqué localement.</summary>
+    public async Task UnblockChannelAsync(string peerId)
+    {
+        if (_node is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await _node.UnblockChannel(peerId);
+            SubscriptionStatus = "channel débloqué";
             RefreshCatalog();
         }
         catch (Exception ex)
