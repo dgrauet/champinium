@@ -66,8 +66,8 @@ public sealed class ChannelGroup
     public string SeedStatusText => TotalCount == 0
         ? ""
         : SeededCount == TotalCount
-            ? "à jour"
-            : $"seed en cours ({SeededCount}/{TotalCount})";
+            ? "· à jour"
+            : $"· seed en cours ({SeededCount}/{TotalCount})";
 
     /// <summary>Libellé du bouton — calculé depuis l'état d'abonnement réel
     /// (dans l'onglet Abonnements, toujours vrai par construction).</summary>

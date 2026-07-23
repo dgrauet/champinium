@@ -2,9 +2,14 @@
 
 Le nœud seede même sans interface ouverte, via le démon **`champinium-seed`** :
 au démarrage puis périodiquement, il réannonce dans la DHT tous les CIDs qu'il
-détient (provider records) et republie son feed signé. Modèle
-*seed-what-you-consume*. La modération par défaut reste active (un seeder ne
-ressert jamais un contenu matché).
+détient (provider records). Ce qu'il détient, c'est le noyau qui en décide —
+la **boucle de seed proactif** retient et resert les publications des
+channels **souscrits** par ce nœud, sous quota, avec éviction par réplication
+et pins (voir `docs/architecture.md` §6 bis) ; le démon ne publie pas de feed
+lui-même (rôle du nœud créateur) ni ne réplique de contenu hors abonnements
+(seed-what-you-consume et la réplication opportuniste toutes-directions ont
+été retirés). La modération par défaut reste active (un seeder ne ressert
+jamais un contenu matché).
 
 ```sh
 champinium-seed --data-dir <dir> [--listen <multiaddr>] \
