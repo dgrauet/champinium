@@ -20,11 +20,23 @@ public sealed class CatalogCid
     public string Title { get; init; } = "";
     public IReadOnlyList<string> Tags { get; init; } = Array.Empty<string>();
 
+    /// <summary>Vrai si CE nœud a épinglé ce manifeste (lot c) — n'a de sens
+    /// que dans l'onglet Abonnements ; toujours faux côté Explorer/recherche.</summary>
+    public bool IsPinned { get; init; }
+
+    /// <summary>Vrai si le bouton de pin doit être affiché pour cette ligne
+    /// (Abonnements uniquement — même décision que le jumeau macOS ; le
+    /// gabarit d'item est partagé avec Explorer, où le bouton reste masqué).</summary>
+    public bool CanPin { get; init; }
+
     /// <summary>Libellé principal : le titre, ou le CID si sans titre.</summary>
     public string Display => Title.Length > 0 ? Title : Cid;
 
     /// <summary>Tags joints pour l'affichage (vide si aucun).</summary>
     public string TagsText => string.Join(" · ", Tags);
+
+    /// <summary>Libellé du bouton pin — "Garder" (non épinglé) / "Oublier" (épinglé).</summary>
+    public string PinLabel => IsPinned ? "Oublier" : "Garder";
 }
 
 /// <summary>
@@ -44,6 +56,18 @@ public sealed class ChannelGroup
     public string DisplayName { get; init; } = "";
 
     public string SeqText => $"seq {Seq}";
+
+    /// <summary>Couverture du seed proactif pour ce feed (lot c).</summary>
+    public uint SeededCount { get; init; }
+    public uint TotalCount { get; init; }
+
+    /// <summary>« à jour » si tout est seedé localement, sinon « seed en cours
+    /// (x/y) ». Un feed vide (rien à seeder) n'affiche rien.</summary>
+    public string SeedStatusText => TotalCount == 0
+        ? ""
+        : SeededCount == TotalCount
+            ? "à jour"
+            : $"seed en cours ({SeededCount}/{TotalCount})";
 
     /// <summary>Libellé du bouton — calculé depuis l'état d'abonnement réel
     /// (dans l'onglet Abonnements, toujours vrai par construction).</summary>
@@ -69,9 +93,22 @@ public sealed class NodeViewModel : INotifyPropertyChanged
         public void OnCatalogUpdated() => _onUpdate();
     }
 
+    /// <summary>Pont vers le callback de seed proactif (lot c) — même patron que
+    /// <see cref="CatalogRefresher"/> : re-dispatch, puis le VM relit
+    /// `StorageStats()`/le catalogue (la couverture voyage dans FfiCatalogEntry).</summary>
+    private sealed class SeedRefresher : SeedListener
+    {
+        private readonly Action _onUpdate;
+
+        public SeedRefresher(Action onUpdate) => _onUpdate = onUpdate;
+
+        public void OnSeedUpdated() => _onUpdate();
+    }
+
     private ChampiniumNode? _node;
     private Microsoft.UI.Dispatching.DispatcherQueue? _dispatcher;
     private CatalogRefresher? _listener;
+    private SeedRefresher? _seedListener;
 
     /// <summary>Répertoire de la lecture en cours (supprimé au changement de contenu).</summary>
     private string? _currentPlayDir;
@@ -142,6 +179,35 @@ public sealed class NodeViewModel : INotifyPropertyChanged
     /// <summary>PeerIds actuellement souscrits (pour calculer l'état des boutons Explorer).</summary>
     private HashSet<string> _subscriptions = new();
 
+    /// <summary>`(octets_utilisés, quota_octets)` du seed proactif de ce nœud (lot c).</summary>
+    private FfiStorageStats _storageStats = new(0, 0);
+    public FfiStorageStats StorageStats
+    {
+        get => _storageStats;
+        private set
+        {
+            if (Equals(_storageStats, value))
+            {
+                return;
+            }
+            _storageStats = value;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(StorageStats)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(StorageStatsText)));
+        }
+    }
+
+    /// <summary>Quota de seeding saisi par l'utilisateur, en Go (liaison TextBox).</summary>
+    private string _quotaField = "";
+    public string QuotaField
+    {
+        get => _quotaField;
+        set => Set(ref _quotaField, value);
+    }
+
+    /// <summary>Affichage humain de l'usage courant (liaison TextBlock du popover de réglages).</summary>
+    public string StorageStatsText =>
+        $"Utilisé : {GigabytesText(StorageStats.usedBytes)} Go / {GigabytesText(StorageStats.quotaBytes)} Go";
+
     /// <summary>Émis quand un abonnement/désabonnement échoue ou réussit — la vue
     /// affiche un message court (distinct des erreurs réseau pour un refus de
     /// modération, distinct des soucis réseau).</summary>
@@ -193,8 +259,13 @@ public sealed class NodeViewModel : INotifyPropertyChanged
                 () => _dispatcher?.TryEnqueue(RefreshCatalog));
             await node.SetCatalogListener(_listener);
 
+            _seedListener = new SeedRefresher(
+                () => _dispatcher?.TryEnqueue(RefreshCatalog));
+            await node.SetSeedListener(_seedListener);
+
             Status = "nœud en ligne";
             RefreshCatalog();
+            QuotaField = GigabytesText(StorageStats.quotaBytes);
         }
         catch (Exception ex)
         {
@@ -255,12 +326,15 @@ public sealed class NodeViewModel : INotifyPropertyChanged
             return;
         }
 
-        Fill(SubscribedGroups, _node.CatalogSubscribed());
-        Fill(ExploreGroups, _node.Catalog());
+        StorageStats = _node.StorageStats();
+        // Abonnements seul montre le pin : épingler un contenu hors abonnement
+        // n'a pas de sens dans cette UI (même décision que le jumeau macOS).
+        Fill(SubscribedGroups, _node.CatalogSubscribed(), showPin: true);
+        Fill(ExploreGroups, _node.Catalog(), showPin: false);
         Status = $"catalogue: {ExploreGroups.Count} créateur(s), {SubscribedGroups.Count} souscrit(s)";
     }
 
-    private void Fill(ObservableCollection<ChannelGroup> target, IReadOnlyList<FfiCatalogEntry> entries)
+    private void Fill(ObservableCollection<ChannelGroup> target, IReadOnlyList<FfiCatalogEntry> entries, bool showPin)
     {
         target.Clear();
         foreach (var entry in entries)
@@ -271,6 +345,8 @@ public sealed class NodeViewModel : INotifyPropertyChanged
                 Seq = entry.seq,
                 IsSubscribed = _subscriptions.Contains(entry.issuer),
                 DisplayName = entry.channel.name.Length > 0 ? entry.channel.name : Truncate(entry.issuer),
+                SeededCount = entry.seededCount,
+                TotalCount = entry.totalCount,
             };
             foreach (var item in entry.items)
             {
@@ -279,6 +355,8 @@ public sealed class NodeViewModel : INotifyPropertyChanged
                     Cid = item.cid,
                     Title = item.title,
                     Tags = item.tags,
+                    IsPinned = showPin && entry.pinned.Contains(item.cid),
+                    CanPin = showPin,
                 });
             }
             target.Add(group);
@@ -340,6 +418,62 @@ public sealed class NodeViewModel : INotifyPropertyChanged
             SubscriptionStatus = DescribeSubscriptionError(ex);
         }
     }
+
+    /// <summary>Définit le quota de seed depuis <see cref="QuotaField"/> (Go).
+    /// Ignore une saisie non numérique plutôt que de planter.</summary>
+    public async Task SetSeedQuotaAsync()
+    {
+        if (_node is null || !double.TryParse(
+                QuotaField.Replace(',', '.'),
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var gigabytes))
+        {
+            return;
+        }
+
+        try
+        {
+            var bytes = (ulong)Math.Max(0, gigabytes * 1_000_000_000);
+            await _node.SetSeedQuota(bytes);
+            SubscriptionStatus = "quota mis à jour";
+            RefreshCatalog();
+        }
+        catch (Exception)
+        {
+            SubscriptionStatus = "quota: erreur";
+        }
+    }
+
+    /// <summary>Bascule l'épinglage d'un manifeste (bouton par publication,
+    /// Abonnements uniquement — voir <see cref="CatalogCid.CanPin"/>).</summary>
+    public async Task TogglePinAsync(string manifestCid, bool currentlyPinned)
+    {
+        if (_node is null)
+        {
+            return;
+        }
+
+        try
+        {
+            if (currentlyPinned)
+            {
+                await _node.UnpinContent(manifestCid);
+            }
+            else
+            {
+                await _node.PinContent(manifestCid);
+            }
+            RefreshCatalog();
+        }
+        catch (Exception)
+        {
+            SubscriptionStatus = "épinglage: erreur";
+        }
+    }
+
+    private static string GigabytesText(ulong bytes) =>
+        (bytes / 1_000_000_000.0).ToString("F1", System.Globalization.CultureInfo.InvariantCulture);
 
     /// <summary>Erreur typée du contrat : un refus de modération est un blocage
     /// volontaire, présenté comme tel (distinct d'une panne réseau).</summary>
