@@ -11,13 +11,14 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use champinium_core::p2p::ChannelPreview;
 use champinium_core::{channel_link, paths, CatalogEntry, Cid, CoreError, Node, PeerId};
 use gstreamer::prelude::*;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
     Application, ApplicationWindow, Box as GtkBox, Button, ButtonsType, Entry, Label, ListBox,
-    MessageDialog, Orientation, ResponseType, ScrolledWindow, Stack, StackSwitcher,
+    MessageDialog, Orientation, ResponseType, ScrolledWindow, Spinner, Stack, StackSwitcher,
 };
 use tokio::runtime::Runtime;
 
@@ -120,7 +121,11 @@ fn build_ui(app: &Application) {
         .placeholder_text("Lien de channel ou PeerId…")
         .hexpand(true)
         .build();
-    let subscribe_link_btn = Button::with_label("S'abonner");
+    // « Aperçu » résout le lien/PeerId SANS abonner (l'ancien abonnement
+    // direct au collage est supprimé, tâche 3) — l'abonnement se décide
+    // depuis la feuille d'aperçu (`open_channel_preview`).
+    let preview_link_btn = Button::with_label("Aperçu");
+    let preview_spinner = Spinner::new();
     let copy_link_btn = Button::with_label("Copier le lien de mon channel");
     let link_msg = Label::new(None);
     link_msg.set_xalign(0.0);
@@ -128,7 +133,8 @@ fn build_ui(app: &Application) {
 
     let explorer_toolbar = GtkBox::new(Orientation::Horizontal, 8);
     explorer_toolbar.append(&channel_entry);
-    explorer_toolbar.append(&subscribe_link_btn);
+    explorer_toolbar.append(&preview_spinner);
+    explorer_toolbar.append(&preview_link_btn);
     explorer_toolbar.append(&copy_link_btn);
 
     let explorer_page = GtkBox::new(Orientation::Vertical, 6);
@@ -300,16 +306,22 @@ fn build_ui(app: &Application) {
         });
     }
 
-    // Abonnement par lien (`channel_link::parse`, tolérant : lien ou PeerId nu).
+    // Aperçu par lien (`channel_link::parse`, tolérant : lien ou PeerId nu) —
+    // résout SANS abonner, ouvre la feuille d'aperçu en cas de succès. Le
+    // fetch réseau (`resolve_channel`) tourne sur le runtime tokio, jamais sur
+    // le thread GTK (voir `resolve_channel_inner`).
     {
         let ui = ui.clone();
+        let window = window.clone();
         let status = status.clone();
         let subs_list = subs_list.clone();
         let explorer_list = explorer_list.clone();
         let search_entry = search_entry.clone();
         let channel_entry = channel_entry.clone();
         let link_msg = link_msg.clone();
-        subscribe_link_btn.connect_clicked(move |_| {
+        let preview_link_btn = preview_link_btn.clone();
+        let preview_spinner = preview_spinner.clone();
+        preview_link_btn.clone().connect_clicked(move |_| {
             let text = channel_entry.text().to_string();
             let peer = match channel_link::parse(&text) {
                 Ok(peer) => peer,
@@ -325,24 +337,39 @@ fn build_ui(app: &Application) {
             };
             let rt = ui.rt.clone();
             let ui = ui.clone();
+            let window = window.clone();
             let status = status.clone();
             let subs_list = subs_list.clone();
             let explorer_list = explorer_list.clone();
             let search_entry = search_entry.clone();
             let channel_entry = channel_entry.clone();
+            let link_msg = link_msg.clone();
+            let preview_link_btn = preview_link_btn.clone();
+            let preview_spinner = preview_spinner.clone();
+            preview_link_btn.set_sensitive(false);
+            preview_spinner.set_spinning(true);
             glib::spawn_future_local(async move {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 rt.spawn(async move {
-                    let _ = tx.send(subscribe_inner(&node, peer).await);
+                    let _ = tx.send(resolve_channel_inner(&node, peer).await);
                 });
+                preview_link_btn.set_sensitive(true);
+                preview_spinner.set_spinning(false);
                 match rx.await {
-                    Ok(Ok(())) => {
+                    Ok(Ok(preview)) => {
                         channel_entry.set_text("");
-                        status.set_text("abonné");
-                        refresh_lists(&ui, &status, &subs_list, &explorer_list, &search_entry);
+                        open_channel_preview(
+                            &ui,
+                            &window,
+                            &status,
+                            &subs_list,
+                            &explorer_list,
+                            &search_entry,
+                            preview,
+                        );
                     }
-                    Ok(Err(e)) => status.set_text(&describe_core_error(&e, "abonnement")),
-                    Err(_) => status.set_text("tâche annulée"),
+                    Ok(Err(e)) => link_msg.set_text(&describe_preview_error(&e)),
+                    Err(_) => link_msg.set_text("tâche annulée"),
                 }
             });
         });
@@ -682,6 +709,19 @@ fn describe_core_error(e: &CoreError, context: &str) -> String {
     }
 }
 
+/// Message d'erreur pour `resolve_channel` (tâche 3) — jamais refusé par la
+/// modération (voir doc `resolve_channel`) ; seul un émetteur sans fournisseur
+/// (aucun résultat DHT ni catalogue) est attendu ici. `InvalidInput` est géré
+/// en amont par `channel_link::parse` (voir l'appelant).
+fn describe_preview_error(e: &CoreError) -> String {
+    match e {
+        CoreError::NoProviders(_) | CoreError::BlockNotFound(_) => {
+            "channel introuvable pour l'instant".to_string()
+        }
+        other => format!("aperçu : {other}"),
+    }
+}
+
 /// Une ligne de contenu : titre (ou CID si sans titre) + tags + bouton de pin
 /// (Abonnements uniquement, quand `pinned` est fourni) + bouton « Lire ».
 #[allow(clippy::too_many_arguments)]
@@ -981,6 +1021,164 @@ fn populate_blocked_channels(ui: &Rc<Ui>, win: &gtk::Window, list: &ListBox) {
     }
 }
 
+/// Feuille d'aperçu d'un channel résolu par lien/PeerId (tâche 3) — même
+/// patron de fenêtre dédiée que `open_seed_settings`/`open_blocked_channels`.
+/// En-tête (nom/description, avatar si présent — sinon rien, pas de
+/// placeholder cassé) + liste des publications + pied selon
+/// abonné/bloqué : bouton S'abonner/Se désabonner, ou libellé "Channel
+/// bloqué" sans bouton. Ferme la fenêtre après une action réussie — les
+/// listes se rafraîchissent réactivement via le `CatalogListener` du core, le
+/// `refresh_lists` explicite ici donne un retour immédiat (même choix que le
+/// reste de ce fichier).
+#[allow(clippy::too_many_arguments)]
+fn open_channel_preview(
+    ui: &Rc<Ui>,
+    parent: &ApplicationWindow,
+    status: &Label,
+    subs_list: &ListBox,
+    explorer_list: &ListBox,
+    search_entry: &Entry,
+    preview: ChannelPreview,
+) {
+    let win = gtk::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .title("Aperçu du channel")
+        .default_width(360)
+        .build();
+
+    let content = GtkBox::new(Orientation::Vertical, 8);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+
+    let name = if preview.channel.name.is_empty() {
+        truncate_peer_id(&preview.issuer.to_string())
+    } else {
+        preview.channel.name.clone()
+    };
+    let name_label = Label::new(Some(&name));
+    name_label.set_xalign(0.0);
+    name_label.add_css_class("heading");
+    content.append(&name_label);
+
+    if !preview.channel.description.is_empty() {
+        let desc_label = Label::new(Some(&preview.channel.description));
+        desc_label.set_xalign(0.0);
+        desc_label.set_wrap(true);
+        content.append(&desc_label);
+    }
+
+    // Avatar si présent — sinon rien du tout (pas de placeholder cassé) :
+    // c'est un CID, pas d'image chargée ici (même choix que les jumeaux
+    // macOS/Windows, qui n'affichent qu'une mention texte).
+    if let Some(avatar_cid) = &preview.channel.avatar_cid {
+        if !avatar_cid.is_empty() {
+            let avatar_label = Label::new(Some(&format!("avatar : {avatar_cid}")));
+            avatar_label.set_xalign(0.0);
+            avatar_label.add_css_class("dim-label");
+            content.append(&avatar_label);
+        }
+    }
+
+    let items_title = Label::new(Some("Publications"));
+    items_title.set_xalign(0.0);
+    items_title.add_css_class("heading");
+    content.append(&items_title);
+
+    if preview.items.is_empty() {
+        let empty = Label::new(Some("aucune publication"));
+        empty.set_xalign(0.0);
+        empty.add_css_class("dim-label");
+        content.append(&empty);
+    } else {
+        let items_list = ListBox::new();
+        for item in &preview.items {
+            let row = GtkBox::new(Orientation::Vertical, 2);
+            let title_text = if item.title.is_empty() {
+                item.cid.to_string()
+            } else {
+                item.title.clone()
+            };
+            let title_label = Label::new(Some(&title_text));
+            title_label.set_xalign(0.0);
+            row.append(&title_label);
+            if !item.tags.is_empty() {
+                let tags_label = Label::new(Some(&item.tags.join(" · ")));
+                tags_label.set_xalign(0.0);
+                tags_label.add_css_class("dim-label");
+                row.append(&tags_label);
+            }
+            items_list.append(&row);
+        }
+        let scroller = ScrolledWindow::builder()
+            .child(&items_list)
+            .min_content_height(160)
+            .build();
+        content.append(&scroller);
+    }
+
+    // Pied : bouton selon abonné/bloqué — présentation pure, aucun état
+    // recalculé côté front (`subscribed`/`blocked` viennent de l'aperçu).
+    if preview.blocked {
+        let blocked_label = Label::new(Some("Channel bloqué"));
+        blocked_label.set_xalign(0.0);
+        content.append(&blocked_label);
+    } else {
+        let action_btn = Button::with_label(if preview.subscribed {
+            "Se désabonner"
+        } else {
+            "S'abonner"
+        });
+        let issuer = preview.issuer;
+        let subscribed = preview.subscribed;
+        let ui = ui.clone();
+        let win = win.clone();
+        let status = status.clone();
+        let subs_list = subs_list.clone();
+        let explorer_list = explorer_list.clone();
+        let search_entry = search_entry.clone();
+        action_btn.connect_clicked(move |_| {
+            let Some(node) = ui.node.borrow().clone() else {
+                status.set_text("nœud pas encore prêt");
+                return;
+            };
+            let rt = ui.rt.clone();
+            let ui = ui.clone();
+            let win = win.clone();
+            let status = status.clone();
+            let subs_list = subs_list.clone();
+            let explorer_list = explorer_list.clone();
+            let search_entry = search_entry.clone();
+            glib::spawn_future_local(async move {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                rt.spawn(async move {
+                    let res = if subscribed {
+                        unsubscribe_inner(&node, issuer).await
+                    } else {
+                        subscribe_inner(&node, issuer).await
+                    };
+                    let _ = tx.send(res);
+                });
+                match rx.await {
+                    Ok(Ok(())) => {
+                        status.set_text(if subscribed { "désabonné" } else { "abonné" });
+                        refresh_lists(&ui, &status, &subs_list, &explorer_list, &search_entry);
+                        win.close();
+                    }
+                    Ok(Err(e)) => status.set_text(&describe_core_error(&e, "abonnement")),
+                    Err(_) => status.set_text("tâche annulée"),
+                }
+            });
+        });
+        content.append(&action_btn);
+    }
+
+    win.set_child(Some(&content));
+    win.present();
+}
+
 /// Affichage humain de `(octets_utilisés, quota_octets)`.
 fn storage_stats_text(used: u64, quota: u64) -> String {
     format!(
@@ -1056,6 +1254,13 @@ async fn unsubscribe_inner(node: &Node, issuer: PeerId) -> Result<(), CoreError>
 /// core (désabonne + purge le catalogue), exécuté sur le runtime tokio.
 async fn block_channel_inner(node: &Node, issuer: PeerId) -> Result<(), CoreError> {
     node.block_channel(issuer).await
+}
+
+/// Résout un aperçu de channel (tâche 3) — catalogue local d'abord, sinon
+/// DHT (appel réseau potentiellement lent) : exécuté sur le runtime tokio,
+/// jamais sur le thread principal GTK.
+async fn resolve_channel_inner(node: &Node, issuer: PeerId) -> Result<ChannelPreview, CoreError> {
+    node.resolve_channel(issuer).await
 }
 
 /// Débloque un channel bloqué localement — appel sync du core, même
