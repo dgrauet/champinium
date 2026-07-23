@@ -2267,17 +2267,27 @@ async fn seed_publication(
     let segment_cids: Vec<String> = manifest.segments.iter().map(|s| s.cid.clone()).collect();
     // Point de COMMIT : les fetchs réseau ci-dessus ont pu durer — entre-temps
     // un `register_seeded_publication` (lecture au premier plan) a pu indexer
-    // la même publication, ou un désabonnement/blocage a pu purger l'émetteur.
-    // Sans re-validation ici, une insertion retardataire ressusciterait dans
-    // l'index une publication déjà purgée (métadonnées orphelines, stats
-    // faussées — course observée en test). Ordre des verrous : abonnements
-    // PUIS index, comme partout ailleurs — jamais l'inverse.
+    // la même publication, ou un désabonnement/blocage/ban a pu purger
+    // l'émetteur. Sans re-validation ici, une insertion retardataire
+    // ressusciterait dans l'index une publication déjà purgée (métadonnées
+    // orphelines, stats faussées, blocs réannoncés — course observée en test).
+    // Deux verdicts d'invalidation : (1) plus abonné — couvre désabonnement ET
+    // blocage local (`block_channel` désabonne) ; (2) clé bannie par denylist —
+    // `subscribe_denylist` NE désabonne PAS, donc `subs.contains` resterait
+    // vrai : sans ce second test, une publication d'une clé bannie en cours de
+    // seed survivrait à la purge rétroactive (TOCTOU, finding revue finale d).
+    // Ordre des verrous : abonnements PUIS index, comme partout ailleurs.
+    let key_banned = state
+        .moderation
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_blocked_key(&issuer);
     let committed = {
         let subs = state
             .subscriptions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !subs.contains(&issuer) {
+        if key_banned || !subs.contains(&issuer) {
             false
         } else {
             let mut idx = state
