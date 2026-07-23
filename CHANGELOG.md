@@ -6,6 +6,22 @@ versionnage : [SemVer](https://semver.org/lang/fr/). À partir de la 0.2.0, ce
 fichier est maintenu automatiquement par release-please (voir
 [ADR-0005](docs/adr/0005-release-please.md)).
 
+## [0.8.0](https://github.com/dgrauet/champinium/compare/v0.7.0...v0.8.0) (2026-07-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* aperçu de channel par lien — prévisualiser avant de s'abonner (contrat v9) ([#59](https://github.com/dgrauet/champinium/issues/59))
+
+### Features
+
+* aperçu de channel par lien — prévisualiser avant de s'abonner (contrat v9) ([#59](https://github.com/dgrauet/champinium/issues/59)) ([2ee8738](https://github.com/dgrauet/champinium/commit/2ee8738c9d7a74ef216e433ff79a47e7b028a18c))
+
+
+### Bug Fixes
+
+* **core:** republie les records de feed souscrits (durabilité hors ligne) ([#55](https://github.com/dgrauet/champinium/issues/55)) ([bb48b27](https://github.com/dgrauet/champinium/commit/bb48b273dbb043ab468febe94a8a4eaabb2048f7))
+
 ## [0.7.0](https://github.com/dgrauet/champinium/compare/v0.6.0...v0.7.0) (2026-07-23)
 
 
