@@ -138,3 +138,29 @@ jobs:
         # --include limite au code écrit à la main : les bindings UniFFI générés
         # (bindings/csharp/, inclus via Compile Include) ne sont pas formatés.
         run: dotnet format apps/windows/Champinium.sln --verify-no-changes --no-restore --include apps/windows/Champinium/
+
+  flatpak:
+    name: Linux front (Flatpak, build de validation)
+    # Valide le manifeste packaging/flatpak/org.champinium.Champinium.yml —
+    # même esprit que linux-gui/macos-app/windows-app : bloquant comme les
+    # autres jobs front, pas de continue-on-error (le repo ne fait
+    # d'exception pour aucun des trois OS malgré des builds déjà coûteux —
+    # xcodebuild/dotnet build tournent sans filet, Flatpak suit la même règle).
+    # N'attaque PAS Flathub : c'est un build+bundle local dans le conteneur
+    # CI, jamais publié.
+    runs-on: ubuntu-latest
+    container:
+      image: bilelmoussaoui/flatpak-github-actions:gnome-47
+      options: --privileged
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@bf5cafdfd97dcf5a89c7475bbc86a616e1f86acb  # v6.7
+        with:
+          bundle: champinium.flatpak
+          manifest-path: packaging/flatpak/org.champinium.Champinium.yml
+          cache-key: flatpak-builder-${{ github.sha }}
+      - name: Upload workflow artifact (bundle de validation)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: champinium-flatpak
+          path: champinium.flatpak

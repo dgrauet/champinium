@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Métadonnées AppStream minimales, requises par flatpak-builder (module
+  `appstream` implicite) pour toute app Flatpak. Un manque ici fait échouer
+  la validation `appstreamcli validate` en CI.
+-->
+<component type="desktop-application">
+  <id>org.champinium.Champinium.desktop</id>
+  <name>Champinium</name>
+  <summary>Partage P2P décentralisé de contenu généré par IA</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>Apache-2.0</project_license>
+  <description>
+    <p>
+      Champinium est une plateforme de partage pair-à-pair (P2P) de contenu
+      généré par IA (vidéo, image, audio). Aucun serveur central : découverte,
+      catalogue et distribution vivent entièrement dans le réseau P2P
+      (libp2p), avec une modération côté nœud active par défaut.
+    </p>
+  </description>
+  <launchable type="desktop-id">org.champinium.Champinium.desktop</launchable>
+  <url type="homepage">https://github.com/champinium/champinium</url>
+  <content_rating type="oars-1.1" />
+  <categories>
+    <category>AudioVideo</category>
+    <category>Network</category>
+  </categories>
+  <releases>
+    <release version="0.1.0" date="2026-07-23" />
+  </releases>
+</component>

@@ -1,0 +1,104 @@
+# Manifeste Flatpak — front Linux GTK4 de Champinium.
+#
+# Patron « GNOME Rust app » : runtime GNOME + rustc installé via rustup au
+# build (l'extension SDK rust-stable est trop ancienne pour la pile gtk-rs
+# courante — voir le module ci-dessous), module unique compilant
+# `champinium-linux` (feature `gui`).
+#
+# Choix de version : org.gnome.Platform/Sdk 47 (stable courante au moment de
+# l'écriture de ce manifeste — à faire suivre lors des mises à jour GNOME).
+#
+# GStreamer : org.gnome.Platform embarque gstreamer1.0 core + plugins-base +
+# plugins-good (assez pour VP8/VP9/Opus/WebM). Les plugins **plugins-bad** et
+# **libav** (nécessaires pour H.264/AAC — voir scripts/package-linux-app.sh qui
+# les liste comme dépendances système du tarball) NE SONT PAS embarqués par le
+# runtime GNOME de base (restrictions de brevets/licences en amont). Ce
+# manifeste ne les construit pas depuis les sources pour l'instant : c'est un
+# suivi documenté (voir docs/packaging.md), pas un blocage du build Flatpak
+# lui-même. À terme : soit compiler gst-plugins-bad/gst-libav en module
+# flatpak-builder, soit dépendre d'une extension Flathub équivalente si une
+# apparaît pour org.gnome.Platform.
+#
+# Sources cargo : ce manifeste build avec `--share=network` pendant le module
+# de compilation (cargo télécharge les crates depuis crates.io). C'est un
+# ÉCART assumé par rapport au patron Flatpak/Flathub « correct » qui utiliserait
+# des sources vendorisées hors-ligne (cargo-sources.json généré par
+# flatpak-cargo-generator, cf. https://github.com/flatpak/flatpak-builder-tools).
+# Générer ce fichier nécessite un accès réseau + le script flatpak-cargo-generator,
+# indisponibles dans l'environnement où ce manifeste a été rédigé (pas de
+# Flatpak ni de clone du dépôt flatpak-builder-tools). Le job CI qui construit
+# ce manifeste a un accès réseau (runner GitHub Actions) donc `--share=network`
+# au build fonctionne ; une vraie publication Flathub devrait basculer sur les
+# sources vendorisées pour la reproductibilité (Flathub l'exige d'ailleurs pour
+# les modules cargo). Noté comme suivi dans docs/packaging.md.
+
+app-id: org.champinium.Champinium
+runtime: org.gnome.Platform
+runtime-version: "48"
+sdk: org.gnome.Sdk
+command: champinium
+
+# Permissions minimales pour un lecteur P2P (pas de --filesystem=host) :
+# - réseau : libp2p (TCP/QUIC) parle au monde entier, pas de proxy possible.
+# - wayland + fallback-x11 + dri : fenêtre GTK4 + rendu vidéo GStreamer (GL).
+# - ipc : partagé par GStreamer/GTK pour certains plugins (memfd, shm).
+# - pulseaudio : sortie audio de la lecture GStreamer.
+#
+# Persistance des données (identité Ed25519, blocs, `.seed_index`, etc.) :
+# `champinium-core::paths::default_data_dir()` résout en
+# `$XDG_DATA_HOME/champinium` (repli `~/.local/share/champinium`). Sous
+# Flatpak, `XDG_DATA_HOME` est automatiquement redirigé par le sandbox vers
+# `~/.var/app/org.champinium.Champinium/data` — AUCUNE permission
+# `--filesystem` supplémentaire n'est nécessaire pour que l'identité/les blocs
+# persistent : c'est déjà dans le bac à sable de l'app, entre relances. Donc
+# pas de `--filesystem=xdg-download` ni `--filesystem=host` : l'app n'a
+# aujourd'hui aucun besoin documenté de lire/écrire en dehors de son propre
+# répertoire de données Flatpak.
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=pulseaudio
+  - --device=dri
+
+modules:
+  - name: champinium
+    buildsystem: simple
+    build-options:
+      build-args:
+        - --share=network
+    build-commands:
+      # rustc via rustup plutôt que l'extension SDK rust-stable : la pile
+      # gtk-rs courante (glib/gio-sys 0.22) exige rustc ≥ 1.92, or l'extension
+      # rust-stable du SDK GNOME 47 est figée à 1.89 (échec CI observé). Le
+      # réseau étant déjà partagé au build (voir en-tête), on installe le
+      # toolchain stable courant, garanti ≥ 1.92 (le job CI ubuntu compile la
+      # même pile avec le rustc du runner). CARGO_HOME/RUSTUP_HOME dans le
+      # répertoire de build pour rester dans le bac à sable de flatpak-builder.
+      - |
+        set -e
+        export RUSTUP_HOME="$PWD/.rustup" CARGO_HOME="$PWD/.cargo"
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+          | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
+        export PATH="$CARGO_HOME/bin:$PATH"
+        cargo build --release -p champinium-linux --features gui
+      - install -Dm755 target/release/champinium /app/bin/champinium
+      # Icône placeholder (appstreamcli refuse une app GUI sans icône) — à
+      # remplacer par une vraie identité visuelle.
+      - install -Dm644 packaging/flatpak/org.champinium.Champinium.svg
+        /app/share/icons/hicolor/scalable/apps/org.champinium.Champinium.svg
+      - install -Dm644 packaging/flatpak/org.champinium.Champinium.desktop
+        /app/share/applications/org.champinium.Champinium.desktop
+      - install -Dm644 packaging/flatpak/org.champinium.Champinium.metainfo.xml
+        /app/share/metainfo/org.champinium.Champinium.metainfo.xml
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - .git
+          - target
+          - dist
+          - apps/macos/.build
+          - apps/windows/**/bin
+          - apps/windows/**/obj
