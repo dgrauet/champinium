@@ -356,10 +356,16 @@ async fn subscribe_denylist_purges_catalog_and_seeded_stock_including_pins() {
     // seule course avec le PUT DHT de `publish_feed` — une fois le feed au
     // catalogue, le seed proactif (réveillé par `catalog_events`) retient la
     // publication.
+    // Attendre que la publication soit **indexée au SeedIndex**, pas seulement
+    // que ses blocs soient sur disque : `seed_publication` insère à l'index
+    // APRÈS avoir écrit les blocs, donc `blockstore().has()` peut être vrai
+    // alors que `storage_stats().used` (qui lit le SeedIndex) vaut encore 0 —
+    // fenêtre élargie sous charge parallèle (flake CI observé). `pin` opère
+    // aussi sur l'index, il ne prend effet qu'une fois la publication indexée.
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let _ = node_b.fetch_feed(node_bad.peer_id()).await;
-            if node_b.blockstore().has(&manifest_cid) {
+            if node_b.storage_stats().0 > 0 {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
