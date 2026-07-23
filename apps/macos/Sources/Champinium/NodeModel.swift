@@ -20,6 +20,22 @@ private final class CatalogRefresher: CatalogListener {
     }
 }
 
+/// Pont vers le callback de seed proactif (lot c) : même patron que
+/// `CatalogRefresher` — re-dispatch vers le thread principal, où le modèle
+/// relit `storageStats()` et le catalogue (la couverture de seed voyage dans
+/// `FfiCatalogEntry`).
+private final class SeedRefresher: SeedListener {
+    private let onUpdate: @Sendable () -> Void
+
+    init(onUpdate: @escaping @Sendable () -> Void) {
+        self.onUpdate = onUpdate
+    }
+
+    func onSeedUpdated() {
+        onUpdate()
+    }
+}
+
 @MainActor
 final class NodeModel: ObservableObject {
     @Published var status: String = "démarrage…"
@@ -29,10 +45,12 @@ final class NodeModel: ObservableObject {
     @Published var subscribedEntries: [FfiCatalogEntry] = []
     @Published var subscriptions: Set<String> = []
     @Published var searchHits: [FfiSearchHit] = []
+    @Published var storageStats = FfiStorageStats(usedBytes: 0, quotaBytes: 0)
     @Published var player: AVPlayer?
 
     private var node: ChampiniumNode?
     private var listener: CatalogListener?
+    private var seedListener: SeedListener?
     /// Répertoire de la lecture en cours (supprimé au changement de contenu).
     private var currentPlayDir: String?
 
@@ -60,6 +78,11 @@ final class NodeModel: ObservableObject {
             }
             listener = refresher
             await node.setCatalogListener(listener: refresher)
+            let seedRefresher = SeedRefresher { [weak self] in
+                Task { @MainActor in self?.refreshCatalog() }
+            }
+            seedListener = seedRefresher
+            await node.setSeedListener(listener: seedRefresher)
             status = "nœud en ligne"
         } catch {
             status = "erreur d'ouverture: \(error)"
@@ -84,7 +107,30 @@ final class NodeModel: ObservableObject {
         entries = node?.catalog() ?? []
         subscribedEntries = node?.catalogSubscribed() ?? []
         subscriptions = Set(node?.subscriptions() ?? [])
+        storageStats = node?.storageStats() ?? FfiStorageStats(usedBytes: 0, quotaBytes: 0)
         status = "catalogue: \(entries.count) créateur(s)"
+    }
+
+    /// Définit le quota de seed proactif en gigaoctets (arrondi à l'octet).
+    func setSeedQuotaGB(_ gigabytes: Double) async throws {
+        guard let node else { return }
+        let bytes = UInt64(max(0, gigabytes) * 1_000_000_000)
+        try await node.setSeedQuota(bytes: bytes)
+        refreshCatalog()
+    }
+
+    /// Épingle un manifeste (exempté d'éviction par le seed proactif).
+    func pin(_ manifestCid: String) async throws {
+        guard let node else { return }
+        try await node.pinContent(manifestCid: manifestCid)
+        refreshCatalog()
+    }
+
+    /// Retire l'épinglage d'un manifeste.
+    func unpin(_ manifestCid: String) async throws {
+        guard let node else { return }
+        try await node.unpinContent(manifestCid: manifestCid)
+        refreshCatalog()
     }
 
     /// Lien partageable du channel de ce nœud.

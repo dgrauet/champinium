@@ -21,6 +21,8 @@ struct ContentView: View {
     @AppStorage("explorerAccepted") private var explorerAccepted = false
     @State private var channelLinkField: String = ""
     @State private var subscriptionStatus: String?
+    @State private var showSeedSettings = false
+    @State private var quotaField: String = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -57,12 +59,64 @@ struct ContentView: View {
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text("Champinium").font(.title2).bold()
-            Text(model.status).font(.caption).foregroundStyle(.secondary)
-            if !model.peerId.isEmpty {
-                Text("PeerId : \(model.peerId)").font(.caption2).foregroundStyle(.tertiary)
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Champinium").font(.title2).bold()
+                Text(model.status).font(.caption).foregroundStyle(.secondary)
+                if !model.peerId.isEmpty {
+                    Text("PeerId : \(model.peerId)").font(.caption2).foregroundStyle(.tertiary)
+                }
             }
+            Spacer()
+            Button("Réglages de seed") {
+                quotaField = String(format: "%.1f", gigabytes(model.storageStats.quotaBytes))
+                showSeedSettings = true
+            }
+            .font(.caption)
+            .popover(isPresented: $showSeedSettings) {
+                seedSettingsPopover
+            }
+        }
+    }
+
+    /// Réglage du quota de seeding (GB) + affichage de l'usage courant. Vue
+    /// minimale en popover pour rester cohérent avec la vue unique existante.
+    private var seedSettingsPopover: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Quota de seeding").font(.headline)
+            HStack {
+                TextField("Go", text: $quotaField)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 80)
+                Text("Go")
+                Button("Enregistrer") { Task { await saveSeedQuota() } }
+            }
+            Text(
+                "Utilisé : \(formatGB(model.storageStats.usedBytes)) Go / "
+                    + "\(formatGB(model.storageStats.quotaBytes)) Go"
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+        .padding()
+        .frame(width: 260)
+    }
+
+    private func gigabytes(_ bytes: UInt64) -> Double {
+        Double(bytes) / 1_000_000_000
+    }
+
+    private func formatGB(_ bytes: UInt64) -> String {
+        String(format: "%.1f", gigabytes(bytes))
+    }
+
+    private func saveSeedQuota() async {
+        guard let gb = Double(quotaField.replacingOccurrences(of: ",", with: ".")) else { return }
+        do {
+            try await model.setSeedQuotaGB(gb)
+            subscriptionStatus = "quota mis à jour"
+        } catch {
+            subscriptionStatus = "quota: erreur"
         }
     }
 
@@ -123,7 +177,10 @@ struct ContentView: View {
             ForEach(currentEntries, id: \.issuer) { entry in
                 Section(header: channelHeader(for: entry)) {
                     ForEach(entry.items, id: \.cid) { item in
-                        contentRow(title: item.title, tags: item.tags, cid: item.cid)
+                        contentRow(
+                            title: item.title, tags: item.tags, cid: item.cid,
+                            isPinned: tab == .subscriptions ? entry.pinned.contains(item.cid) : nil
+                        )
                     }
                 }
             }
@@ -140,11 +197,25 @@ struct ContentView: View {
         HStack {
             VStack(alignment: .leading, spacing: 1) {
                 Text(displayName(for: entry)).font(.subheadline).bold()
-                Text("seq \(entry.seq)").font(.caption2).foregroundStyle(.tertiary)
+                HStack(spacing: 6) {
+                    Text("seq \(entry.seq)").font(.caption2).foregroundStyle(.tertiary)
+                    Text(seedStatus(for: entry)).font(.caption2).foregroundStyle(.tertiary)
+                }
             }
             Spacer()
             subscribeButton(for: entry)
         }
+    }
+
+    /// « à jour » si tout est seedé localement, sinon « seed en cours (x/y) ».
+    /// Un feed vide (`totalCount == 0`, ex. channel sans publication) n'affiche
+    /// pas « à jour » — il n'y a rien à seeder.
+    private func seedStatus(for entry: FfiCatalogEntry) -> String {
+        guard entry.totalCount > 0 else { return "" }
+        if entry.seededCount == entry.totalCount {
+            return "· à jour"
+        }
+        return "· seed en cours (\(entry.seededCount)/\(entry.totalCount))"
     }
 
     private func displayName(for entry: FfiCatalogEntry) -> String {
@@ -180,7 +251,7 @@ struct ContentView: View {
     private var searchResults: some View {
         List {
             ForEach(model.searchHits, id: \.cid) { hit in
-                contentRow(title: hit.title, tags: hit.tags, cid: hit.cid)
+                contentRow(title: hit.title, tags: hit.tags, cid: hit.cid, isPinned: nil)
             }
             if model.searchHits.isEmpty {
                 Text("aucun résultat").foregroundStyle(.secondary)
@@ -188,8 +259,12 @@ struct ContentView: View {
         }
     }
 
-    /// Une ligne de contenu : titre (ou CID si sans titre), tags, bouton Lire.
-    private func contentRow(title: String, tags: [String], cid: String) -> some View {
+    /// Une ligne de contenu : titre (ou CID si sans titre), tags, bouton Lire,
+    /// et bouton Garder/Oublier (pin) quand `isPinned` est fourni (Abonnements
+    /// uniquement — épingler un contenu hors abonnement n'a pas de sens ici).
+    private func contentRow(title: String, tags: [String], cid: String,
+                            isPinned: Bool?) -> some View
+    {
         HStack {
             VStack(alignment: .leading, spacing: 2) {
                 Text(title.isEmpty ? cid : title)
@@ -201,7 +276,26 @@ struct ContentView: View {
                 }
             }
             Spacer()
+            if let isPinned {
+                Button(isPinned ? "Oublier" : "Garder") {
+                    Task { await togglePin(cid: cid, pinned: isPinned) }
+                }
+                .font(.caption)
+                .buttonStyle(.bordered)
+            }
             Button("Lire") { Task { await model.play(manifestCid: cid) } }
+        }
+    }
+
+    private func togglePin(cid: String, pinned: Bool) async {
+        do {
+            if pinned {
+                try await model.unpin(cid)
+            } else {
+                try await model.pin(cid)
+            }
+        } catch {
+            subscriptionStatus = "épinglage: erreur"
         }
     }
 
