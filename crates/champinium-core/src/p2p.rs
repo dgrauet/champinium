@@ -1056,6 +1056,12 @@ impl Node {
     /// (mêmes règles d'éviction qu'une publication seedée proactivement).
     /// No-op si déjà indexée (ex. seedée entre-temps par la boucle
     /// proactive).
+    ///
+    /// Compromis assumé : ce chemin n'applique PAS le quota (`make_room_for`)
+    /// — une lecture au premier plan (« regarder maintenant ») n'est pas
+    /// retenue par la borne à l'insertion, `used` peut donc la dépasser
+    /// temporairement. L'éviction de la boucle proactive rétablit la borne au
+    /// prochain passage qui aura besoin de place.
     fn register_seeded_publication(
         &self,
         issuer: PeerId,
@@ -2258,24 +2264,51 @@ async fn seed_publication(
     }
 
     let total_bytes = fetched_bytes;
-    let segment_cids = manifest.segments.iter().map(|s| s.cid.clone()).collect();
-    {
-        let mut idx = state
-            .seed_index
+    let segment_cids: Vec<String> = manifest.segments.iter().map(|s| s.cid.clone()).collect();
+    // Point de COMMIT : les fetchs réseau ci-dessus ont pu durer — entre-temps
+    // un `register_seeded_publication` (lecture au premier plan) a pu indexer
+    // la même publication, ou un désabonnement/blocage a pu purger l'émetteur.
+    // Sans re-validation ici, une insertion retardataire ressusciterait dans
+    // l'index une publication déjà purgée (métadonnées orphelines, stats
+    // faussées — course observée en test). Ordre des verrous : abonnements
+    // PUIS index, comme partout ailleurs — jamais l'inverse.
+    let committed = {
+        let subs = state
+            .subscriptions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        idx.insert(
-            issuer.to_string(),
-            SeededPublication {
-                manifest_cid: manifest_cid.to_string(),
-                segment_cids,
-                total_bytes,
-                order: 0, // ignoré par `insert`, réassigné par l'index.
-            },
-        );
-        if let Err(e) = seeding::save_seed_index(&state.blockstore, &idx) {
-            tracing::warn!("persistance de l'index de seed échouée: {e}");
+        if !subs.contains(&issuer) {
+            false
+        } else {
+            let mut idx = state
+                .seed_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Doublon (l'autre chemin a gagné la course) : les blocs sont
+            // partagés avec la copie indexée, rien à insérer ni à retirer.
+            if !idx.contains_manifest(&manifest_cid.to_string()) {
+                idx.insert(
+                    issuer.to_string(),
+                    SeededPublication {
+                        manifest_cid: manifest_cid.to_string(),
+                        segment_cids,
+                        total_bytes,
+                        order: 0, // ignoré par `insert`, réassigné par l'index.
+                    },
+                );
+                if let Err(e) = seeding::save_seed_index(&state.blockstore, &idx) {
+                    tracing::warn!("persistance de l'index de seed échouée: {e}");
+                }
+            }
+            true
         }
+    };
+    if !committed {
+        // L'émetteur n'est plus suivi : la tentative est abandonnée et ses
+        // blocs non indexés sont retirés (ceux partagés avec une publication
+        // indexée survivent via la garde `all_cids` de `remove_unindexed_fetch`).
+        remove_unindexed_fetch(state, &fetched_cids);
+        return Ok(());
     }
     let _ = state.seed_events.send(());
     Ok(())
