@@ -984,6 +984,13 @@ impl Node {
     /// est toujours faux, le blocage désabonnant (lot d) — aucun abonnement
     /// implicite n'est créé ou supposé ici, l'aperçu est un instantané pur.
     ///
+    /// Même nuance pour un émetteur INCONNU mais non bloqué, sur un catalogue
+    /// déjà à sa borne anti-DoS (1024, `Catalog::apply`) : l'insertion est
+    /// refusée silencieusement par `fetch_feed`, la relecture ne retrouve donc
+    /// rien — on construit alors l'aperçu depuis le `Feed` déjà vérifié plutôt
+    /// que de supposer la relecture systématiquement gagnante (borne du
+    /// catalogue ≠ échec de résolution).
+    ///
     /// Discipline verrous : les instantanés (catalogue, abonnements, blocage)
     /// sont pris et relâchés avant tout `.await` — `catalog_entries()`,
     /// `subscriptions_snapshot()` et `is_key_blocked_inner` sont toutes des
@@ -1022,20 +1029,38 @@ impl Node {
         }
 
         // 3. Clé non bloquée : `fetch_feed` alimente déjà le catalogue en cas
-        // de succès (comportement existant) — la relecture suffit.
-        if self.fetch_feed(issuer).await?.is_none() {
-            return Err(CoreError::NoProviders(issuer.to_string()));
-        }
-        let entry = self
+        // de succès — MAIS `Catalog::apply` refuse un émetteur inconnu et non
+        // souscrit si le catalogue est déjà à sa borne anti-DoS (1024
+        // émetteurs, `fetch_feed_inner` ignore ce refus silencieusement).
+        // La borne du catalogue n'est PAS un échec de résolution : plutôt que
+        // supposer que la relecture retrouvera forcément l'entrée (ce qui
+        // paniquait ici auparavant, un `unwrap`/`expect` réseau atteignable
+        // depuis la FFI par un simple lien collé sur un catalogue plein), on
+        // retombe sur le `Feed` déjà vérifié pour construire l'aperçu si la
+        // relecture ne le trouve pas — même chemin que la clé bloquée
+        // ci-dessus, sans jamais réinsérer ni réessayer.
+        let feed = self
+            .fetch_feed(issuer)
+            .await?
+            .ok_or_else(|| CoreError::NoProviders(issuer.to_string()))?;
+        let subscribed = self.subscriptions_snapshot().contains(&issuer);
+        if let Some(entry) = self
             .catalog_entries()
             .into_iter()
             .find(|e| e.issuer == issuer)
-            .expect("fetch_feed vient d'alimenter le catalogue pour cet émetteur");
-        let subscribed = self.subscriptions_snapshot().contains(&issuer);
+        {
+            return Ok(ChannelPreview {
+                issuer,
+                channel: entry.channel,
+                items: entry.items,
+                subscribed,
+                blocked: false,
+            });
+        }
         Ok(ChannelPreview {
             issuer,
-            channel: entry.channel,
-            items: entry.items,
+            channel: feed.channel.clone(),
+            items: catalog_items_from_feed(&feed),
             subscribed,
             blocked: false,
         })

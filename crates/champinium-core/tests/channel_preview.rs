@@ -163,6 +163,68 @@ async fn blocked_channel_remains_resolvable() {
     );
 }
 
+/// Régression (revue finale, panic FFI atteignable) : `Catalog::apply`
+/// refuse un émetteur inconnu ET non souscrit dès que le catalogue est à sa
+/// borne anti-DoS (`DEFAULT_MAX_ISSUERS`, 1024) — `fetch_feed_inner` ignore
+/// ce refus silencieusement. `resolve_channel` ne doit donc PAS supposer que
+/// la relecture du catalogue après `fetch_feed` retrouve toujours l'entrée
+/// (un `expect` sur ce chemin paniquait, atteignable depuis la FFI par un
+/// simple lien collé sur un catalogue plein) : il doit construire l'aperçu
+/// depuis le `Feed` déjà vérifié, sans jamais insérer ni paniquer, et laisser
+/// le catalogue inchangé.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resolves_unknown_issuer_via_dht_even_when_catalog_is_at_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let node_a = node(dir.path(), "a").await;
+    let node_b = node(dir.path(), "b").await;
+    connect(&node_a, &node_b).await;
+
+    // Sature le catalogue de B à sa borne, avec des émetteurs sans rapport
+    // avec A ni entre eux — aucun souscrit, donc aucune exemption de borne.
+    for i in 0..champinium_core::catalog::DEFAULT_MAX_ISSUERS {
+        let filler = Keypair::generate_ed25519();
+        let cid = cid_for(format!("contenu de remplissage {i}").as_bytes());
+        let feed = Feed::build_signed(&filler, 1, &[cid]).unwrap();
+        node_b.apply_feed_for_tests(feed).unwrap();
+    }
+    assert_eq!(
+        node_b.catalog_entries().len(),
+        champinium_core::catalog::DEFAULT_MAX_ISSUERS,
+        "catalogue saturé à sa borne avant le test"
+    );
+
+    node_a
+        .set_channel_profile(ChannelMeta {
+            name: "Surnuméraire".into(),
+            description: "".into(),
+            avatar_cid: None,
+        })
+        .await
+        .unwrap();
+    let cid = cid_for(b"contenu d'un emetteur inconnu sur catalogue plein");
+    node_a.publish_feed(&[cid]).await.unwrap();
+
+    let preview = resolve_until_ok(&node_b, node_a.peer_id()).await;
+    assert_eq!(preview.issuer, node_a.peer_id());
+    assert_eq!(preview.channel.name, "Surnuméraire");
+    assert!(preview.items.iter().any(|i: &CatalogItem| i.cid == cid));
+    assert!(!preview.subscribed);
+    assert!(!preview.blocked);
+
+    assert_eq!(
+        node_b.catalog_entries().len(),
+        champinium_core::catalog::DEFAULT_MAX_ISSUERS,
+        "un émetteur inconnu résolu sur catalogue plein ne doit PAS y être inséré"
+    );
+    assert!(
+        !node_b
+            .catalog_entries()
+            .iter()
+            .any(|e| e.issuer == node_a.peer_id()),
+        "toujours refusé par la borne anti-DoS (non souscrit)"
+    );
+}
+
 /// (e) Inconnu et injoignable (nœud isolé, issuer aléatoire) →
 /// `Err(NoProviders)`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

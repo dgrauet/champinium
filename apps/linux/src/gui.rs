@@ -720,9 +720,7 @@ fn describe_core_error(e: &CoreError, context: &str) -> String {
 /// en amont par `channel_link::parse` (voir l'appelant).
 fn describe_preview_error(e: &CoreError) -> String {
     match e {
-        CoreError::NoProviders(_) | CoreError::BlockNotFound(_) => {
-            "channel introuvable pour l'instant".to_string()
-        }
+        CoreError::NoProviders(_) => "channel introuvable pour l'instant".to_string(),
         other => format!("aperçu : {other}"),
     }
 }
