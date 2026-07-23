@@ -2734,8 +2734,8 @@ mod tests {
         node_a.add(&forbidden).await.unwrap();
 
         let issuer = identity::load_or_generate(dir.path().join("issuer.key")).unwrap();
-        let dl =
-            Denylist::build_signed("test", "2026-06-24T00:00:00Z", &issuer, &[bad_cid]).unwrap();
+        let dl = Denylist::build_signed("test", "2026-06-24T00:00:00Z", &issuer, &[bad_cid], &[])
+            .unwrap();
         let mut moderation = Moderation::empty();
         moderation.subscribe(&dl).unwrap();
 
