@@ -6,6 +6,23 @@ versionnage : [SemVer](https://semver.org/lang/fr/). À partir de la 0.2.0, ce
 fichier est maintenu automatiquement par release-please (voir
 [ADR-0005](docs/adr/0005-release-please.md)).
 
+## [0.7.0](https://github.com/dgrauet/champinium/compare/v0.6.0...v0.7.0) (2026-07-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* channels lot (d) — modération par clé, blocage local, signalements par channel ([#53](https://github.com/dgrauet/champinium/issues/53))
+* Node::get ne met plus le bloc consommé en cache et n'annonce plus le nœud comme fournisseur par défaut. Introduit StorePolicy::{Seed, Stream} (crate-interne) et Node::get_with pour choisir explicitement l'ancien comportement. fetch_hls applique Seed aux channels souscrits, Stream sinon — signature publique inchangée. replicate/replicate_under_provided et les flags --replication-target/ --replicate-max du démon champinium-seed sont supprimés ; reseed() ne publie plus de feed (la publication appartient au créateur, pas au démon).
+* channels lot (b) — abonnements, vues Abonnements/Explorer, liens de channel ([#51](https://github.com/dgrauet/champinium/issues/51))
+* channels lot (a) — feed v3 (identité de channel signée) + contrat FFI v5 ([#49](https://github.com/dgrauet/champinium/issues/49))
+
+### Features
+
+* channels lot (a) — feed v3 (identité de channel signée) + contrat FFI v5 ([#49](https://github.com/dgrauet/champinium/issues/49)) ([fcaa0dd](https://github.com/dgrauet/champinium/commit/fcaa0ddb1826894f906a31581958228b56099876))
+* channels lot (b) — abonnements, vues Abonnements/Explorer, liens de channel ([#51](https://github.com/dgrauet/champinium/issues/51)) ([0e26948](https://github.com/dgrauet/champinium/commit/0e26948c40c646ea416ec08b05578134806f5ecf))
+* channels lot (c) — seed proactif, quota, éviction ; retrait de seed-what-you-consume ([#52](https://github.com/dgrauet/champinium/issues/52)) ([9073538](https://github.com/dgrauet/champinium/commit/9073538f17691cd74955ef589f0e6ffb528839d7))
+* channels lot (d) — modération par clé, blocage local, signalements par channel ([#53](https://github.com/dgrauet/champinium/issues/53)) ([1f8d5f3](https://github.com/dgrauet/champinium/commit/1f8d5f3e3f80f8f85a98f26417955a24220ba8e9))
+
 ## [0.6.0](https://github.com/dgrauet/champinium/compare/v0.5.0...v0.6.0) (2026-07-04)
 
 
