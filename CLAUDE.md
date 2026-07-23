@@ -312,8 +312,16 @@ sur deux machines physiques.
   Les trois fronts ont l'action « Bloquer » (vue Explorer) + un volet « Channels
   bloqués ». Spec :
   `~/Work/.superpowers/champinium/specs/2026-07-22-channels-subscriptions-design.md`.
-- **Restent** (issues) : IPNS durable (#21). **La refonte channels (lots a–d)
-  est intégralement livrée.**
+- **Durabilité du record de feed ✔** : `Node::republish_known_feeds`
+  (`champinium-seed`, même boucle que `reprovide_all`) re-PUT dans la DHT le
+  feed signé du nœud lui-même et ceux de ses **abonnements** — corrige un
+  écart où le record `/champinium/feed/<peerid>` d'un créateur hors ligne
+  n'était jamais réannoncé (contrairement à ce que l'ADR 0007 supposait déjà
+  couvert), le laissant s'éteindre au TTL du `MemoryStore` Kademlia.
+- IPNS durable (#21) **fermée par l'ADR 0007** (différée : la durabilité
+  pratique est déjà assurée par le point ci-dessus, l'interop IPFS public
+  reste bloquée par ailleurs — voir [`docs/adr/0007-ipns-deferred.md`](docs/adr/0007-ipns-deferred.md)).
+  **La refonte channels (lots a–d) est intégralement livrée.**
 
 Phasing : 0 (spike async FFI ✔ contrat) → **1 (P2P nu CLI ✔)** → **2 (modération ✔,
 feeds/gossipsub/catalogue ✔, ingestion ffmpeg ✔)** → **3 (contrat UniFFI v3 ✔,
@@ -322,7 +330,8 @@ NAT ✔, seeding ✔, feed DHT ✔, fetch concurrent ✔, déploiement tiers doc
 bitswap différé)** → 5 (en cours : peer scoring ✔, signalement P2P ✔, réplication
 mesurée ✔, recherche ✔ (#20) ; **refonte channels COMPLÈTE** — lot (a) identité
 ✔, lot (b) abonnements ✔, lot (c) seed proactif/quota/pins ✔, lot (d) modération
-par clé + blocage local + signalements par channel ✔ ; reste IPNS #21). Voir le
+par clé + blocage local + signalements par channel ✔ ; durabilité du record de
+feed ✔ (`republish_known_feeds`) ; IPNS #21 close, voir ADR 0007). Voir le
 spec.
 
 **Dernière release : voir `.release-please-manifest.json` / CHANGELOG** —
