@@ -91,6 +91,7 @@ apps/linux/               GTK4 (gtk-rs)
 bindings/                 généré au build (gitignoré)
 deny/                     denylist par défaut signée
 docs/                     documentation
+packaging/flatpak/        manifeste Flatpak du front Linux (Phase 6)
 ```
 
 ## Build
@@ -322,6 +323,19 @@ sur deux machines physiques.
   pratique est déjà assurée par le point ci-dessus, l'interop IPFS public
   reste bloquée par ailleurs — voir [`docs/adr/0007-ipns-deferred.md`](docs/adr/0007-ipns-deferred.md)).
   **La refonte channels (lots a–d) est intégralement livrée.**
+- **Packaging Linux — Flatpak ✔ (structurel, palier gratuit)** : manifeste
+  [`packaging/flatpak/org.champinium.Champinium.yml`](packaging/flatpak/org.champinium.Champinium.yml)
+  (app-id `org.champinium.Champinium`, runtime GNOME 47 + extension
+  rust-stable), `.desktop` + métainfo AppStream à côté. `finish-args` minimal
+  (réseau, wayland/x11/dri, ipc, pulseaudio — **pas** de
+  `--filesystem=host` : `default_data_dir()` atterrit déjà dans le sandbox via
+  la redirection standard de `XDG_DATA_HOME`). Build cargo en `--share=network`
+  (pas encore vendorisé hors-ligne — écart documenté, voir
+  [`docs/packaging.md`](docs/packaging.md)). Job CI `flatpak` (conteneur
+  `bilelmoussaoui/flatpak-github-actions:gnome-47`) = seule validation réelle
+  du manifeste, non exécutable en dev macOS. GStreamer plugins-bad/libav
+  (H.264/AAC) absents du runtime GNOME de base et non recompilés ici — suivi.
+  AppImage non fait (suivi, différé par effort).
 
 Phasing : 0 (spike async FFI ✔ contrat) → **1 (P2P nu CLI ✔)** → **2 (modération ✔,
 feeds/gossipsub/catalogue ✔, ingestion ffmpeg ✔)** → **3 (contrat UniFFI v3 ✔,
