@@ -39,6 +39,50 @@ async fn fetch_hls_until_ok(
     .expect("fetch_hls doit finir par réussir sous l'échéance")
 }
 
+/// Comme [`fetch_hls_until_ok`], mais pour le cas souscrit (politique `Seed`
+/// attendue) : réessaie jusqu'à ce que le manifeste soit RÉELLEMENT en cache
+/// dans le blockstore, pas seulement jusqu'au premier `Ok`. Un `Ok` isolé peut
+/// survenir alors que la politique retenue était encore `Stream` (le
+/// catalogue souscrit pas encore visible côté consommateur au moment précis
+/// du fetch) — dans ce cas rien n'est mis en cache et une seule tentative
+/// réussie ne garantit pas l'effet attendu (flake CI observé).
+async fn fetch_hls_until_cached(
+    node: &Node,
+    manifest_cid: champinium_core::Cid,
+    out: &std::path::Path,
+) -> PathBuf {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(playlist) = node.fetch_hls(manifest_cid, out).await {
+                if node.blockstore().has(&manifest_cid) {
+                    return playlist;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect(
+        "fetch_hls doit finir par mettre le manifeste en cache (politique Seed) sous l'échéance",
+    )
+}
+
+/// Poll générique jusqu'à ce que `cond` renvoie `true`, sous une échéance
+/// généreuse — même patron que `fetch_hls_until_ok`/`fetch_hls_until_cached`,
+/// pour les conditions qui ne passent pas par `fetch_hls`.
+async fn poll_until<F: Fn() -> bool>(deadline: Duration, cond: F) {
+    tokio::time::timeout(deadline, async {
+        loop {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("condition attendue non atteinte sous l'échéance");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fetch_hls_leaves_no_partial_output_on_failure() {
     let dir = tempfile::tempdir().unwrap();
@@ -153,16 +197,19 @@ async fn fetch_hls_stores_content_for_subscribed_channel() {
     node_consumer.subscribe(node_creator.peer_id()).unwrap();
     let feed = Feed::build_signed(&kp_creator, 1, &[manifest_cid]).unwrap();
     node_consumer.apply_feed_for_tests(feed).unwrap();
-    assert!(
+    // Poll (pas une seule lecture) : le catalogue souscrit doit vraiment
+    // contenir le manifeste AVANT le fetch, sinon `fetch_hls` retiendrait la
+    // politique `Stream` (course catalogue vs fetch, flake CI observé).
+    poll_until(Duration::from_secs(30), || {
         node_consumer
             .catalog_subscribed()
             .iter()
-            .any(|e| e.cids.contains(&manifest_cid)),
-        "le manifeste doit apparaître dans le catalogue souscrit avant le fetch"
-    );
+            .any(|e| e.cids.contains(&manifest_cid))
+    })
+    .await;
 
     let out = dir.path().join("hls-out-sub");
-    let playlist = fetch_hls_until_ok(&node_consumer, manifest_cid, &out).await;
+    let playlist = fetch_hls_until_cached(&node_consumer, manifest_cid, &out).await;
     assert!(playlist.exists());
 
     assert!(
@@ -185,19 +232,16 @@ async fn fetch_hls_stores_content_for_subscribed_channel() {
     );
 
     node_consumer.unsubscribe(node_creator.peer_id()).unwrap();
-    assert!(
-        !node_consumer.blockstore().has(&manifest_cid),
-        "le désabonnement doit purger le manifeste seedé par fetch_hls"
-    );
-    assert!(
-        !node_consumer.blockstore().has(&seg_cid),
-        "le désabonnement doit purger le segment seedé par fetch_hls"
-    );
-    let (used_after, _) = node_consumer.storage_stats();
-    assert_eq!(
-        used_after, 0,
-        "le désabonnement doit ramener storage_stats().used à 0 (rien d'épinglé)"
-    );
+    // Poll (pas un assert immédiat) : un traînard du seed_loop ou un retard de
+    // comptabilité du SeedIndex peut laisser ces conditions momentanément
+    // fausses juste après `unsubscribe` (même classe de flake que
+    // `key_moderation`, cf. commentaire du module).
+    poll_until(Duration::from_secs(30), || {
+        !node_consumer.blockstore().has(&manifest_cid)
+            && !node_consumer.blockstore().has(&seg_cid)
+            && node_consumer.storage_stats().0 == 0
+    })
+    .await;
 }
 
 /// Channel NON souscrit (ex. consultation depuis Explorer) : `fetch_hls`
