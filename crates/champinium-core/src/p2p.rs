@@ -1006,6 +1006,28 @@ impl Node {
         Ok(())
     }
 
+    /// CIDs de manifestes de `issuer` (tels que connus du catalogue local)
+    /// actuellement épinglés. Sert le contrat FFI v7 (`FfiCatalogEntry.pinned`)
+    /// sans recalculer l'épinglage côté binding.
+    pub fn pinned_manifests_of(&self, issuer: PeerId) -> Vec<Cid> {
+        let Some(entry) = self
+            .catalog_entries()
+            .into_iter()
+            .find(|e| e.issuer == issuer)
+        else {
+            return Vec::new();
+        };
+        let idx = self
+            .seed_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entry
+            .cids
+            .into_iter()
+            .filter(|c| idx.is_pinned(&c.to_string()))
+            .collect()
+    }
+
     /// Entrées du catalogue restreintes aux émetteurs souscrits.
     pub fn catalog_subscribed(&self) -> Vec<CatalogEntry> {
         let subs = self.subscriptions_snapshot();

@@ -1,4 +1,4 @@
-//! Surface UniFFI exposée aux fronts natifs (contrat v6).
+//! Surface UniFFI exposée aux fronts natifs (contrat v7).
 //!
 //! C'est la **frontière de contrat** : les fronts (Swift, C#) codent contre cet
 //! objet, jamais contre l'implémentation. Toute évolution passe par l'agent NOYAU
@@ -61,6 +61,16 @@ pub trait CatalogListener: Send + Sync {
     fn on_catalog_updated(&self);
 }
 
+/// Callback implémenté par les fronts : rappelé à chaque changement effectif du
+/// seed proactif (publication nouvellement seedée ou purgée). Même contrat que
+/// `CatalogListener` : tic fusionnable, le front re-dispatche puis relit
+/// `storage_stats()` / `catalog()`.
+#[uniffi::export(with_foreign)]
+pub trait SeedListener: Send + Sync {
+    /// L'état du seed proactif a changé (couverture, quota, pins).
+    fn on_seed_updated(&self);
+}
+
 /// Un contenu avec ses métadonnées signées (titre, tags). Sert à la fois de
 /// sortie (catalogue, recherche) et d'entrée (`publish_feed_with`).
 #[derive(uniffi::Record)]
@@ -107,6 +117,20 @@ pub struct FfiCatalogEntry {
     pub items: Vec<FfiContentItem>,
     /// Identité éditoriale du channel émetteur (signée avec le feed).
     pub channel: FfiChannelProfile,
+    /// Nombre de publications de ce feed actuellement seedées par CE nœud
+    /// (couverture du seed proactif, lot c).
+    pub seeded_count: u32,
+    /// Nombre total de publications de ce feed, tel que connu du catalogue local.
+    pub total_count: u32,
+    /// Manifestes de ce feed épinglés par CE nœud (chaînes CID).
+    pub pinned: Vec<String>,
+}
+
+/// `(octets_utilisés, quota_octets)` du seed proactif de ce nœud.
+#[derive(uniffi::Record)]
+pub struct FfiStorageStats {
+    pub used_bytes: u64,
+    pub quota_bytes: u64,
 }
 
 /// Nœud Champinium exposé aux fronts. Encapsule le noyau ; les fronts ne font que
@@ -146,8 +170,22 @@ impl ChampiniumNode {
         self.inner
             .catalog_entries()
             .into_iter()
-            .map(catalog_entry_to_ffi)
+            .map(|e| catalog_entry_to_ffi(&self.inner, e))
             .collect()
+    }
+
+    /// Quota de seed courant (octets). Raccourci sync sur `storage_stats()`.
+    pub fn seed_quota(&self) -> u64 {
+        self.inner.storage_stats().1
+    }
+
+    /// `(octets_utilisés, quota_octets)` du seed proactif de ce nœud.
+    pub fn storage_stats(&self) -> FfiStorageStats {
+        let (used_bytes, quota_bytes) = self.inner.storage_stats();
+        FfiStorageStats {
+            used_bytes,
+            quota_bytes,
+        }
     }
 
     /// Abonnements courants (PeerIds triés) — état local privé, jamais publié.
@@ -164,7 +202,7 @@ impl ChampiniumNode {
         self.inner
             .catalog_subscribed()
             .into_iter()
-            .map(catalog_entry_to_ffi)
+            .map(|e| catalog_entry_to_ffi(&self.inner, e))
             .collect()
     }
 
@@ -324,6 +362,45 @@ impl ChampiniumNode {
         Ok(())
     }
 
+    /// Définit le quota de seed proactif (octets) : persiste puis réveille la
+    /// boucle de seed (une baisse peut nécessiter une éviction immédiate).
+    pub async fn set_seed_quota(&self, bytes: u64) -> Result<(), FfiError> {
+        self.inner.set_seed_quota(bytes)?;
+        Ok(())
+    }
+
+    /// Épingle un manifeste : exempté d'éviction par le seed proactif, qu'il
+    /// soit ou non déjà retenu.
+    pub async fn pin_content(&self, manifest_cid: String) -> Result<(), FfiError> {
+        let cid: Cid = manifest_cid.parse().map_err(|e| FfiError::InvalidInput {
+            msg: format!("CID invalide: {e}"),
+        })?;
+        self.inner.pin(cid)?;
+        Ok(())
+    }
+
+    /// Retire l'épinglage d'un manifeste (redevient évictable sous quota).
+    pub async fn unpin_content(&self, manifest_cid: String) -> Result<(), FfiError> {
+        let cid: Cid = manifest_cid.parse().map_err(|e| FfiError::InvalidInput {
+            msg: format!("CID invalide: {e}"),
+        })?;
+        self.inner.unpin(cid)?;
+        Ok(())
+    }
+
+    /// Enregistre un listener de seed proactif : même patron que
+    /// `set_catalog_listener` — remplace le polling côté front par un
+    /// rafraîchissement réactif de `storage_stats()`/`catalog()`.
+    pub async fn set_seed_listener(&self, listener: Arc<dyn SeedListener>) {
+        let mut events = self.inner.subscribe_seed();
+        tokio::spawn(async move {
+            use tokio::sync::broadcast::error::RecvError;
+            while let Ok(()) | Err(RecvError::Lagged(_)) = events.recv().await {
+                listener.on_seed_updated();
+            }
+        });
+    }
+
     /// Récupère et reconstruit un HLS depuis un manifeste, dans `out_dir`.
     /// Renvoie le chemin du `index.m3u8` jouable.
     pub async fn fetch_hls(
@@ -342,7 +419,13 @@ impl ChampiniumNode {
     }
 }
 
-fn catalog_entry_to_ffi(e: crate::catalog::CatalogEntry) -> FfiCatalogEntry {
+fn catalog_entry_to_ffi(node: &Node, e: crate::catalog::CatalogEntry) -> FfiCatalogEntry {
+    let (seeded_count, total_count) = node.seed_status(e.issuer);
+    let pinned = node
+        .pinned_manifests_of(e.issuer)
+        .into_iter()
+        .map(|c| c.to_string())
+        .collect();
     FfiCatalogEntry {
         issuer: e.issuer.to_string(),
         seq: e.seq,
@@ -361,6 +444,9 @@ fn catalog_entry_to_ffi(e: crate::catalog::CatalogEntry) -> FfiCatalogEntry {
             description: e.channel.description,
             avatar_cid: e.channel.avatar_cid,
         },
+        seeded_count: seeded_count as u32,
+        total_count: total_count as u32,
+        pinned,
     }
 }
 
@@ -619,5 +705,171 @@ mod tests {
 
         let err = node.channel_link("pas-un-peerid".into()).unwrap_err();
         assert!(matches!(err, FfiError::InvalidInput { .. }), "{err}");
+    }
+
+    /// Contrat v7 : le quota de seed défini via `set_seed_quota` est persisté —
+    /// un nœud rouvert sur le même répertoire retrouve la même valeur (comme le
+    /// `seq` de feed ou les abonnements, chargés au constructeur).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn seed_quota_roundtrip_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_string_lossy().into_owned();
+
+        let node = open_node(data_dir.clone()).await.unwrap();
+        node.set_seed_quota(12_345).await.unwrap();
+        assert_eq!(node.seed_quota(), 12_345);
+        assert_eq!(node.storage_stats().quota_bytes, 12_345);
+        drop(node);
+
+        let reopened = open_node(data_dir).await.unwrap();
+        assert_eq!(reopened.seed_quota(), 12_345);
+    }
+
+    /// Un nœud fraîchement ouvert n'a rien seedé : `storage_stats` reflète un
+    /// index de seed vide sous le quota par défaut.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn storage_stats_is_zero_on_fresh_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = open_node(dir.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        let stats = node.storage_stats();
+        assert_eq!(stats.used_bytes, 0);
+        assert!(stats.quota_bytes > 0);
+    }
+
+    /// Une entrée de catalogue enrichit `seeded_count`/`total_count`/`pinned` à
+    /// partir du `SeedIndex` local : ici la publication n'est pas retenue au
+    /// seed (aucun octet réellement stocké — `seeded_count` reste à 0) mais
+    /// `pin_content` marque quand même le manifeste comme épinglé, et
+    /// `unpin_content` fait le chemin inverse — le contrat n'exige pas qu'une
+    /// publication soit seedée pour être épinglable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_entry_exposes_seed_fields_and_pin_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = open_node(dir.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+
+        let cid = crate::content::cid_for(b"contenu v7").to_string();
+        node.publish_feed(vec![cid.clone()]).await.unwrap();
+
+        let entry = &node.catalog()[0];
+        assert_eq!(entry.total_count, 1);
+        assert_eq!(entry.seeded_count, 0);
+        assert!(entry.pinned.is_empty());
+
+        node.pin_content(cid.clone()).await.unwrap();
+        let entry = &node.catalog()[0];
+        assert_eq!(entry.pinned, vec![cid.clone()]);
+
+        node.unpin_content(cid).await.unwrap();
+        assert!(node.catalog()[0].pinned.is_empty());
+    }
+
+    /// Un CID invalide fourni à `pin_content`/`unpin_content` est une
+    /// `InvalidInput` (même contrat que les autres entrées CID de la surface).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pin_and_unpin_content_reject_invalid_cid() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = open_node(dir.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            node.pin_content("pas-un-cid".into()).await.unwrap_err(),
+            FfiError::InvalidInput { .. }
+        ));
+        assert!(matches!(
+            node.unpin_content("pas-un-cid".into()).await.unwrap_err(),
+            FfiError::InvalidInput { .. }
+        ));
+    }
+
+    /// `set_seed_listener` : même patron que `set_catalog_listener`. Le seed
+    /// proactif émet un tic à l'ingestion d'un contenu propre (retenu +
+    /// épinglé d'office) — `storage_stats` est alors cohérent avec les octets
+    /// réellement stockés (publication + seed dans le même mouvement).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn seed_listener_fires_after_ingest_and_storage_stats_is_coherent() {
+        if !ffmpeg_available().await {
+            eprintln!("ffmpeg absent — test seed_listener/ingest ignoré");
+            return;
+        }
+
+        struct Probe(std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>);
+        impl SeedListener for Probe {
+            fn on_seed_updated(&self) {
+                if let Some(tx) = self.0.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let node = open_node(dir.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.set_seed_listener(Arc::new(Probe(std::sync::Mutex::new(Some(tx)))))
+            .await;
+
+        let input = dir.path().join("input.mp4");
+        assert!(generate_media(&input).await, "génération du média de test");
+        let manifest_cid = node
+            .ingest_file(input.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        // `ingest_file` seede/épingle le contenu propre mais ne publie pas de
+        // feed : sans `publish_feed`, aucune entrée de catalogue ne référence
+        // le manifeste (le catalogue reconstruit uniquement depuis les feeds).
+        node.publish_feed(vec![manifest_cid.clone()]).await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("le SeedListener doit être rappelé après ingest_file")
+            .unwrap();
+
+        let stats = node.storage_stats();
+        assert!(
+            stats.used_bytes > 0,
+            "le contenu propre ingéré doit être compté dans storage_stats"
+        );
+        assert!(stats.used_bytes <= stats.quota_bytes);
+
+        // Le contenu propre est épinglé d'office (jamais évincé) : le contrat
+        // v7 doit le refléter dans `pinned` de l'entrée de catalogue.
+        let entries = node.catalog();
+        let own = entries.iter().find(|e| e.issuer == node.peer_id()).expect(
+            "le catalogue doit contenir l'entrée du nœud lui-même après ingest_file + publish",
+        );
+        assert!(own.pinned.contains(&manifest_cid));
+    }
+
+    async fn ffmpeg_available() -> bool {
+        tokio::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    async fn generate_media(out: &std::path::Path) -> bool {
+        tokio::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i"])
+            .arg("testsrc=duration=1:size=160x90:rate=15")
+            .args(["-f", "lavfi", "-i"])
+            .arg("sine=frequency=440:duration=1")
+            .args(["-c:v", "libx264", "-c:a", "aac", "-shortest"])
+            .arg(out)
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 }
