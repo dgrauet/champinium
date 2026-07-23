@@ -961,17 +961,35 @@ impl Node {
         else {
             return (0, 0);
         };
+        let (seeded, total, _pinned) = self.seed_coverage(&entry.cids);
+        (seeded, total)
+    }
+
+    /// `(publications_seedées, publications_totales, pins)` pour une liste de
+    /// CIDs **déjà résolue** (ex. `entry.cids` d'une entrée de catalogue en
+    /// main) — un seul verrou `seed_index`, sans re-parcourir le catalogue.
+    /// `seed_status`/`pinned_manifests_of` s'appuient dessus pour un appel
+    /// isolé par PeerId ; la FFI (`catalog_entry_to_ffi`) l'appelle
+    /// directement par entrée pour rester O(N) sur tout le catalogue au lieu
+    /// de re-cloner le catalogue entier (verrou + reconstruction CRDT) par
+    /// entrée, ce qui serait O(N²) (retour de review, tâche c5).
+    pub fn seed_coverage(&self, cids: &[Cid]) -> (u64, u64, Vec<Cid>) {
         let idx = self
             .seed_index
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let total = entry.cids.len() as u64;
-        let seeded = entry
-            .cids
-            .iter()
-            .filter(|c| idx.contains_manifest(&c.to_string()))
-            .count() as u64;
-        (seeded, total)
+        let mut seeded = 0u64;
+        let mut pinned = Vec::new();
+        for c in cids {
+            let s = c.to_string();
+            if idx.contains_manifest(&s) {
+                seeded += 1;
+            }
+            if idx.is_pinned(&s) {
+                pinned.push(*c);
+            }
+        }
+        (seeded, cids.len() as u64, pinned)
     }
 
     /// `(octets_utilisés, quota_octets)` — `used` vient du SeedIndex (source
@@ -1008,7 +1026,8 @@ impl Node {
 
     /// CIDs de manifestes de `issuer` (tels que connus du catalogue local)
     /// actuellement épinglés. Sert le contrat FFI v7 (`FfiCatalogEntry.pinned`)
-    /// sans recalculer l'épinglage côté binding.
+    /// pour un appel isolé par PeerId ; la FFI, elle, appelle `seed_coverage`
+    /// directement par entrée (voir sa doc) pour rester O(N) sur le catalogue.
     pub fn pinned_manifests_of(&self, issuer: PeerId) -> Vec<Cid> {
         let Some(entry) = self
             .catalog_entries()
@@ -1017,15 +1036,8 @@ impl Node {
         else {
             return Vec::new();
         };
-        let idx = self
-            .seed_index
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        entry
-            .cids
-            .into_iter()
-            .filter(|c| idx.is_pinned(&c.to_string()))
-            .collect()
+        let (_seeded, _total, pinned) = self.seed_coverage(&entry.cids);
+        pinned
     }
 
     /// Entrées du catalogue restreintes aux émetteurs souscrits.

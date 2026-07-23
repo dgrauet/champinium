@@ -420,12 +420,14 @@ impl ChampiniumNode {
 }
 
 fn catalog_entry_to_ffi(node: &Node, e: crate::catalog::CatalogEntry) -> FfiCatalogEntry {
-    let (seeded_count, total_count) = node.seed_status(e.issuer);
-    let pinned = node
-        .pinned_manifests_of(e.issuer)
-        .into_iter()
-        .map(|c| c.to_string())
-        .collect();
+    // `seed_coverage(&e.cids)` — un seul verrou `seed_index` sur les CIDs déjà
+    // en main, PAS `seed_status`/`pinned_manifests_of` (chacun reconstruirait
+    // tout le catalogue pour retrouver CETTE entrée : O(N²) sur l'ensemble du
+    // catalogue à chaque `catalog()`/`catalog_subscribed()`, exactement le
+    // chemin chaud du rafraîchissement réactif Seed/CatalogListener — retour
+    // de review, tâche c5).
+    let (seeded_count, total_count, pinned) = node.seed_coverage(&e.cids);
+    let pinned = pinned.into_iter().map(|c| c.to_string()).collect();
     FfiCatalogEntry {
         issuer: e.issuer.to_string(),
         seq: e.seq,
@@ -444,6 +446,10 @@ fn catalog_entry_to_ffi(node: &Node, e: crate::catalog::CatalogEntry) -> FfiCata
             description: e.channel.description,
             avatar_cid: e.channel.avatar_cid,
         },
+        // `entry.cids` est borné par les mêmes plafonds anti-DoS que le
+        // catalogue (taille de feed + nombre d'émetteurs, cf. durcissement
+        // post-audit Phase 4) : bien en-deçà de `u32::MAX`, la troncature est
+        // structurellement impossible aujourd'hui.
         seeded_count: seeded_count as u32,
         total_count: total_count as u32,
         pinned,
