@@ -24,7 +24,7 @@ path = "src/bin/uniffi-bindgen.rs"
 # tirée par défaut. Décision supply-chain : voir
 # .superpowers/sdd/coldstore-decision.md (hand-roll de la signature Arweave,
 # reqwest = seul ajout, pour l'upload/GraphQL de découverte).
-cold-storage = ["dep:reqwest"]
+cold-storage = ["dep:reqwest", "dep:async-trait"]
 
 [dependencies]
 uniffi = { workspace = true, features = ["cli", "tokio"] }
@@ -41,7 +41,16 @@ base64 = "0.22"
 thiserror = "2"
 tracing = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
+# Désacharnement (« type erasure ») pour le trait `ColdStore` : nécessaire pour
+# rester dyn-compatible malgré des méthodes async (edition 2021 — les async fn
+# natives en trait ne sont pas dyn-compatibles). Gaté par la même feature.
+async-trait = { version = "0.1", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 tempfile = "3"
+# Serveur HTTP mock pour les tests coldstore (gateways Arweave simulées).
+# httpmock écarté : dépendance non optionnelle sur async-std (discontinué,
+# RUSTSEC-2025-0052) — fait échouer `cargo deny check`. wiremock (base tokio,
+# cohérente avec le reste du workspace) est cargo-deny-clean.
+wiremock = "0.6"
