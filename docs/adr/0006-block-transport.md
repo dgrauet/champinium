@@ -33,3 +33,13 @@ donc à `beetswap` (0.5.0), qui exige encore `multihash-codetable ^0.1`
 (lignée empoisonnée). Prochain déclencheur : un bump `^0.1 → ^0.2` côté
 beetswap (demande amont légère), puis reprise de la migration ici — et, dans la
 foulée, réévaluation d'IPNS (ADR 0007).
+
+## Note éditoriale (channels lot (c), 2026-07-22)
+
+Le contexte ci-dessus décrit `get()` comme réannonçant systématiquement le bloc
+consommé (seed-what-you-consume) : c'était vrai au moment de cette décision,
+mais ce n'est plus le comportement par défaut depuis le lot (c) channels — le
+retrait de seed-what-you-consume et son remplacement par le seed proactif des
+abonnements sont documentés dans `docs/architecture.md` §6. Cette note ne
+révise pas la décision ci-dessus (transport request-response, bitswap différé),
+qui reste inchangée.

@@ -512,6 +512,43 @@ impl Node {
             .counts()
     }
 
+    /// Signalements agrégés **par émetteur** (spec channels lot d, tâche 4) :
+    /// jointure locale entre l'agrégat de rapports existant
+    /// ([`Node::report_counts`]) et le mapping CID→émetteur du catalogue
+    /// reconstruit localement. Pour chaque émetteur retenu :
+    /// `(rapporteurs distincts cumulés sur tous ses CIDs signalés, nombre de
+    /// CIDs distincts signalés qui lui sont attribués)`.
+    ///
+    /// **Limite assumée** : un CID signalé qui n'apparaît dans AUCUNE entrée
+    /// du catalogue local (émetteur pas vu par ce nœud, ou entrée expirée)
+    /// n'apparaît PAS dans ce résultat — il reste compté uniquement côté
+    /// [`Node::report_counts`] (agrégat global, sans attribution). Lecture
+    /// seule, aucun effet réseau.
+    pub fn report_counts_by_channel(&self) -> Vec<(PeerId, u64, u64)> {
+        let cid_issuer: HashMap<Cid, PeerId> = self
+            .catalog_entries()
+            .into_iter()
+            .flat_map(|entry| {
+                let issuer = entry.issuer;
+                entry.cids.into_iter().map(move |cid| (cid, issuer))
+            })
+            .collect();
+
+        let mut by_channel: HashMap<PeerId, (u64, u64)> = HashMap::new();
+        for (cid, reporters) in self.report_counts() {
+            let Some(issuer) = cid_issuer.get(&cid) else {
+                continue;
+            };
+            let tally = by_channel.entry(*issuer).or_insert((0, 0));
+            tally.0 += reporters as u64;
+            tally.1 += 1;
+        }
+        by_channel
+            .into_iter()
+            .map(|(issuer, (reporters, cids))| (issuer, reporters, cids))
+            .collect()
+    }
+
     /// Score gossipsub d'un pair (réputation ; `None` si le pair est inconnu
     /// de la couche gossip). Diagnostic/observabilité — les seuils d'application
     /// (arrêt du relais, graylist) sont gérés par gossipsub lui-même.
@@ -974,12 +1011,15 @@ impl Node {
         // Politique : `Seed` si le manifeste appartient à un channel souscrit
         // (suivi actif — on veut le resservir), `Stream` sinon (simple
         // consultation, ex. Explorer) — le retrait de seed-what-you-consume ne
-        // doit pas priver un channel suivi de sa réplication.
-        let policy = if self
+        // doit pas priver un channel suivi de sa réplication. On retient aussi
+        // l'émetteur de l'entrée souscrite : c'est l'issuer correct pour
+        // enregistrer la publication au SeedIndex ci-dessous (finding M1).
+        let subscribed_issuer = self
             .catalog_subscribed()
-            .iter()
-            .any(|e| e.cids.contains(&manifest_cid))
-        {
+            .into_iter()
+            .find(|e| e.cids.contains(&manifest_cid))
+            .map(|e| e.issuer);
+        let policy = if subscribed_issuer.is_some() {
             StorePolicy::Seed
         } else {
             StorePolicy::Stream
@@ -994,7 +1034,63 @@ impl Node {
         }
         let playlist = out_dir.join("index.m3u8");
         tokio::fs::write(&playlist, manifest.to_m3u8()).await?;
+
+        // M1 (revue finale lot c) : `get_with(Seed)` ci-dessus met déjà les
+        // blocs en cache et les réannonce, mais ne touchait pas le SeedIndex —
+        // la publication restait invisible du quota (`storage_stats`) et
+        // survivait à un désabonnement (`unsubscribe` ne purge que ce que le
+        // SeedIndex connaît). On l'y enregistre si elle n'y est pas déjà.
+        if let Some(issuer) = subscribed_issuer {
+            self.register_seeded_publication(issuer, manifest_cid, &manifest);
+        }
+
         Ok(playlist)
+    }
+
+    /// Enregistre au SeedIndex une publication déjà récupérée en politique
+    /// `Seed` par [`Node::fetch_hls_inner`] (finding M1) : sans cela, le
+    /// contenu était mis en cache et réannoncé par `get_with(Seed)` mais
+    /// restait absent du SeedIndex — ni compté au quota, ni purgé à un
+    /// désabonnement ultérieur. Octets mesurés via `Blockstore::size_of` (les
+    /// blocs sont déjà en cache à cet appel), publication NON épinglée
+    /// (mêmes règles d'éviction qu'une publication seedée proactivement).
+    /// No-op si déjà indexée (ex. seedée entre-temps par la boucle
+    /// proactive).
+    fn register_seeded_publication(
+        &self,
+        issuer: PeerId,
+        manifest_cid: Cid,
+        manifest: &HlsManifest,
+    ) {
+        let manifest_key = manifest_cid.to_string();
+        let mut idx = self
+            .seed_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if idx.contains_manifest(&manifest_key) {
+            return;
+        }
+        let segment_cids: Vec<String> = manifest.segments.iter().map(|s| s.cid.clone()).collect();
+        let mut total_bytes = self.blockstore.size_of(&manifest_cid).unwrap_or(0);
+        for seg in &segment_cids {
+            if let Ok(cid) = seg.parse::<Cid>() {
+                total_bytes += self.blockstore.size_of(&cid).unwrap_or(0);
+            }
+        }
+        idx.insert(
+            issuer.to_string(),
+            SeededPublication {
+                manifest_cid: manifest_key,
+                segment_cids,
+                total_bytes,
+                order: 0, // ignoré par `insert`, réassigné par l'index.
+            },
+        );
+        if let Err(e) = seeding::save_seed_index(&self.blockstore, &idx) {
+            tracing::warn!("persistance de l'index de seed échouée: {e}");
+        }
+        drop(idx);
+        let _ = self.seed_events.send(());
     }
 
     /// Instantané des entrées du catalogue reconstruit (un feed par émetteur).
@@ -2940,6 +3036,52 @@ mod tests {
         })
         .await
         .expect("le score du pair malveillant doit devenir négatif");
+    }
+
+    /// Agrégation par channel (tâche 4, lot d) : deux rapporteurs distincts,
+    /// un chacun sur un des deux CIDs du même émetteur → cumul de 2
+    /// rapporteurs sur 2 CIDs signalés. Un CID signalé dont l'émetteur est
+    /// inconnu du catalogue local reste dans l'agrégat global mais absent du
+    /// résultat par channel (limite documentée).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn report_counts_by_channel_joins_reports_with_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = spawn_node(dir.path(), "n").await;
+
+        let issuer_kp = Keypair::generate_ed25519();
+        let issuer = issuer_kp.public().to_peer_id();
+        let cid_a = cid_for(b"report-a");
+        let cid_b = cid_for(b"report-b");
+        node.apply_feed_for_tests(Feed::build_signed(&issuer_kp, 1, &[cid_a, cid_b]).unwrap())
+            .unwrap();
+
+        let reporter1 = Keypair::generate_ed25519();
+        let reporter2 = Keypair::generate_ed25519();
+        {
+            let mut book = node.reports.lock().unwrap();
+            book.apply(&Report::build_signed(&reporter1, &cid_a, "denylist").unwrap())
+                .unwrap();
+            book.apply(&Report::build_signed(&reporter2, &cid_b, "denylist").unwrap())
+                .unwrap();
+        }
+
+        let by_channel = node.report_counts_by_channel();
+        assert_eq!(by_channel.len(), 1);
+        assert_eq!(by_channel[0], (issuer, 2, 2));
+
+        // CID hors catalogue : compté globalement, absent du join par channel.
+        let unknown_cid = cid_for(b"report-unknown");
+        node.reports
+            .lock()
+            .unwrap()
+            .apply(&Report::build_signed(&reporter1, &unknown_cid, "denylist").unwrap())
+            .unwrap();
+
+        assert_eq!(node.report_counts_by_channel(), by_channel);
+        assert!(node
+            .report_counts()
+            .iter()
+            .any(|(cid, _)| *cid == unknown_cid));
     }
 
     /// Régression : avec la validation applicative activée (les messages ne

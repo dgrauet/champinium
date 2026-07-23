@@ -160,6 +160,14 @@ enum Cmd {
         /// CID du manifeste.
         manifest_cid: String,
     },
+    /// Affiche les signalements agrégés localement (matière première pour un
+    /// éditeur de denylist — aucun effet automatique).
+    Reports {
+        /// Regroupe par émetteur (jointure locale rapports × catalogue)
+        /// au lieu des compteurs globaux par CID.
+        #[arg(long)]
+        by_channel: bool,
+    },
 }
 
 #[tokio::main]
@@ -395,6 +403,28 @@ async fn main() -> Result<()> {
             let node = build_node(&cli.data_dir, &cli.denylist).await?;
             node.unpin(manifest_cid)?;
             println!("épinglage retiré: {manifest_cid}");
+        }
+        Cmd::Reports { by_channel } => {
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            if by_channel {
+                let by_channel = node.report_counts_by_channel();
+                if by_channel.is_empty() {
+                    println!("aucun signalement attribuable à un émetteur connu");
+                } else {
+                    for (issuer, reporters, cids) in by_channel {
+                        println!("{issuer}: {reporters} rapporteur(s) distinct(s) / {cids} CID(s) signalé(s)");
+                    }
+                }
+            } else {
+                let counts = node.report_counts();
+                if counts.is_empty() {
+                    println!("aucun signalement");
+                } else {
+                    for (cid, reporters) in counts {
+                        println!("{cid}: {reporters} rapporteur(s) distinct(s)");
+                    }
+                }
+            }
         }
     }
     Ok(())
