@@ -39,6 +39,7 @@
             <local:EmptyStringToVisibilityConverter x:Key="EmptyStringToVisibility" />
             <local:NonEmptyStringToVisibilityConverter x:Key="NonEmptyStringToVisibility" />
             <local:BooleanToVisibilityConverter x:Key="BooleanToVisibility" />
+            <local:InverseBooleanConverter x:Key="InverseBoolean" />
 
             <!-- Gabarit partagé : un groupe (créateur/channel) = en-tête (nom, seq,
                  bouton abonnement) + ses contenus. Le bouton d'abonnement est au
@@ -266,15 +267,25 @@
                          visibles uniquement dans l'onglet Explorer (même choix que
                          le jumeau macOS). -->
                     <StackPanel Spacing="6">
+                        <!-- Aperçu (pas d'abonnement direct au collage, voir tâche 3) :
+                             résout le lien/PeerId puis ouvre une feuille d'aperçu ;
+                             l'abonnement se décide depuis cette feuille. -->
                         <Grid ColumnSpacing="8">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
                                 <ColumnDefinition Width="Auto" />
                             </Grid.ColumnDefinitions>
                             <TextBox Grid.Column="0"
                                      PlaceholderText="Coller un lien de channel…"
                                      Text="{Binding ChannelLinkField, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
-                            <Button Grid.Column="1" Content="S'abonner" Click="OnSubscribeByLinkClick" />
+                            <ProgressRing Grid.Column="1"
+                                          Width="20" Height="20"
+                                          IsActive="{Binding IsPreviewLoading, Mode=OneWay}"
+                                          Visibility="{Binding IsPreviewLoading, Mode=OneWay, Converter={StaticResource BooleanToVisibility}}" />
+                            <Button Grid.Column="2" Content="Aperçu"
+                                    IsEnabled="{Binding IsPreviewLoading, Mode=OneWay, Converter={StaticResource InverseBoolean}}"
+                                    Click="OnPreviewByLinkClick" />
                         </Grid>
                         <Button Content="Copier le lien de mon channel" Click="OnCopyMyLinkClick" />
                         <TextBlock Text="{Binding SubscriptionStatus, Mode=OneWay}"
