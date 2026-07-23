@@ -150,6 +150,82 @@ async fn retrieve_returns_none_when_only_malicious_gateway_available() {
     assert_eq!(result, None);
 }
 
+#[tokio::test]
+async fn retrieve_rejects_oversized_gateway_response_and_tries_next_gateway() {
+    let malicious = MockServer::start().await;
+    let honest = MockServer::start().await;
+    let bytes = b"contenu authentique";
+    let cid = cid_for(bytes);
+    let tx_id = "tx-oversized";
+    // Un peu plus que la borne MAX_ARCHIVE_FETCH_BYTES (64 MiO) d'arweave.rs :
+    // une gateway (même malveillante) ne doit jamais pouvoir faire gonfler la
+    // mémoire du client par une réponse énorme.
+    let oversized = vec![0u8; 64 * 1024 * 1024 + 1];
+
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(graphql_hit_body(tx_id)))
+        .mount(&malicious)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{tx_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(oversized))
+        .mount(&malicious)
+        .await;
+
+    // La gateway suivante, honnête, sert le bon contenu (taille normale).
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(graphql_hit_body(tx_id)))
+        .mount(&honest)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{tx_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+        .mount(&honest)
+        .await;
+
+    let store = ArweaveColdStore::new(vec![malicious.uri(), honest.uri()]);
+    let result = store.retrieve(cid).await.unwrap();
+
+    assert_eq!(result, Some(bytes.to_vec()));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn balance_derives_known_arweave_address_from_jwk() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Vecteur de test indépendant : `n` = octets 0..=255 encodés en
+    // base64url (comme un vrai module RSA public de JWK Arweave). L'adresse
+    // attendue a été calculée séparément (Python : hashlib.sha256 +
+    // base64.urlsafe_b64encode, sans padding) — si la dérivation Rust
+    // divergeait (mauvais alphabet base64, padding non retiré, hex au lieu
+    // d'octets bruts...), cette adresse ne correspondrait plus et le mock
+    // HTTP ci-dessous ne matcherait jamais, faisant échouer le test.
+    let n = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn-AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t_g4eLj5OXm5-jp6uvs7e7v8PHy8_T19vf4-fr7_P3-_w";
+    let expected_address = "QK_y6dLYki5Hr9RkjmlnSXFYeF-9Hahw5xECZr-USIA";
+
+    let dir = tempfile::tempdir().unwrap();
+    let wallet_path = dir.path().join("wallet.json");
+    let jwk = serde_json::json!({ "kty": "RSA", "n": n, "e": "AQAB" });
+    std::fs::write(&wallet_path, serde_json::to_vec(&jwk).unwrap()).unwrap();
+    std::fs::set_permissions(&wallet_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let wallet = ArweaveWallet::from_path(&wallet_path).unwrap();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/wallet/{expected_address}/balance")))
+        .respond_with(ResponseTemplate::new(200).set_body_string("123456789"))
+        .mount(&server)
+        .await;
+
+    let store = ArweaveColdStore::new(vec![server.uri()]);
+    let balance = store.balance(&wallet).await.unwrap();
+
+    assert_eq!(balance, 123_456_789);
+}
+
 #[test]
 fn archive_receipt_roundtrips_json() {
     let receipt = ArchiveReceipt {

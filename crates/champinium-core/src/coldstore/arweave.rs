@@ -23,6 +23,13 @@ use std::time::Duration;
 /// bloquer le repli d'archive, on passe à la suivante.
 const GATEWAY_TIMEOUT_SECS: u64 = 8;
 
+/// Borne la taille d'une réponse de gateway (cohérent avec `MAX_BLOCK_SIZE`
+/// dans `p2p.rs`) : une gateway — même malveillante, hors de tout contrôle,
+/// c'est tout le modèle de menace de ce module — ne doit jamais pouvoir
+/// gonfler la mémoire du client par une réponse énorme. Dépassement → traité
+/// comme un échec de cette gateway (gateway suivante), jamais une erreur.
+const MAX_ARCHIVE_FETCH_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Backend Arweave : une liste de gateways essayées en séquence.
 pub struct ArweaveColdStore {
     gateways: Vec<String>,
@@ -90,6 +97,31 @@ struct GraphQlNode {
     id: String,
 }
 
+/// Lit le corps d'une réponse en le bornant à `limit` octets : rejette tôt si
+/// `Content-Length` l'annonce déjà au-delà, sinon accumule par morceaux
+/// (`Response::chunk`, disponible sans feature `stream`) et abandonne dès que
+/// le total dépasse la borne — jamais un `bytes().await` non borné sur une
+/// source non fiable. `None` = dépassement ou erreur réseau, traité comme un
+/// simple échec de gateway par l'appelant.
+async fn read_bounded(mut resp: reqwest::Response, limit: u64) -> Option<Vec<u8>> {
+    if resp.content_length().is_some_and(|len| len > limit) {
+        return None;
+    }
+    let mut buf = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                buf.extend_from_slice(&chunk);
+                if buf.len() as u64 > limit {
+                    return None;
+                }
+            }
+            Ok(None) => return Some(buf),
+            Err(_) => return None,
+        }
+    }
+}
+
 /// Dérive l'adresse Arweave (base64url de sha256(module RSA public `n`)) du
 /// portefeuille référencé. Ne lit que le champ public du JWK — jamais la clé
 /// privée (`d`) — et ne la copie nulle part, juste le temps du calcul.
@@ -123,10 +155,9 @@ impl ColdStore for ArweaveColdStore {
             if !resp.status().is_success() {
                 continue;
             }
-            let Ok(bytes) = resp.bytes().await else {
+            let Some(bytes) = read_bounded(resp, MAX_ARCHIVE_FETCH_BYTES).await else {
                 continue;
             };
-            let bytes = bytes.to_vec();
             if content::verify(&cid, &bytes) {
                 return Ok(Some(bytes));
             }
