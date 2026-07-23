@@ -3,10 +3,17 @@
 //! Depuis le retrait de seed-what-you-consume (spec channels lot c), le démon
 //! ne fait plus que **resservir ce qu'il détient déjà** : au démarrage et
 //! périodiquement, il **réannonce** tous ses CIDs dans la DHT (provider
-//! records). Il ne publie PLUS de feed — la publication appartient au nœud
-//! créateur, pas au démon de seeding. Conçu pour tourner sous launchd (macOS),
-//! un service Windows, ou un systemd user service (Linux) — voir
-//! `infra/services/`.
+//! records) ET **republie** les feeds SIGNÉS qu'il détient légitimement (le
+//! sien s'il a publié, ceux de ses abonnements — voir
+//! `Node::republish_known_feeds`). Il ne PUBLIE (crée/incrémente `seq`)
+//! toujours PAS de feed — ça reste le rôle du nœud créateur, pas du démon de
+//! seeding — mais il réannonce dans la DHT ceux déjà signés qu'il détient,
+//! condition nécessaire à leur durabilité (ADR 0007) : sans réannonce, le
+//! record `/champinium/feed/<peerid>` expire au TTL du `MemoryStore`
+//! Kademlia dès que le créateur passe hors ligne, quel que soit le nombre
+//! d'abonnés qui l'ont pourtant dans leur catalogue. Conçu pour tourner sous
+//! launchd (macOS), un service Windows, ou un systemd user service (Linux) —
+//! voir `infra/services/`.
 //!
 //! La modération par défaut reste active : un seeder ne ressert jamais un contenu
 //! matché (les checkpoints du noyau s'appliquent au service comme au reste).
@@ -80,12 +87,19 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Réannonce tous les CIDs détenus (provider records). La publication du feed
-/// n'appartient PAS au démon — c'est le nœud créateur qui publie ce qu'il
-/// crée ; le démon de seeding ne fait que resservir ce qu'il détient déjà.
+/// Réannonce tous les CIDs détenus (provider records) PUIS republie les feeds
+/// signés détenus légitimement (le sien + ses abonnements — voir
+/// `Node::republish_known_feeds`). La PUBLICATION d'un feed (créer/incrémenter
+/// `seq`) n'appartient PAS au démon — c'est le nœud créateur qui publie ce
+/// qu'il crée ; le démon de seeding ne fait que resservir/réannoncer ce qu'il
+/// détient déjà, feeds compris.
 async fn reseed(node: &Node) {
     match node.reprovide_all().await {
         Ok(n) => tracing::info!("réannonce de {n} CID(s)"),
         Err(e) => tracing::warn!("réannonce échouée: {e}"),
+    }
+    match node.republish_known_feeds().await {
+        Ok(n) => tracing::info!("republication de {n} feed(s)"),
+        Err(e) => tracing::warn!("republication de feeds échouée: {e}"),
     }
 }

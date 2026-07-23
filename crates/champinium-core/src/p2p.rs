@@ -1533,6 +1533,66 @@ impl Node {
         Ok(cids.len())
     }
 
+    /// Réannonce dans la DHT les feeds SIGNÉS que ce nœud détient
+    /// légitimement : le sien propre (s'il a déjà publié — il figure alors
+    /// dans son propre catalogue, voir `publish_feed_with`) et ceux des
+    /// créateurs **souscrits** présents dans le catalogue. Contrairement à
+    /// [`Node::reprovide_all`] (provider records de blocs), ceci re-PUT le
+    /// RECORD DE FEED lui-même (`/champinium/feed/<peerid>`) — sans quoi il
+    /// s'éteint au TTL du `MemoryStore` Kademlia dès que son émetteur est
+    /// hors ligne, y compris si celui-ci a bel et bien publié (voir ADR
+    /// 0007). Le nœud ne fait que réémettre les octets déjà signés par
+    /// l'émetteur d'origine — sa propre clé n'est jamais engagée pour un
+    /// tiers, la signature republiée reste celle du créateur.
+    ///
+    /// Ne republie QUE les abonnements (jamais tout le catalogue) :
+    /// cohérent avec « les abonnés SONT l'infrastructure du créateur » (seuls
+    /// ceux qui ont choisi de suivre un émetteur portent la durabilité de son
+    /// feed) et borne l'amplification réseau (un nœud avec un catalogue
+    /// borné à 1024 émetteurs mais 3 abonnements ne republie que 3 feeds, pas
+    /// 1024). Un émetteur bloqué (denylist souscrite ou blocage local de
+    /// channel, `is_key_blocked_inner`) est exclu — republier le feed d'une
+    /// clé qu'on refuse par ailleurs serait incohérent avec la modération.
+    ///
+    /// Best-effort (comme `publish_feed_with` : le PUT n'est pas attendu,
+    /// juste envoyé à la boucle réseau) ; renvoie le nombre de feeds pour
+    /// lesquels un PUT a été émis.
+    pub async fn republish_known_feeds(&self) -> CoreResult<usize> {
+        let subs = self.subscriptions_snapshot();
+        let to_republish: Vec<(PeerId, Vec<u8>)> = {
+            let catalog = self
+                .catalog
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            catalog
+                .issuers()
+                .filter(|issuer| **issuer == self.peer_id || subs.contains(*issuer))
+                .filter(|issuer| {
+                    !is_key_blocked_inner(&self.moderation, &self.blocked_channels, issuer)
+                })
+                .filter_map(|issuer| {
+                    let data = catalog.feed_for(issuer)?.to_json().ok()?.into_bytes();
+                    Some((*issuer, data))
+                })
+                .collect()
+        };
+
+        let mut count = 0usize;
+        for (issuer, data) in to_republish {
+            let (tx, _rx) = oneshot::channel();
+            let _ = self
+                .cmd_tx
+                .send(Command::PutRecord {
+                    key: feed_record_key(&issuer),
+                    value: data,
+                    tx,
+                })
+                .await;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// Annonce que ce nœud fournit `cid`. **Ne fait rien** si le CID est bloqué :
     /// s'annoncer fournisseur d'un contenu qu'on refuse de servir serait à la
     /// fois incohérent et un signal au réseau qu'on le détient.

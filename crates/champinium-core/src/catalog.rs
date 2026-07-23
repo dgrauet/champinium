@@ -168,6 +168,21 @@ impl Catalog {
     pub fn issuer_count(&self) -> usize {
         self.feeds.len()
     }
+
+    /// Le feed SIGNÉ brut connu pour `issuer`, tel que reçu (octets encore
+    /// vérifiables tels quels — la signature reste celle de l'émetteur
+    /// d'origine). Utilisé par `Node::republish_known_feeds` pour réannoncer
+    /// un feed dans la DHT sans avoir à le reconstruire depuis `entries()`
+    /// (qui a perdu la signature au profit de champs applicatifs).
+    pub fn feed_for(&self, issuer: &PeerId) -> Option<&Feed> {
+        self.feeds.get(issuer)
+    }
+
+    /// Tous les émetteurs actuellement connus du catalogue (pour itérer côté
+    /// appelant, ex. filtrer sur l'abonnement avant de relire `feed_for`).
+    pub fn issuers(&self) -> impl Iterator<Item = &PeerId> {
+        self.feeds.keys()
+    }
 }
 
 #[cfg(test)]
