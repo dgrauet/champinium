@@ -1053,6 +1053,30 @@ mod tests {
         assert!(!preview.blocked);
     }
 
+    /// Garde anti-inversion : `subscribed`/`blocked` doivent traverser le FFI
+    /// dans le bon ordre. Un nœud n'a pas de garde-fou contre l'auto-abonnement
+    /// (`Node::subscribe` n'exclut pas `self`) — le chemin le plus simple pour
+    /// obtenir `subscribed = true` ET `blocked = false` simultanément sur le
+    /// MÊME aperçu, sans dépendre du réseau. Un swap
+    /// (`subscribed: p.blocked, blocked: p.subscribed` dans
+    /// `channel_preview_to_ffi`) ferait échouer soit cette assertion soit celle
+    /// du test précédent (qui attend `subscribed = false`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_channel_preview_reflects_subscribed_not_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = open_node(dir.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+
+        let cid = crate::content::cid_for(b"contenu v9 auto-abonnement").to_string();
+        node.publish_feed(vec![cid]).await.unwrap();
+        node.subscribe_channel(node.peer_id()).await.unwrap();
+
+        let preview = node.resolve_channel(node.peer_id()).await.unwrap();
+        assert!(preview.subscribed);
+        assert!(!preview.blocked);
+    }
+
     /// Une entrée invalide (ni lien, ni PeerId nu) est une InvalidInput.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resolve_channel_with_garbage_is_invalid_input() {
