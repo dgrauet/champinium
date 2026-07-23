@@ -219,6 +219,13 @@ enum Command {
         data: Vec<u8>,
         tx: oneshot::Sender<CoreResult<()>>,
     },
+    /// Arrête d'annoncer ce nœud comme fournisseur d'un CID (purge de
+    /// modération par clé, tâche d/2 — voir `Node::stop_providing`).
+    /// Fire-and-forget : pas de réponse attendue, best-effort comme
+    /// `Provide`/`Command::Provide` côté annonce.
+    StopProviding {
+        key: RecordKey,
+    },
 }
 
 /// Politique de stockage appliquée par [`Node::get_with`] lors d'une
@@ -266,6 +273,18 @@ pub struct Node {
     /// de `catalog_events` : un changement de quota n'est pas un changement de
     /// catalogue.
     seed_wake: tokio::sync::broadcast::Sender<()>,
+    /// Ensemble dérivé des CIDs connus des feeds de clés bloquées (denylist,
+    /// tâche 2 ; blocage local, tâche 3), indexé par émetteur — jamais
+    /// persisté : entièrement dérivable à tout instant (recapturé au fil de
+    /// l'eau quand un feed d'une clé bloquée est vu passer). Consulté EN PLUS
+    /// de `moderation.is_blocked` par `get_with` (checkpoint #2) et le
+    /// service de blocs (`EventLoop::handle_block_message`) — voir
+    /// `is_cid_in_blocked_set_inner`. Indexé par émetteur (plutôt qu'un
+    /// simple `HashSet<Cid>`) pour permettre un retrait propre et isolé au
+    /// déblocage local d'un seul channel (`Node::unblock_channel`, tâche 3)
+    /// sans affecter les CIDs capturés pour d'autres émetteurs toujours
+    /// bloqués.
+    blocked_cids: Arc<Mutex<HashMap<PeerId, HashSet<Cid>>>>,
     /// Marqueur de vivacité : la tâche de suivi périodique n'en tient qu'un
     /// [`Weak`], ce qui lui permet de s'arrêter dès que toutes les poignées
     /// `Node` (qui clonent ce `Arc`) sont tombées, sans jamais retenir un
@@ -380,6 +399,10 @@ impl Node {
         // rater un tic mais en recevoir un plus tard suffit à se resynchroniser).
         let (catalog_events, _) = tokio::sync::broadcast::channel(64);
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        // Ensemble dérivé des CIDs de clés bloquées (tâche 2) — voir la doc du
+        // champ `Node::blocked_cids`.
+        let blocked_cids: Arc<Mutex<HashMap<PeerId, HashSet<Cid>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let event_loop = EventLoop::new(
             swarm,
             blockstore.clone(),
@@ -388,6 +411,7 @@ impl Node {
             catalog_events.clone(),
             reports.clone(),
             subscriptions.clone(),
+            blocked_cids.clone(),
             topic,
             reports_topic,
             cmd_rx,
@@ -425,6 +449,8 @@ impl Node {
             catalog.clone(),
             catalog_events.clone(),
             subscriptions.clone(),
+            moderation.clone(),
+            blocked_cids.clone(),
             follow_interval,
         ));
 
@@ -447,6 +473,7 @@ impl Node {
                 keypair: keypair.clone(),
                 peer_id,
                 quota_blocked: Arc::new(Mutex::new(HashSet::new())),
+                blocked_cids: blocked_cids.clone(),
             },
             catalog_events.subscribe(),
             seed_wake.subscribe(),
@@ -468,6 +495,7 @@ impl Node {
             seed_quota,
             seed_events,
             seed_wake,
+            blocked_cids,
             alive,
             cmd_tx,
         })
@@ -568,8 +596,16 @@ impl Node {
     }
 
     /// Souscrit **à chaud** à une denylist signée : vérifie la signature, ajoute
-    /// ses CIDs au moteur, puis **purge** du magasin local tout bloc désormais
-    /// interdit (checkpoint rétroactif). Renvoie le nombre de blocs purgés.
+    /// ses CIDs ET ses clés au moteur, puis **purge rétroactivement** :
+    /// - tout bloc du magasin dont le CID est directement listé (comportement
+    ///   historique, denylist v1/v2 par CID) ;
+    /// - tout émetteur dont la clé est désormais bannie (v2, finding M2) :
+    ///   son entrée de catalogue, ses publications retenues (SeedIndex —
+    ///   modération prime sur les pins, `keep_pinned=false`) et leurs blocs
+    ///   sont purgés, et le nœud arrête d'en annoncer chacun comme
+    ///   fournisseur (`Node::stop_providing`).
+    ///
+    /// Renvoie le nombre total de blocs supprimés du magasin.
     pub async fn subscribe_denylist(&self, list: &Denylist) -> CoreResult<usize> {
         {
             let mut mod_guard = self
@@ -578,15 +614,115 @@ impl Node {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             mod_guard.subscribe(list)?;
         }
-        // Purge des blocs déjà stockés que la nouvelle liste couvre.
-        let mut purged = 0;
+
+        // --- Purge par CLÉ (finding M2) : toute entrée de catalogue dont
+        // l'émetteur est désormais bloqué — pas seulement les clés de CETTE
+        // liste : une clé a pu être bloquée par une souscription antérieure
+        // dont le catalogue vient tout juste d'être peuplé.
+        let mut purged = 0usize;
+        let blocked_entries: Vec<CatalogEntry> = self
+            .catalog_entries()
+            .into_iter()
+            .filter(|e| is_key_blocked_inner(&self.moderation, &e.issuer))
+            .collect();
+        for entry in &blocked_entries {
+            purged += self.purge_blocked_issuer(entry.issuer, &entry.cids).await;
+        }
+        if !blocked_entries.is_empty() {
+            let _ = self.catalog_events.send(());
+        }
+
+        // --- Purge par CID (comportement historique, v1/v2) : les blocs
+        // encore présents et directement listés (les blocs d'émetteurs
+        // bloqués ci-dessus ont déjà été retirés, donc jamais recomptés ici).
         for cid in self.blockstore.list()? {
             if self.is_blocked(&cid) {
                 self.blockstore.remove(&cid)?;
+                self.stop_providing(cid).await;
                 purged += 1;
             }
         }
         Ok(purged)
+    }
+
+    /// Purge toutes les traces locales d'un émetteur devenu bloqué (denylist,
+    /// tâche 2 ; ou blocage local de channel, tâche 3) : capture ses CIDs
+    /// connus dans `blocked_cids` AVANT toute purge (le checkpoint #2/service
+    /// continue de les couvrir même après le retrait du catalogue), retire
+    /// son entrée du catalogue, purge le SeedIndex de ses publications
+    /// (`keep_pinned=false` : la modération prime sur les pins, contrairement
+    /// à `unsubscribe` qui les préserve), supprime du magasin tout bloc
+    /// devenu orphelin, puis arrête d'en annoncer chacun comme fournisseur.
+    /// Renvoie le nombre de blocs effectivement supprimés du magasin.
+    async fn purge_blocked_issuer(&self, issuer: PeerId, entry_cids: &[Cid]) -> usize {
+        {
+            let mut bc = self
+                .blocked_cids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            bc.entry(issuer)
+                .or_default()
+                .extend(entry_cids.iter().copied());
+        }
+        self.catalog
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove_issuer(&issuer);
+
+        let evicted = {
+            let mut idx = self
+                .seed_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let evicted = idx.purge_issuer(&issuer.to_string(), false);
+            if !evicted.is_empty() {
+                if let Err(e) = seeding::save_seed_index(&self.blockstore, &idx) {
+                    tracing::warn!("persistance de l'index de seed échouée: {e}");
+                }
+            }
+            evicted
+        };
+
+        let mut removed: HashSet<Cid> = entry_cids.iter().copied().collect();
+        for publication in &evicted {
+            if let Ok(cid) = publication.manifest_cid.parse::<Cid>() {
+                removed.insert(cid);
+            }
+            for seg in &publication.segment_cids {
+                if let Ok(cid) = seg.parse::<Cid>() {
+                    removed.insert(cid);
+                }
+            }
+        }
+
+        let mut count = 0usize;
+        for cid in &removed {
+            if self.blockstore.has(cid) {
+                let _ = self.blockstore.remove(cid);
+                count += 1;
+            }
+            self.stop_providing(*cid).await;
+        }
+        if !evicted.is_empty() {
+            let _ = self.seed_events.send(());
+        }
+        count
+    }
+
+    /// Arrête d'annoncer ce nœud comme fournisseur d'un CID (purge de
+    /// modération, tâches 2/3). `libp2p-kad` 0.48 (utilisé par libp2p 0.56)
+    /// expose `Behaviour::stop_providing` : le provider record LOCAL est
+    /// retiré immédiatement. Limite assumée : les copies déjà propagées chez
+    /// des pairs distants ne sont pas rappelées — elles s'éteignent à leur
+    /// propre expiration TTL (mêmes garanties best-effort que `provide`/
+    /// `Command::Provide`, pas de garantie de retrait réseau instantané).
+    async fn stop_providing(&self, cid: Cid) {
+        let _ = self
+            .cmd_tx
+            .send(Command::StopProviding {
+                key: RecordKey::new(&cid.to_bytes()),
+            })
+            .await;
     }
 
     /// Publie un feed signé listant `cids` (sans métadonnées) : voir
@@ -713,13 +849,17 @@ impl Node {
 
     /// Récupère le feed d'un créateur depuis la DHT (découverte hors gossip).
     /// Vérifie la signature et l'émetteur, retient le `seq` le plus élevé, et
-    /// l'applique au catalogue local. Renvoie `None` si aucun feed valide trouvé.
+    /// l'applique au catalogue local. Renvoie `None` si aucun feed valide
+    /// trouvé, **ou** si l'émetteur est une clé bloquée (checkpoint
+    /// modération, voir `fetch_feed_inner`).
     pub async fn fetch_feed(&self, issuer: PeerId) -> CoreResult<Option<Feed>> {
         fetch_feed_inner(
             &self.cmd_tx,
             &self.catalog,
             &self.catalog_events,
             &self.subscriptions,
+            &self.moderation,
+            &self.blocked_cids,
             issuer,
         )
         .await
@@ -864,9 +1004,19 @@ impl Node {
         let catalog = self.catalog.clone();
         let catalog_events = self.catalog_events.clone();
         let subscriptions = self.subscriptions.clone();
+        let moderation = self.moderation.clone();
+        let blocked_cids = self.blocked_cids.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                fetch_feed_inner(&cmd_tx, &catalog, &catalog_events, &subscriptions, issuer).await
+            if let Err(e) = fetch_feed_inner(
+                &cmd_tx,
+                &catalog,
+                &catalog_events,
+                &subscriptions,
+                &moderation,
+                &blocked_cids,
+                issuer,
+            )
+            .await
             {
                 tracing::debug!("fetch immédiat à l'abonnement échoué pour {issuer}: {e}");
             }
@@ -1200,6 +1350,7 @@ impl Node {
         get_with_inner(
             &self.blockstore,
             &self.moderation,
+            &self.blocked_cids,
             &self.cmd_tx,
             self.peer_id,
             &self.keypair,
@@ -1286,11 +1437,23 @@ fn save_subscriptions(blockstore: &Blockstore, subs: &BTreeSet<PeerId>) -> CoreR
 /// un `Node` entier — voir `follow_loop`). Récupère le feed d'un créateur
 /// depuis la DHT, vérifie signature + émetteur, retient le `seq` le plus
 /// élevé, l'applique au catalogue (avec exemption de borne s'il est souscrit).
+///
+/// CHECKPOINT MODÉRATION (ingestion catalogue, finding M2) : si `issuer` est
+/// une clé bloquée, le feed trouvé (signature déjà vérifiée) n'est PAS
+/// appliqué au catalogue — ses CIDs sont capturés dans `blocked_cids` AVANT
+/// le renvoi, et la fonction renvoie `Ok(None)` (« aucun feed exploitable »,
+/// même sémantique que si rien n'avait été trouvé) plutôt que le feed
+/// rejeté : un appelant ne doit pas pouvoir distinguer « rien trouvé » de
+/// « trouvé mais bloqué », ce qui éviterait toute fuite d'information sur le
+/// contenu d'une clé bannie.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_feed_inner(
     cmd_tx: &mpsc::Sender<Command>,
     catalog: &Arc<Mutex<Catalog>>,
     catalog_events: &tokio::sync::broadcast::Sender<()>,
     subscriptions: &Arc<Mutex<BTreeSet<PeerId>>>,
+    moderation: &Arc<RwLock<Moderation>>,
+    blocked_cids: &Arc<Mutex<HashMap<PeerId, HashSet<Cid>>>>,
     issuer: PeerId,
 ) -> CoreResult<Option<Feed>> {
     let (tx, rx) = oneshot::channel();
@@ -1315,22 +1478,27 @@ async fn fetch_feed_inner(
             best = Some(feed);
         }
     }
-    if let Some(feed) = &best {
-        let subs: HashSet<PeerId> = subscriptions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .copied()
-            .collect();
-        let changed = catalog
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .apply(feed.clone(), &subs);
-        if changed.unwrap_or(false) {
-            let _ = catalog_events.send(());
-        }
+    let Some(feed) = best else {
+        return Ok(None);
+    };
+    if is_key_blocked_inner(moderation, &issuer) {
+        capture_blocked_cids(blocked_cids, issuer, &feed);
+        return Ok(None);
     }
-    Ok(best)
+    let subs: HashSet<PeerId> = subscriptions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .copied()
+        .collect();
+    let changed = catalog
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .apply(feed.clone(), &subs);
+    if changed.unwrap_or(false) {
+        let _ = catalog_events.send(());
+    }
+    Ok(Some(feed))
 }
 
 /// Boucle de suivi actif des channels souscrits (spec channels §2) : à chaque
@@ -1351,12 +1519,15 @@ async fn fetch_feed_inner(
 /// poignées `Node` sont tombées (donc `alive.upgrade()` échoue), la boucle
 /// s'arrête et relâche son clone de `cmd_tx` — sinon la boucle d'évènements ne
 /// s'arrêterait jamais (`cmd_rx.recv()` attend que tous les émetteurs tombent).
+#[allow(clippy::too_many_arguments)]
 async fn follow_loop(
     alive: Weak<()>,
     cmd_tx: mpsc::Sender<Command>,
     catalog: Arc<Mutex<Catalog>>,
     catalog_events: tokio::sync::broadcast::Sender<()>,
     subscriptions: Arc<Mutex<BTreeSet<PeerId>>>,
+    moderation: Arc<RwLock<Moderation>>,
+    blocked_cids: Arc<Mutex<HashMap<PeerId, HashSet<Cid>>>>,
     follow_interval: Duration,
 ) {
     loop {
@@ -1370,8 +1541,16 @@ async fn follow_loop(
             .copied()
             .collect();
         for issuer in issuers {
-            if let Err(e) =
-                fetch_feed_inner(&cmd_tx, &catalog, &catalog_events, &subscriptions, issuer).await
+            if let Err(e) = fetch_feed_inner(
+                &cmd_tx,
+                &catalog,
+                &catalog_events,
+                &subscriptions,
+                &moderation,
+                &blocked_cids,
+                issuer,
+            )
+            .await
             {
                 tracing::debug!("suivi périodique de {issuer} échoué: {e}");
             }
@@ -1392,6 +1571,51 @@ fn is_blocked_inner(moderation: &Arc<RwLock<Moderation>>, cid: &Cid) -> bool {
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .is_blocked(cid)
+}
+
+/// Vrai si `issuer` est une clé bannie par une denylist souscrite. Utilisé
+/// aux points d'entrée du catalogue (gossip, DHT) pour rejeter les feeds
+/// d'une clé bloquée AVANT `Catalog::apply` — voir la doc de
+/// `handle_feed_message` pour la justification de ce choix (call site plutôt
+/// qu'un paramètre de `apply`).
+fn is_key_blocked_inner(moderation: &Arc<RwLock<Moderation>>, issuer: &PeerId) -> bool {
+    moderation
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_blocked_key(issuer)
+}
+
+/// Alimente `blocked_cids` avec les CIDs d'un feed d'une clé bloquée,
+/// capturés AVANT rejet (voir la doc du champ `Node::blocked_cids`) : même si
+/// ce feed précis n'est jamais réappliqué, ses CIDs restent couverts par le
+/// checkpoint #2/service.
+fn capture_blocked_cids(
+    blocked_cids: &Arc<Mutex<HashMap<PeerId, HashSet<Cid>>>>,
+    issuer: PeerId,
+    feed: &Feed,
+) {
+    if let Ok(cids) = feed.cids() {
+        blocked_cids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(issuer)
+            .or_default()
+            .extend(cids);
+    }
+}
+
+/// Vrai si `cid` appartient à l'ensemble dérivé `blocked_cids` (n'importe quel
+/// émetteur bloqué) — vérification EN PLUS de `is_blocked_inner` aux
+/// checkpoints #2/service.
+fn is_cid_in_blocked_set_inner(
+    blocked_cids: &Arc<Mutex<HashMap<PeerId, HashSet<Cid>>>>,
+    cid: &Cid,
+) -> bool {
+    blocked_cids
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .any(|s| s.contains(cid))
 }
 
 async fn get_providers_inner(
@@ -1477,6 +1701,7 @@ async fn emit_report_inner(
 async fn get_with_inner(
     blockstore: &Blockstore,
     moderation: &Arc<RwLock<Moderation>>,
+    blocked_cids: &Arc<Mutex<HashMap<PeerId, HashSet<Cid>>>>,
     cmd_tx: &mpsc::Sender<Command>,
     self_peer_id: PeerId,
     keypair: &Keypair,
@@ -1486,6 +1711,13 @@ async fn get_with_inner(
 ) -> CoreResult<Vec<u8>> {
     if is_blocked_inner(moderation, &cid) {
         emit_report_inner(cmd_tx, reports, keypair, &cid, "denylist").await;
+        return Err(CoreError::Moderated(cid.to_string()));
+    }
+    // EN PLUS de `is_blocked` : ce CID appartient au feed connu d'une clé
+    // bloquée (tâche 2/finding M2), même s'il n'est pas lui-même dans une
+    // liste de CIDs.
+    if is_cid_in_blocked_set_inner(blocked_cids, &cid) {
+        emit_report_inner(cmd_tx, reports, keypair, &cid, "clé bloquée").await;
         return Err(CoreError::Moderated(cid.to_string()));
     }
     let mut repairing_corruption = false;
@@ -1579,6 +1811,10 @@ struct SeedLoopState {
     /// ou quota) suggère que la situation a pu changer — pas sur un simple
     /// tic d'intervalle, qui ne change rien à lui seul.
     quota_blocked: Arc<Mutex<HashSet<String>>>,
+    /// Voir la doc du champ `Node::blocked_cids` — évite au seed proactif de
+    /// re-fetcher un CID appartenant au feed connu d'une clé bloquée entre
+    /// deux passes.
+    blocked_cids: Arc<Mutex<HashMap<PeerId, HashSet<Cid>>>>,
 }
 
 /// Fait de la place pour `extra` octets supplémentaires sous le quota
@@ -1722,6 +1958,7 @@ async fn seed_publication(
     let manifest_bytes = get_with_inner(
         &state.blockstore,
         &state.moderation,
+        &state.blocked_cids,
         &state.cmd_tx,
         state.peer_id,
         &state.keypair,
@@ -1759,6 +1996,7 @@ async fn seed_publication(
         match get_with_inner(
             &state.blockstore,
             &state.moderation,
+            &state.blocked_cids,
             &state.cmd_tx,
             state.peer_id,
             &state.keypair,
@@ -2016,6 +2254,9 @@ struct EventLoop {
     catalog_events: tokio::sync::broadcast::Sender<()>,
     reports: Arc<Mutex<ReportBook>>,
     subscriptions: Arc<Mutex<BTreeSet<PeerId>>>,
+    /// Voir la doc du champ `Node::blocked_cids` — alimenté ici quand un feed
+    /// gossip d'une clé bloquée est vu passer (`handle_feed_message`).
+    blocked_cids: Arc<Mutex<HashMap<PeerId, HashSet<Cid>>>>,
     feeds_topic: gossipsub::IdentTopic,
     reports_topic: gossipsub::IdentTopic,
     cmd_rx: mpsc::Receiver<Command>,
@@ -2041,6 +2282,7 @@ impl EventLoop {
         catalog_events: tokio::sync::broadcast::Sender<()>,
         reports: Arc<Mutex<ReportBook>>,
         subscriptions: Arc<Mutex<BTreeSet<PeerId>>>,
+        blocked_cids: Arc<Mutex<HashMap<PeerId, HashSet<Cid>>>>,
         feeds_topic: gossipsub::IdentTopic,
         reports_topic: gossipsub::IdentTopic,
         cmd_rx: mpsc::Receiver<Command>,
@@ -2053,6 +2295,7 @@ impl EventLoop {
             catalog_events,
             reports,
             subscriptions,
+            blocked_cids,
             feeds_topic,
             reports_topic,
             cmd_rx,
@@ -2176,6 +2419,9 @@ impl EventLoop {
                     Err(e) => Err(CoreError::Network(format!("gossipsub publish: {e}"))),
                 };
                 let _ = tx.send(res);
+            }
+            Command::StopProviding { key } => {
+                self.swarm.behaviour_mut().kademlia.stop_providing(&key);
             }
         }
     }
@@ -2322,6 +2568,16 @@ impl EventLoop {
     ///   (pas relayé, pas pénalisé : c'est du retard, pas de la malveillance) ;
     /// - illisible ou signature invalide → **Reject** (pénalise l'émetteur via
     ///   le peer scoring).
+    ///
+    /// CHECKPOINT MODÉRATION (ingestion catalogue, finding M2) : un feed dont
+    /// l'émetteur est une clé bloquée (denylist) n'entre JAMAIS au catalogue,
+    /// même signature valide — vérifiée EN PREMIER (`feed.verify()`) pour ne
+    /// jamais fonder ce check sur un `issuer_pubkey` non authentifié. Ses CIDs
+    /// connus sont capturés dans `blocked_cids` AVANT le rejet (purge
+    /// rétroactive future). Verdict **Reject** : le peer scoring gossipsub
+    /// décourage déjà le relais de cette clé, pas besoin d'un rapport P2P par
+    /// CID en plus (sobriété — le rapport existant reste déclenché par le
+    /// checkpoint #2 sur les contenus, pas ici).
     fn handle_feed_message(
         &mut self,
         message_id: &gossipsub::MessageId,
@@ -2329,31 +2585,47 @@ impl EventLoop {
         data: &[u8],
     ) {
         let acceptance = match Feed::from_json(data) {
-            Ok(feed) => {
-                let subs: HashSet<PeerId> = self
-                    .subscriptions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .iter()
-                    .copied()
-                    .collect();
-                match self
-                    .catalog
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .apply(feed, &subs)
-                {
-                    Ok(true) => {
-                        let _ = self.catalog_events.send(());
-                        gossipsub::MessageAcceptance::Accept
-                    }
-                    Ok(false) => gossipsub::MessageAcceptance::Ignore,
-                    Err(e) => {
-                        tracing::debug!("feed rejeté: {e}");
+            Ok(feed) => match feed.verify() {
+                Ok(()) => match feed.issuer_peer_id() {
+                    Ok(issuer) if is_key_blocked_inner(&self.moderation, &issuer) => {
+                        capture_blocked_cids(&self.blocked_cids, issuer, &feed);
                         gossipsub::MessageAcceptance::Reject
                     }
+                    Ok(_) => {
+                        let subs: HashSet<PeerId> = self
+                            .subscriptions
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .iter()
+                            .copied()
+                            .collect();
+                        match self
+                            .catalog
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .apply(feed, &subs)
+                        {
+                            Ok(true) => {
+                                let _ = self.catalog_events.send(());
+                                gossipsub::MessageAcceptance::Accept
+                            }
+                            Ok(false) => gossipsub::MessageAcceptance::Ignore,
+                            Err(e) => {
+                                tracing::debug!("feed rejeté: {e}");
+                                gossipsub::MessageAcceptance::Reject
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("feed sans émetteur exploitable: {e}");
+                        gossipsub::MessageAcceptance::Reject
+                    }
+                },
+                Err(e) => {
+                    tracing::debug!("feed invalide: {e}");
+                    gossipsub::MessageAcceptance::Reject
                 }
-            }
+            },
             Err(e) => {
                 tracing::debug!("feed illisible: {e}");
                 gossipsub::MessageAcceptance::Reject
@@ -2419,13 +2691,20 @@ impl EventLoop {
             request_response::Message::Request {
                 request, channel, ..
             } => {
-                // CHECKPOINT MODÉRATION : ne jamais servir un contenu matché.
+                // CHECKPOINT MODÉRATION : ne jamais servir un contenu matché —
+                // ni par denylist CID directe (`is_blocked`), ni par
+                // appartenance à un feed de clé bloquée (`blocked_cids`,
+                // tâche 2).
                 let blocked = self
                     .moderation
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let blocked_cids = self
+                    .blocked_cids
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let data = Cid::try_from(request.0.as_slice()).ok().and_then(|cid| {
-                    if blocked.is_blocked(&cid) {
+                    if blocked.is_blocked(&cid) || blocked_cids.values().any(|s| s.contains(&cid)) {
                         None
                     } else {
                         self.blockstore.get(&cid).ok()
