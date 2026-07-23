@@ -12,6 +12,8 @@
 
 use crate::blockstore::Blockstore;
 use crate::catalog::{Catalog, CatalogEntry, CatalogItem};
+#[cfg(feature = "cold-storage")]
+use crate::coldstore::ColdStore;
 use crate::content::{cid_for, verify};
 use crate::error::{CoreError, Result as CoreResult};
 use crate::feed::{ChannelMeta, Feed, FeedEntry};
@@ -37,6 +39,8 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "cold-storage")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -287,6 +291,18 @@ pub struct Node {
     #[allow(dead_code)]
     alive: Arc<()>,
     cmd_tx: mpsc::Sender<Command>,
+    /// Backend de repli de récupération froide (ADR 0008, CS-a tâche 3) —
+    /// `None` par défaut : aucun câblage de production dans cette tâche, seule
+    /// l'injection de test (`with_cold_for_tests`) le peuple. Gaté par la
+    /// feature `cold-storage` : absent de la struct (et donc du binaire) dans
+    /// un build par défaut.
+    #[cfg(feature = "cold-storage")]
+    cold: Option<Arc<dyn ColdStore>>,
+    /// Débrayage du repli froid, persisté (dotfile `.cold_enabled`) — un
+    /// utilisateur peut vouloir désactiver l'appel réseau au froid (coût,
+    /// vie privée) sans recompiler. Défaut vrai (absent/corrompu → activé).
+    #[cfg(feature = "cold-storage")]
+    cold_retrieval_enabled: Arc<AtomicBool>,
 }
 
 /// Aperçu d'un channel résolu par lien (spec 2026-07-23, partie A), voir
@@ -502,6 +518,14 @@ impl Node {
             seed_interval,
         ));
 
+        // Repli froid (CS-a tâche 3) : recharge le débrayage persisté (défaut
+        // activé si absent/corrompu, même patron que le profil de channel ou
+        // l'index de seed — un dotfile illisible ne doit jamais empêcher le
+        // démarrage du nœud). Aucun backend réel câblé ici : `cold` reste
+        // `None` tant qu'aucun appelant n'utilise `with_cold_for_tests`.
+        #[cfg(feature = "cold-storage")]
+        let cold_retrieval_enabled = Arc::new(AtomicBool::new(load_cold_enabled(&blockstore)));
+
         Ok(Self {
             peer_id,
             keypair,
@@ -520,6 +544,10 @@ impl Node {
             blocked_channels,
             alive,
             cmd_tx,
+            #[cfg(feature = "cold-storage")]
+            cold: None,
+            #[cfg(feature = "cold-storage")]
+            cold_retrieval_enabled,
         })
     }
 
@@ -1774,7 +1802,7 @@ impl Node {
     /// **signalé** aux pairs (rapport signé sur le topic des signalements,
     /// best-effort).
     pub(crate) async fn get_with(&self, cid: Cid, policy: StorePolicy) -> CoreResult<Vec<u8>> {
-        get_with_inner(
+        let result = get_with_inner(
             &self.blockstore,
             &self.moderation,
             &self.cmd_tx,
@@ -1784,7 +1812,79 @@ impl Node {
             cid,
             policy,
         )
-        .await
+        .await;
+
+        // Repli de récupération froide (ADR 0008, CS-a tâche 3) : uniquement
+        // sur `NoProviders` (plus aucun fournisseur P2P), jamais sur les
+        // autres erreurs (`Moderated` en particulier reste un refus ferme).
+        // No-op garanti si la feature est absente ou si aucun `ColdStore`
+        // n'est câblé : `result` est alors renvoyé tel quel, comportement
+        // identique à avant cette tâche.
+        #[cfg(feature = "cold-storage")]
+        if matches!(&result, Err(CoreError::NoProviders(_)))
+            && self.cold_retrieval_enabled.load(Ordering::Relaxed)
+        {
+            if let Some(cold) = self.cold.as_ref() {
+                return cold_fallback_inner(
+                    &self.blockstore,
+                    &self.moderation,
+                    &self.cmd_tx,
+                    &self.reports,
+                    &self.keypair,
+                    cold,
+                    cid,
+                    policy,
+                )
+                .await;
+            }
+        }
+
+        result
+    }
+
+    /// Active/désactive le repli de récupération froide et persiste le choix
+    /// (dotfile `.cold_enabled`, à côté des blocs). Débrayable sans
+    /// recompiler : coût réseau/monétaire du froid, ou préférence de vie
+    /// privée de l'utilisateur.
+    #[cfg(feature = "cold-storage")]
+    pub fn set_cold_retrieval(&self, enabled: bool) -> CoreResult<()> {
+        self.cold_retrieval_enabled
+            .store(enabled, Ordering::Relaxed);
+        save_cold_enabled(&self.blockstore, enabled)
+    }
+
+    /// État courant du débrayage de repli froid (vrai par défaut).
+    #[cfg(feature = "cold-storage")]
+    pub fn cold_retrieval_enabled(&self) -> bool {
+        self.cold_retrieval_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Injecte un backend [`ColdStore`] (tests/configuration) : le câblage
+    /// d'un backend réel (`ArweaveColdStore`) est un détail de configuration
+    /// laissé à un suivi ultérieur — cette tâche prouve le repli avec un
+    /// backend injectable.
+    #[cfg(feature = "cold-storage")]
+    #[doc(hidden)]
+    pub fn with_cold_for_tests(&self, cold: Arc<dyn ColdStore>) -> Self {
+        let mut node = self.clone();
+        node.cold = Some(cold);
+        node
+    }
+
+    /// Passerelle de test vers `get_with` : `StorePolicy` est `pub(crate)`
+    /// (interne au crate) et les tests d'intégration du repli froid (tâche 3)
+    /// vivent hors crate — ce point d'entrée `#[doc(hidden)]` expose le seul
+    /// comportement observable nécessaire (`seed: bool`) sans élargir l'API
+    /// publique pour de vrai.
+    #[cfg(feature = "cold-storage")]
+    #[doc(hidden)]
+    pub async fn get_with_policy_for_tests(&self, cid: Cid, seed: bool) -> CoreResult<Vec<u8>> {
+        let policy = if seed {
+            StorePolicy::Seed
+        } else {
+            StorePolicy::Stream
+        };
+        self.get_with(cid, policy).await
     }
 
     /// Demande un bloc précis à un pair précis. Les octets reçus sont **vérifiés
@@ -1855,6 +1955,31 @@ fn save_subscriptions(blockstore: &Blockstore, subs: &BTreeSet<PeerId>) -> CoreR
     let json = serde_json::to_string(&ids)
         .map_err(|e| CoreError::Network(format!("json abonnements: {e}")))?;
     std::fs::write(subscriptions_path(blockstore), json)?;
+    Ok(())
+}
+
+/// Chemin du débrayage de repli froid persisté (CS-a tâche 3), à côté des
+/// blocs — même patron que `.subscriptions`/`.seed_quota`.
+#[cfg(feature = "cold-storage")]
+fn cold_enabled_path(blockstore: &Blockstore) -> PathBuf {
+    blockstore.root().join(".cold_enabled")
+}
+
+/// Charge le débrayage persisté (activé par défaut si absent/illisible — un
+/// dotfile corrompu ne doit pas empêcher le démarrage, ni couper silencieusement
+/// un repli que l'utilisateur attend).
+#[cfg(feature = "cold-storage")]
+fn load_cold_enabled(blockstore: &Blockstore) -> bool {
+    std::fs::read_to_string(cold_enabled_path(blockstore))
+        .ok()
+        .and_then(|s| s.trim().parse::<bool>().ok())
+        .unwrap_or(true)
+}
+
+/// Persiste le débrayage de repli froid.
+#[cfg(feature = "cold-storage")]
+fn save_cold_enabled(blockstore: &Blockstore, enabled: bool) -> CoreResult<()> {
+    std::fs::write(cold_enabled_path(blockstore), enabled.to_string())?;
     Ok(())
 }
 
@@ -2216,6 +2341,42 @@ async fn get_with_inner(
         }
     }
     Err(CoreError::BlockNotFound(cid.to_string()))
+}
+
+/// Repli de récupération froide (ADR 0008, CS-a tâche 3) : appelé par
+/// `Node::get_with` uniquement quand `get_with_inner` a épuisé le P2P
+/// (`NoProviders`). `retrieve` a déjà vérifié le CID (spec « repli, pas un
+/// CDN ») ; re-vérifier via `blockstore.put` (content-addressed) reste
+/// gratuit et défensif. `Ok(None)` (introuvable au froid aussi) propage
+/// `NoProviders` — jamais une erreur pour une simple absence.
+///
+/// CHECKPOINT MODÉRATION #2 : identique au chemin P2P — un contenu matché
+/// n'est ni mis en cache ni fourni, quelle que soit `policy`, et le refus
+/// est signalé (best-effort) aux pairs.
+#[cfg(feature = "cold-storage")]
+#[allow(clippy::too_many_arguments)]
+async fn cold_fallback_inner(
+    blockstore: &Blockstore,
+    moderation: &Arc<RwLock<Moderation>>,
+    cmd_tx: &mpsc::Sender<Command>,
+    reports: &Arc<Mutex<ReportBook>>,
+    keypair: &Keypair,
+    cold: &Arc<dyn ColdStore>,
+    cid: Cid,
+    policy: StorePolicy,
+) -> CoreResult<Vec<u8>> {
+    let Some(bytes) = cold.retrieve(cid).await? else {
+        return Err(CoreError::NoProviders(cid.to_string()));
+    };
+    if is_blocked_inner(moderation, &cid) {
+        emit_report_inner(cmd_tx, reports, keypair, &cid, "denylist").await;
+        return Err(CoreError::Moderated(cid.to_string()));
+    }
+    if policy == StorePolicy::Seed {
+        blockstore.put(&bytes)?;
+        let _ = provide_inner(cmd_tx, moderation, cid).await;
+    }
+    Ok(bytes)
 }
 
 /// Supprime du magasin les blocs de `publications` qui ne sont référencés par

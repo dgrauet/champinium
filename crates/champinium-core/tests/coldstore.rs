@@ -8,8 +8,12 @@
 
 use champinium_core::coldstore::arweave::ArweaveColdStore;
 use champinium_core::coldstore::receipts::{load_receipts, save_receipt};
-use champinium_core::coldstore::{ArchiveReceipt, ArweaveWallet, ColdStore};
+use champinium_core::coldstore::{ArchivePayload, ArchiveReceipt, ArweaveWallet, ColdStore};
 use champinium_core::content::cid_for;
+use champinium_core::identity::load_or_generate;
+use champinium_core::{Blockstore, Cid, CoreError, Denylist, Moderation, Node};
+use std::sync::Arc;
+use std::time::Duration;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -307,4 +311,200 @@ fn wallet_from_path_accepts_correct_permissions() {
 
     let result = ArweaveWallet::from_path(&wallet_path);
     assert!(result.is_ok());
+}
+
+// --- Tâche 3 : repli de récupération froid dans `Node::get_with`. ---
+//
+// `Node::get_with` (politique de stockage) et `StorePolicy` sont internes au
+// crate (`pub(crate)`) : les tests ci-dessous passent par les passerelles
+// `#[doc(hidden)]` `Node::with_cold_for_tests` / `Node::get_with_policy_for_tests`
+// ajoutées pour cette tâche — aucune autre API publique n'est élargie.
+
+/// Sert un unique CID connu depuis un backend froid simulé (pas de réseau
+/// réel : juste une paire (CID, octets) en mémoire). `archive`/`price`/
+/// `balance` ne sont pas exercées par ces tests (couvertes par ailleurs) —
+/// non implémentées ici volontairement (échec explicite si jamais appelées).
+struct MockColdStore {
+    cid: Cid,
+    bytes: Vec<u8>,
+}
+
+#[async_trait::async_trait]
+impl ColdStore for MockColdStore {
+    async fn retrieve(&self, cid: Cid) -> champinium_core::Result<Option<Vec<u8>>> {
+        Ok(if cid == self.cid {
+            Some(self.bytes.clone())
+        } else {
+            None
+        })
+    }
+
+    async fn archive(
+        &self,
+        _publication: &ArchivePayload,
+        _wallet: &ArweaveWallet,
+    ) -> champinium_core::Result<ArchiveReceipt> {
+        Err(CoreError::Network(
+            "MockColdStore::archive non implémenté".into(),
+        ))
+    }
+
+    async fn price(&self, _bytes: u64) -> champinium_core::Result<u64> {
+        Err(CoreError::Network(
+            "MockColdStore::price non implémenté".into(),
+        ))
+    }
+
+    async fn balance(&self, _wallet: &ArweaveWallet) -> champinium_core::Result<u64> {
+        Err(CoreError::Network(
+            "MockColdStore::balance non implémenté".into(),
+        ))
+    }
+}
+
+async fn solo_node(dir: &std::path::Path, name: &str) -> Node {
+    let kp = load_or_generate(dir.join(format!("{name}.key"))).unwrap();
+    let bs = Blockstore::open(dir.join(name)).unwrap();
+    Node::with_moderation(kp, bs, Moderation::empty())
+        .await
+        .unwrap()
+}
+
+/// (1) Aucun fournisseur P2P (nœud isolé) : le repli froid sert quand même
+/// les octets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallback_serves_bytes_when_no_p2p_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = b"contenu uniquement au froid, aucun pair ne l'a".to_vec();
+    let cid = cid_for(&bytes);
+
+    let node = solo_node(dir.path(), "solo").await;
+    let cold = Arc::new(MockColdStore {
+        cid,
+        bytes: bytes.clone(),
+    });
+    let node = node.with_cold_for_tests(cold);
+
+    let got = node
+        .get_with_policy_for_tests(cid, false)
+        .await
+        .expect("le repli froid doit servir le contenu");
+    assert_eq!(got, bytes);
+}
+
+/// (2) Sous politique Seed, le bloc récupéré au froid entre au blockstore ET
+/// le nœud devient fournisseur (réamorce le P2P) — vérifié depuis un second
+/// nœud qui se connecte APRÈS coup, comme `reprovide_makes_stored_blocks_discoverable`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallback_under_seed_policy_enters_blockstore_and_reprovides() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = b"contenu froid a reamorcer sur le p2p".to_vec();
+    let cid = cid_for(&bytes);
+
+    let node_b = solo_node(dir.path(), "b").await;
+    let cold = Arc::new(MockColdStore {
+        cid,
+        bytes: bytes.clone(),
+    });
+    let node_b = node_b.with_cold_for_tests(cold);
+
+    let got = node_b
+        .get_with_policy_for_tests(cid, true)
+        .await
+        .expect("le repli froid doit servir le contenu sous Seed");
+    assert_eq!(got, bytes);
+    assert!(
+        node_b.blockstore().has(&cid),
+        "Seed doit mettre le bloc récupéré au froid en cache"
+    );
+
+    // B réannonce déjà côté DHT locale ; A se connecte ensuite et doit le
+    // découvrir comme fournisseur.
+    let node_a = solo_node(dir.path(), "a").await;
+    let addr_b = node_b
+        .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .await
+        .unwrap();
+    node_a
+        .add_address(node_b.peer_id(), addr_b.clone())
+        .await
+        .unwrap();
+    node_a.dial(addr_b).await.unwrap();
+
+    let found = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let providers = node_a.get_providers(cid).await.unwrap_or_default();
+            if providers.contains(&node_b.peer_id()) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("B doit devenir fournisseur découvrable après le repli Seed");
+    assert!(found);
+}
+
+/// (3) Débrayé (`set_cold_retrieval(false)`) : pas de repli, `NoProviders`
+/// propagée telle quelle malgré un `ColdStore` capable de servir le contenu.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallback_disabled_propagates_no_providers() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = b"contenu froid disponible mais repli debraye".to_vec();
+    let cid = cid_for(&bytes);
+
+    let node = solo_node(dir.path(), "solo").await;
+    let cold = Arc::new(MockColdStore {
+        cid,
+        bytes: bytes.clone(),
+    });
+    let node = node.with_cold_for_tests(cold);
+    assert!(node.cold_retrieval_enabled(), "activé par défaut");
+    node.set_cold_retrieval(false).unwrap();
+    assert!(!node.cold_retrieval_enabled());
+
+    let err = node
+        .get_with_policy_for_tests(cid, false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CoreError::NoProviders(_)),
+        "débrayé, aucun repli : NoProviders doit être propagée telle quelle"
+    );
+}
+
+/// (4) Un contenu en denylist récupéré depuis le froid reste refusé —
+/// checkpoint modération #2 inchangé, qu'il vienne du P2P ou du froid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallback_still_enforces_moderation_checkpoint_two() {
+    let dir = tempfile::tempdir().unwrap();
+    let forbidden = b"contenu interdit, meme recupere au froid".to_vec();
+    let cid = cid_for(&forbidden);
+
+    let issuer = load_or_generate(dir.path().join("issuer.key")).unwrap();
+    let dl = Denylist::build_signed("test", "2026-07-23T00:00:00Z", &issuer, &[cid], &[]).unwrap();
+    let mut moderation = Moderation::empty();
+    moderation.subscribe(&dl).unwrap();
+
+    let kp = load_or_generate(dir.path().join("node.key")).unwrap();
+    let bs = Blockstore::open(dir.path().join("blocks")).unwrap();
+    let node = Node::with_moderation(kp, bs, moderation).await.unwrap();
+    let cold = Arc::new(MockColdStore {
+        cid,
+        bytes: forbidden.clone(),
+    });
+    let node = node.with_cold_for_tests(cold);
+
+    let err = node
+        .get_with_policy_for_tests(cid, false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CoreError::Moderated(_)),
+        "checkpoint #2 doit refuser le contenu même récupéré au froid"
+    );
+    assert!(
+        !node.blockstore().has(&cid),
+        "un contenu refusé ne doit jamais entrer au blockstore"
+    );
 }
