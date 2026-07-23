@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Icône PLACEHOLDER du front Champinium (champignon stylisé) — à remplacer
+     par une vraie identité visuelle. Suffit à faire passer appstreamcli
+     (gui-app-without-icon) pour le build Flatpak de validation. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <rect width="128" height="128" rx="24" fill="#2e7d5b"/>
+  <!-- chapeau -->
+  <path d="M28 64c0-24 16-38 36-38s36 14 36 38z" fill="#e8f5ee"/>
+  <path d="M28 64c0-24 16-38 36-38s36 14 36 38z" fill="none" stroke="#1b5e40" stroke-width="3"/>
+  <!-- pied -->
+  <path d="M52 64h24v28a12 12 0 0 1-24 0z" fill="#cfe8dc"/>
+  <circle cx="52" cy="50" r="4" fill="#2e7d5b"/>
+  <circle cx="76" cy="52" r="3" fill="#2e7d5b"/>
+  <circle cx="64" cy="42" r="3.5" fill="#2e7d5b"/>
+</svg>
