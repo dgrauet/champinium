@@ -34,7 +34,7 @@
 
 app-id: org.champinium.Champinium
 runtime: org.gnome.Platform
-runtime-version: "47"
+runtime-version: "48"
 sdk: org.gnome.Sdk
 command: champinium
 
@@ -84,6 +84,10 @@ modules:
         export PATH="$CARGO_HOME/bin:$PATH"
         cargo build --release -p champinium-linux --features gui
       - install -Dm755 target/release/champinium /app/bin/champinium
+      # Icône placeholder (appstreamcli refuse une app GUI sans icône) — à
+      # remplacer par une vraie identité visuelle.
+      - install -Dm644 packaging/flatpak/org.champinium.Champinium.svg
+        /app/share/icons/hicolor/scalable/apps/org.champinium.Champinium.svg
       - install -Dm644 packaging/flatpak/org.champinium.Champinium.desktop
         /app/share/applications/org.champinium.Champinium.desktop
       - install -Dm644 packaging/flatpak/org.champinium.Champinium.metainfo.xml

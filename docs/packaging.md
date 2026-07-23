@@ -65,15 +65,28 @@ localement ou distribuable en `.flatpak` autonome.
   `~/.var/app/org.champinium.Champinium/data` par la redirection standard de
   `XDG_DATA_HOME` par le sandbox — aucune permission supplémentaire requise
   pour que l'identité/les blocs persistent entre lancements.
-- **Sources cargo** : build avec `--share=network` pendant la compilation
-  (cargo télécharge les crates), PAS de vendoring hors-ligne
-  (`cargo-sources.json` via `flatpak-cargo-generator`) pour l'instant — écart
-  assumé, voir le commentaire en tête du manifeste. Une vraie publication
-  Flathub devrait basculer sur des sources vendorisées (Flathub l'exige pour
-  la reproductibilité des modules cargo).
-- **Icône d'app** : aucune n'existe encore dans le repo (aucun front n'en a
-  une committée) → suivi, le `.desktop` omet volontairement la clé `Icon=`
-  en attendant.
+- **Chaîne d'approvisionnement du build (durcissement requis avant Flathub)** :
+  deux vecteurs réseau non reproductibles au build, à supprimer ensemble pour
+  une publication réelle —
+    - **Sources cargo** : build avec `--share=network` (cargo télécharge les
+      crates), PAS de vendoring hors-ligne (`cargo-sources.json` via
+      `flatpak-cargo-generator`). Flathub exige des sources vendorisées pour la
+      reproductibilité des modules cargo.
+    - **Toolchain rustc** : installé au build via `curl https://sh.rustup.rs | sh`
+      (l'extension SDK `rust-stable` de GNOME est trop ancienne pour la pile
+      gtk-rs courante, qui exige rustc ≥ 1.92). Ce `curl | sh` exécute un
+      script distant **non épinglé** — vecteur supply-chain relevé en revue.
+      Un vrai build doit épingler rustup (URL + somme de contrôle de
+      `rustup-init`, toolchain figé) ou fournir rustc via une extension SDK à
+      jour. Les sources cargo vendorisées ci-dessus supprimeront de toute façon
+      le besoin de réseau au build.
+- **Icône d'app** : une icône **placeholder** (`org.champinium.Champinium.svg`,
+  champignon stylisé) est installée pour satisfaire `appstreamcli`
+  (`gui-app-without-icon`) — à remplacer par une vraie identité visuelle.
+- **Lecture H.264/AAC** : le runtime `org.gnome.Platform` de base n'embarque pas
+  gstreamer-plugins-bad/libav → l'app se lance mais ne lit pas la plupart des
+  vidéos. **Bloqueur avant tout usage réel** : ajouter ces plugins en modules
+  flatpak-builder.
 
 ### Build/installation locale
 
