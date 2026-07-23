@@ -213,6 +213,41 @@ sur le chemin de cette requête. C'est inhérent au suivi actif voulu par la
 spec (§2), pas un défaut d'implémentation — mais ça mérite d'être dit
 explicitement plutôt que de laisser croire à une confidentialité totale.
 
+### Aperçu de channel par lien : prévisualiser avant de s'abonner
+
+Coller un lien `champinium://channel/<peerid>` (ou un PeerId nu) dans un des
+trois fronts **ne s'abonne plus directement** — c'est une décision produit
+délibérée : le collage ouvre d'abord une **fiche d'aperçu**
+(`resolve_channel`), et c'est depuis cette fiche que l'utilisateur choisit
+explicitement de s'abonner. Le champ de collage → bouton « Aperçu » (état de
+chargement pendant l'appel réseau, potentiellement lent) → fiche affichant
+nom/description/avatar + contenus connus, avec « S'abonner » / « Se
+désabonner » selon l'état réel d'abonnement, ou « Channel bloqué » si
+l'émetteur est bloqué localement (§7).
+
+`Node::resolve_channel` résout **catalogue d'abord** (zéro appel réseau si
+l'émetteur y figure déjà), sinon via la DHT (même vérification
+signature/émetteur que `fetch_feed`), puis relit le catalogue qu'il vient
+d'alimenter ; introuvable des deux côtés → `NotFound`.
+
+Nuance de modération à connaître : un émetteur **bloqué localement reste
+résolvable** — l'aperçu reste consultable (`blocked = true`) pour que
+l'utilisateur puisse revoir ce qu'il a bloqué avant, par exemple, un
+déblocage. Mais le checkpoint de modération à l'ingestion (lot d) continue de
+**rejeter les feeds d'une clé bloquée avant `Catalog::apply`** : le feed d'un
+émetteur bloqué **n'entre donc jamais au catalogue**, quel que soit le nombre
+d'aperçus consultés. Pour honorer les deux à la fois, le chemin bloqué de
+`resolve_channel` interroge la DHT lui-même et construit l'aperçu directement
+depuis le `Feed` vérifié, sans jamais passer par `Catalog::apply` — l'aperçu
+d'un channel bloqué est un instantané pur, il ne contourne pas le rejet à
+l'ingestion.
+
+**Partie B** (enregistrement du scheme `champinium://` auprès de l'OS —
+`CFBundleURLTypes`/`onOpenURL` macOS, `x-scheme-handler` + instance unique
+Linux, registre Windows — pour ouvrir un lien d'un clic depuis un navigateur,
+plutôt que de le coller manuellement) est **différée à la Phase 6
+(packaging)**, sur ce même `resolve_channel`.
+
 ### Lecture (`StorePolicy::Stream` par défaut)
 
 ```
@@ -433,7 +468,7 @@ Autour, trois mécanismes d'écosystème :
   catalogue borné à 1024 émetteurs (refus-quand-plein, pas d'éviction), c'est
   la défense contre l'inondation par clés jetables.
 
-## 8. La frontière FFI : le contrat v8
+## 8. La frontière FFI : le contrat v9
 
 La surface UniFFI de [`ffi.rs`](../crates/champinium-core/src/ffi.rs) est
 **le contrat** entre le noyau et les fronts (tableau exhaustif et protocole de
@@ -447,13 +482,21 @@ changement dans [`AGENTS.md`](../AGENTS.md)). Ce qui la caractérise :
   re-dispatche vers son thread principal et relit l'instantané `catalog()`.
   Choix assumé vs un `Stream` : tic fusionnable + relecture d'instantané, plus
   simple des deux côtés.
+- **Aperçu de channel par lien (v9)** : `resolve_channel(lien-ou-peerid) ->
+  FfiChannelPreview` (async), même tolérance de parsing que
+  `subscribe_channel`/`block_channel` (lien `champinium://channel/<peerid>` ou
+  PeerId nu). Record `FfiChannelPreview { peer_id, name, description,
+  avatar_cid, items, subscribed, blocked }` — identité éditoriale aplatie,
+  même choix que `FfiCatalogEntry`. `subscribe_channel`/`unsubscribe_channel`
+  ne changent pas (toujours contrat v6) : l'aperçu et l'abonnement restent
+  deux actions FFI distinctes, voir §6.
 - **Erreurs typées** : `FfiError::{Moderated, Network, NotFound, InvalidInput,
   Internal}` — un contenu bloqué par la modération s'affiche « contenu
   bloqué », pas comme une panne réseau.
 - **Bindings générés au build, jamais commités** : Swift via
   UniFFI/XCFramework (`just macos-prepare`), C# via `uniffi-bindgen-cs`
   (`just gen-csharp`). Le front Linux consomme le crate **directement** (pas
-  de FFI). `CONTRACT_VERSION` (=8) permet aux fronts de détecter une
+  de FFI). `CONTRACT_VERSION` (=9) permet aux fronts de détecter une
   incompatibilité au démarrage.
 - **Abonnements (v6)** : `subscribe_channel`/`unsubscribe_channel` (lien
   `champinium://channel/<peerid>` ou PeerId nu), `subscriptions` (liste

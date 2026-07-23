@@ -312,6 +312,34 @@ sur deux machines physiques.
   Les trois fronts ont l'action « Bloquer » (vue Explorer) + un volet « Channels
   bloqués ». Spec :
   `~/Work/.superpowers/champinium/specs/2026-07-22-channels-subscriptions-design.md`.
+- **Aperçu de channel par lien ✔** : `Node::resolve_channel(peer_id)` résout un
+  aperçu **catalogue d'abord** (zéro appel réseau si l'émetteur y figure déjà),
+  sinon DHT (`fetch_verified_feed_from_dht`) puis relecture ; introuvable →
+  `NotFound`. **Décision produit** : coller un lien `champinium://channel/…`
+  (ou un PeerId nu) **ne s'abonne plus directement** — il ouvre d'abord une
+  fiche d'aperçu (nom/description/avatar, contenus connus,
+  `subscribed`/`blocked`), et c'est depuis cette fiche que l'utilisateur choisit
+  explicitement de s'abonner ; l'abonnement direct au collage est retiré des
+  trois fronts. **Nuance modération** : un émetteur **bloqué localement reste
+  résolvable** (`blocked = true`, aperçu autorisé pour pouvoir décider un
+  déblocage en connaissance de cause) mais son feed **n'entre jamais au
+  catalogue** — le chemin bloqué construit l'aperçu directement depuis le feed
+  vérifié en DHT, sans passer par `Catalog::apply` (le checkpoint de
+  modération à l'ingestion continue de rejeter ces feeds à l'entrée du
+  catalogue, lot d ; `resolve_channel` ne contourne pas ce rejet, il construit
+  juste un instantané en plus). Contrat FFI **v9** : `resolve_channel(lien-ou-
+  peerid) -> FfiChannelPreview` (async), record `FfiChannelPreview { peer_id,
+  name, description, avatar_cid, items, subscribed, blocked }` ;
+  `subscribe_channel`/`unsubscribe_channel` inchangés (toujours contrat v6).
+  Les trois fronts : champ de collage de lien → bouton « Aperçu » (état de
+  chargement pendant l'appel async) → fiche/feuille/fenêtre d'aperçu avec
+  « S'abonner » / « Se désabonner » selon `subscribed`, ou « Channel bloqué »
+  si `blocked`. **Partie B** (enregistrement du scheme `champinium://` auprès
+  de l'OS — `CFBundleURLTypes`/`onOpenURL`, `x-scheme-handler` + instance
+  unique, registre Windows — pour ouvrir un lien d'un clic depuis un
+  navigateur) reste **différée à la Phase 6 (packaging)**, sur ce même
+  `resolve_channel` : coller le lien manuellement dans l'app reste le seul
+  chemin jusque-là.
 - **Durabilité du record de feed ✔** : `Node::republish_known_feeds`
   (`champinium-seed`, même boucle que `reprovide_all`) re-PUT dans la DHT le
   feed signé du nœud lui-même et ceux de ses **abonnements** — corrige un
@@ -330,9 +358,10 @@ NAT ✔, seeding ✔, feed DHT ✔, fetch concurrent ✔, déploiement tiers doc
 bitswap différé)** → 5 (en cours : peer scoring ✔, signalement P2P ✔, réplication
 mesurée ✔, recherche ✔ (#20) ; **refonte channels COMPLÈTE** — lot (a) identité
 ✔, lot (b) abonnements ✔, lot (c) seed proactif/quota/pins ✔, lot (d) modération
-par clé + blocage local + signalements par channel ✔ ; durabilité du record de
-feed ✔ (`republish_known_feeds`) ; IPNS #21 close, voir ADR 0007). Voir le
-spec.
+par clé + blocage local + signalements par channel ✔ ; aperçu de channel par
+lien ✔ (`resolve_channel`, contrat v9, partie B différée Phase 6) ; durabilité
+du record de feed ✔ (`republish_known_feeds`) ; IPNS #21 close, voir ADR 0007).
+Voir le spec.
 
 **Dernière release : voir `.release-please-manifest.json` / CHANGELOG** —
 pas de version en dur ici, elle dérive (règle intendant DG006). Release-please
