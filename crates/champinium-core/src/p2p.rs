@@ -11,7 +11,7 @@
 //! boucle d'évènements tourne dans une tâche tokio dédiée.
 
 use crate::blockstore::Blockstore;
-use crate::catalog::{Catalog, CatalogEntry};
+use crate::catalog::{Catalog, CatalogEntry, CatalogItem};
 use crate::content::{cid_for, verify};
 use crate::error::{CoreError, Result as CoreResult};
 use crate::feed::{ChannelMeta, Feed, FeedEntry};
@@ -287,6 +287,35 @@ pub struct Node {
     #[allow(dead_code)]
     alive: Arc<()>,
     cmd_tx: mpsc::Sender<Command>,
+}
+
+/// Aperçu d'un channel résolu par lien (spec 2026-07-23, partie A), voir
+/// [`Node::resolve_channel`]. Instantané en lecture seule — ne crée ni
+/// n'implique aucun abonnement.
+#[derive(Debug, Clone)]
+pub struct ChannelPreview {
+    pub issuer: PeerId,
+    pub channel: ChannelMeta,
+    pub items: Vec<CatalogItem>,
+    pub subscribed: bool,
+    pub blocked: bool,
+}
+
+/// Convertit les entrées d'un [`Feed`] en [`CatalogItem`] — même règle que
+/// [`Catalog::entries`] (CID invalide silencieusement ignoré), dupliquée ici
+/// car `resolve_channel` doit pouvoir construire un aperçu SANS passer par le
+/// catalogue (chemin clé bloquée, voir sa doc).
+fn catalog_items_from_feed(feed: &Feed) -> Vec<CatalogItem> {
+    feed.entries
+        .iter()
+        .filter_map(|e| {
+            e.cid.parse::<Cid>().ok().map(|cid| CatalogItem {
+                cid,
+                title: e.title.clone(),
+                tags: e.tags.clone(),
+            })
+        })
+        .collect()
 }
 
 impl Node {
@@ -930,6 +959,86 @@ impl Node {
             issuer,
         )
         .await
+    }
+
+    /// Résout un aperçu de channel par lien (spec 2026-07-23, partie A) :
+    /// **catalogue d'abord** (aucun appel réseau si l'émetteur y figure déjà),
+    /// sinon [`Node::fetch_feed`] (DHT) puis relecture du catalogue qu'il vient
+    /// d'alimenter. Toujours absent après ça → `CoreError::NoProviders`.
+    ///
+    /// Un channel **bloqué localement reste résolvable** (aperçu autorisé,
+    /// `blocked = true`) : c'est un choix délibéré, l'utilisateur qui a bloqué
+    /// doit pouvoir revoir ce qu'il a bloqué (ex. avant un déblocage). Mais le
+    /// checkpoint de modération à l'ingestion (lot d, `is_key_blocked_inner`)
+    /// rejette les feeds d'une clé bloquée *avant* `Catalog::apply` — donc
+    /// `fetch_feed` renvoie systématiquement `None` pour une clé bloquée (voir
+    /// `fetch_feed_from_key_blocked_issuer_returns_none`, contrat déjà testé,
+    /// à ne pas casser). Pour rester cohérent avec CE rejet tout en honorant
+    /// « bloqué reste résolvable », `resolve_channel` interroge la DHT
+    /// lui-même via `fetch_verified_feed_from_dht` (même vérification
+    /// signature/émetteur que `fetch_feed`, mais SANS le filtre modération) et
+    /// construit l'aperçu directement depuis ce `Feed` — sans jamais
+    /// l'insérer au catalogue via `Catalog::apply`.
+    ///
+    /// `subscribed` reflète l'état réel des abonnements ; pour un bloqué il
+    /// est toujours faux, le blocage désabonnant (lot d) — aucun abonnement
+    /// implicite n'est créé ou supposé ici, l'aperçu est un instantané pur.
+    ///
+    /// Discipline verrous : les instantanés (catalogue, abonnements, blocage)
+    /// sont pris et relâchés avant tout `.await` — `catalog_entries()`,
+    /// `subscriptions_snapshot()` et `is_key_blocked_inner` sont toutes des
+    /// fonctions synchrones qui clonent puis relâchent leur verrou en interne.
+    pub async fn resolve_channel(&self, issuer: PeerId) -> CoreResult<ChannelPreview> {
+        // 1. Catalogue d'abord : aucun réseau si l'entrée est déjà connue.
+        if let Some(entry) = self
+            .catalog_entries()
+            .into_iter()
+            .find(|e| e.issuer == issuer)
+        {
+            let subscribed = self.subscriptions_snapshot().contains(&issuer);
+            let blocked = is_key_blocked_inner(&self.moderation, &self.blocked_channels, &issuer);
+            return Ok(ChannelPreview {
+                issuer,
+                channel: entry.channel,
+                items: entry.items,
+                subscribed,
+                blocked,
+            });
+        }
+
+        // 2. Absent du catalogue. Une clé bloquée n'y entrera jamais (rejet à
+        // l'ingestion, lot d) : chemin dédié, sans `Catalog::apply`.
+        if is_key_blocked_inner(&self.moderation, &self.blocked_channels, &issuer) {
+            let feed = fetch_verified_feed_from_dht(&self.cmd_tx, issuer)
+                .await?
+                .ok_or_else(|| CoreError::NoProviders(issuer.to_string()))?;
+            return Ok(ChannelPreview {
+                issuer,
+                channel: feed.channel.clone(),
+                items: catalog_items_from_feed(&feed),
+                subscribed: false, // le blocage désabonne (lot d).
+                blocked: true,
+            });
+        }
+
+        // 3. Clé non bloquée : `fetch_feed` alimente déjà le catalogue en cas
+        // de succès (comportement existant) — la relecture suffit.
+        if self.fetch_feed(issuer).await?.is_none() {
+            return Err(CoreError::NoProviders(issuer.to_string()));
+        }
+        let entry = self
+            .catalog_entries()
+            .into_iter()
+            .find(|e| e.issuer == issuer)
+            .expect("fetch_feed vient d'alimenter le catalogue pour cet émetteur");
+        let subscribed = self.subscriptions_snapshot().contains(&issuer);
+        Ok(ChannelPreview {
+            issuer,
+            channel: entry.channel,
+            items: entry.items,
+            subscribed,
+            blocked: false,
+        })
     }
 
     /// Ingestion : segmente `input` en HLS via ffmpeg, stocke chaque segment
@@ -1757,36 +1866,14 @@ fn save_blocked_channels(blockstore: &Blockstore, blocked: &BTreeSet<PeerId>) ->
     Ok(())
 }
 
-/// Cœur de `Node::fetch_feed`, factorisé pour être réutilisable par la boucle
-/// de suivi périodique (qui ne détient qu'un clone des champs nécessaires, pas
-/// un `Node` entier — voir `follow_loop`). Récupère le feed d'un créateur
-/// depuis la DHT, vérifie signature + émetteur, retient le `seq` le plus
-/// élevé, l'applique au catalogue (avec exemption de borne s'il est souscrit).
-///
-/// CHECKPOINT MODÉRATION (ingestion catalogue, finding M2) : si `issuer` est
-/// une clé bloquée, le feed trouvé (signature déjà vérifiée) n'est PAS
-/// appliqué au catalogue, et la fonction renvoie `Ok(None)` (« aucun feed
-/// exploitable », même sémantique que si rien n'avait été trouvé) plutôt que
-/// le feed rejeté : un appelant ne doit pas pouvoir distinguer « rien trouvé »
-/// de « trouvé mais bloqué », ce qui éviterait toute fuite d'information sur
-/// le contenu d'une clé bannie.
-///
-/// N'alimente PLUS de registre de CIDs dérivé depuis le contenu du feed
-/// (revue post-implémentation, finding critique I2, retiré après la tâche
-/// 3) : capturer les CIDs *listés par* une clé bannie et les bloquer
-/// aveuglément permettait à cette clé de faire disparaître le contenu d'un
-/// tiers innocent en le mentionnant dans son propre feed — lister un CID ne
-/// prouve rien sur qui le détient. L'enforcement se limite désormais à ce
-/// que ce nœud peut réellement ATTRIBUER à la clé bannie (son entrée de
-/// catalogue, son SeedIndex) — voir `purge_blocked_issuer`.
-#[allow(clippy::too_many_arguments)]
-async fn fetch_feed_inner(
+/// Interroge la DHT pour le record de feed de `issuer`, ne retient que le
+/// candidat de plus grand `seq` dont la signature ET l'émetteur sont
+/// vérifiés. Ne fait AUCUNE vérification de modération — c'est la
+/// responsabilité de l'appelant (voir `fetch_feed_inner`, qui l'applique
+/// juste après, et `Node::resolve_channel`, qui a besoin du feed d'une clé
+/// bloquée sans jamais l'insérer au catalogue).
+async fn fetch_verified_feed_from_dht(
     cmd_tx: &mpsc::Sender<Command>,
-    catalog: &Arc<Mutex<Catalog>>,
-    catalog_events: &tokio::sync::broadcast::Sender<()>,
-    subscriptions: &Arc<Mutex<BTreeSet<PeerId>>>,
-    moderation: &Arc<RwLock<Moderation>>,
-    blocked_channels: &Arc<Mutex<BTreeSet<PeerId>>>,
     issuer: PeerId,
 ) -> CoreResult<Option<Feed>> {
     let (tx, rx) = oneshot::channel();
@@ -1811,7 +1898,45 @@ async fn fetch_feed_inner(
             best = Some(feed);
         }
     }
-    let Some(feed) = best else {
+    Ok(best)
+}
+
+/// Cœur de `Node::fetch_feed`, factorisé pour être réutilisable par la boucle
+/// de suivi périodique (qui ne détient qu'un clone des champs nécessaires, pas
+/// un `Node` entier — voir `follow_loop`). Récupère le feed d'un créateur
+/// depuis la DHT (via `fetch_verified_feed_from_dht`, signature + émetteur
+/// déjà vérifiés), retient le `seq` le plus élevé, l'applique au catalogue
+/// (avec exemption de borne s'il est souscrit).
+///
+/// CHECKPOINT MODÉRATION (ingestion catalogue, finding M2) : si `issuer` est
+/// une clé bloquée, le feed trouvé (signature déjà vérifiée) n'est PAS
+/// appliqué au catalogue, et la fonction renvoie `Ok(None)` (« aucun feed
+/// exploitable », même sémantique que si rien n'avait été trouvé) plutôt que
+/// le feed rejeté : un appelant ne doit pas pouvoir distinguer « rien trouvé »
+/// de « trouvé mais bloqué », ce qui éviterait toute fuite d'information sur
+/// le contenu d'une clé bannie. `Node::resolve_channel` a besoin de ce feed
+/// malgré tout (aperçu autorisé pour un bloqué) : il appelle directement
+/// `fetch_verified_feed_from_dht`, plus bas niveau, plutôt que cette fonction.
+///
+/// N'alimente PLUS de registre de CIDs dérivé depuis le contenu du feed
+/// (revue post-implémentation, finding critique I2, retiré après la tâche
+/// 3) : capturer les CIDs *listés par* une clé bannie et les bloquer
+/// aveuglément permettait à cette clé de faire disparaître le contenu d'un
+/// tiers innocent en le mentionnant dans son propre feed — lister un CID ne
+/// prouve rien sur qui le détient. L'enforcement se limite désormais à ce
+/// que ce nœud peut réellement ATTRIBUER à la clé bannie (son entrée de
+/// catalogue, son SeedIndex) — voir `purge_blocked_issuer`.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_feed_inner(
+    cmd_tx: &mpsc::Sender<Command>,
+    catalog: &Arc<Mutex<Catalog>>,
+    catalog_events: &tokio::sync::broadcast::Sender<()>,
+    subscriptions: &Arc<Mutex<BTreeSet<PeerId>>>,
+    moderation: &Arc<RwLock<Moderation>>,
+    blocked_channels: &Arc<Mutex<BTreeSet<PeerId>>>,
+    issuer: PeerId,
+) -> CoreResult<Option<Feed>> {
+    let Some(feed) = fetch_verified_feed_from_dht(cmd_tx, issuer).await? else {
         return Ok(None);
     };
     if is_key_blocked_inner(moderation, blocked_channels, &issuer) {
