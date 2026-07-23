@@ -2,7 +2,22 @@
 
 - Statut : accepté
 - Date : 2026-07-04
-- Issue : #21
+- Issue : #21 (fermée par cette décision — voir note ci-dessous)
+
+> **Note (2026-07-23)** — au moment de cette décision, le point 3 du contexte
+> et la conséquence associée (« la durabilité est déjà couverte par … la
+> republication du démon de seeding ») étaient **anticipés, pas encore
+> vrais** : `champinium-seed` ne réannonçait que les provider records de
+> blocs (`Node::reprovide_all`), jamais le RECORD DE FEED signé lui-même
+> (`/champinium/feed/<peerid>`) — un créateur qui publiait puis passait hors
+> ligne voyait son record de feed s'éteindre au TTL du `MemoryStore`
+> Kademlia sans que personne ne le réannonce, cassant la découverte à froid
+> de son dernier feed. Cet écart a été corrigé : `Node::republish_known_feeds`
+> (appelé par `champinium-seed` dans la même boucle que `reprovide_all`)
+> réannonce le feed du nœud lui-même et ceux de ses abonnements. La
+> décision de cet ADR (différer IPNS) reste valide : c'est la PRÉMISSE
+> « la durabilité pratique est déjà couverte » qui est désormais réellement
+> exacte, pas seulement supposée.
 
 ## Contexte
 
