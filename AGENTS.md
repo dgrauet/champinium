@@ -20,7 +20,7 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
   capacité absente, ils **ouvrent une demande de changement de contrat** (voir
   protocole plus bas) — ils ne contournent pas via du code natif ad hoc.
 
-### Contrat actuel — v8 (`CONTRACT_VERSION = 8`)
+### Contrat actuel — v9 (`CONTRACT_VERSION = 9`)
 
 > v1 → v2 : ajout de `subscribe_denylist(json) -> u64` sur `ChampiniumNode`
 > (modération fédérée activable depuis les fronts). Purement additif.
@@ -86,6 +86,17 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
 > `CoreError::Moderation`, réservée aux erreurs de format/signature des
 > denylists elles-mêmes). Purement additif côté surface (la correction du
 > mapping d'erreur est un changement de comportement, pas de signature).
+>
+> v8 → v9 : **aperçu de channel** : `resolve_channel(lien|PeerId)` →
+> `FfiChannelPreview` ; l'abonnement reste `subscribe_channel` v6 — aucune
+> action nouvelle. `resolve_channel(link_or_peer_id)` (async — même tolérance
+> d'entrée que `subscribe_channel`/`block_channel` : lien
+> `champinium://channel/<clé>` OU PeerId nu, entrée invalide →
+> `InvalidInput` ; catalogue d'abord, sinon DHT ; émetteur introuvable →
+> `NotFound` ; un émetteur bloqué localement reste résolvable,
+> `blocked = true`). Record `FfiChannelPreview { peer_id, name, description,
+> avatar_cid, items, subscribed, blocked }` (identité de channel aplatie,
+> comme `FfiCatalogEntry`). Purement additif.
 
 Fonctions libres (smoke test async, conservées de v0) :
 
@@ -128,12 +139,15 @@ Objet **`ChampiniumNode`** (méthodes) :
 | `block_channel(link_or_peer_id) -> ()` | **async** | bloque un émetteur localement (lien ou PeerId nu) : désabonne, purge catalogue/SeedIndex/blockstore (pins compris) |
 | `unblock_channel(peer_id) -> ()` | **async** | débloque un émetteur ; rien de retéléchargé automatiquement |
 | `blocked_channels() -> Vec<String>` | sync | channels bloqués localement (PeerIds triés) |
+| `resolve_channel(link_or_peer_id) -> FfiChannelPreview` | **async** | aperçu d'un channel par lien ou PeerId nu (catalogue d'abord, sinon DHT) |
 
 Records `FfiCatalogEntry { issuer, seq, cids, items, channel, seeded_count,
 total_count, pinned }`, `FfiContentItem { cid, title, tags }`,
 `FfiSearchHit { issuer, cid, title, tags }`,
 `FfiChannelProfile { name, description, avatar_cid }`,
-`FfiStorageStats { used_bytes, quota_bytes }`.
+`FfiStorageStats { used_bytes, quota_bytes }`,
+`FfiChannelPreview { peer_id, name, description, avatar_cid, items,
+subscribed, blocked }`.
 Erreur **`FfiError` typée**
 (`Moderated` / `Network` / `NotFound` / `InvalidInput` / `Internal`, chacune avec
 `msg`). Callback interfaces **`CatalogListener`** (`on_catalog_updated()`) et

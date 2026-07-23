@@ -2,6 +2,8 @@
 // branche le lecteur Media Foundation. Présentation uniquement : toute la logique
 // vit dans le noyau Rust (appelé via le NodeViewModel).
 using System;
+using System.Threading.Tasks;
+using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Windows.ApplicationModel.DataTransfer;
@@ -101,9 +103,101 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private async void OnSubscribeByLinkClick(object sender, RoutedEventArgs e)
+    /// <summary>
+    /// Résout l'aperçu du lien/PeerId collé (état de chargement porté par
+    /// <see cref="NodeViewModel.IsPreviewLoading"/>, lié dans le XAML) puis
+    /// ouvre la feuille d'aperçu en cas de succès. En cas d'échec, le VM a
+    /// déjà posé le message dans <c>SubscriptionStatus</c> — rien à faire ici.
+    /// </summary>
+    private async void OnPreviewByLinkClick(object sender, RoutedEventArgs e)
     {
-        await Model.SubscribeByLinkAsync();
+        var preview = await Model.PreviewByLinkAsync();
+        if (preview is not null)
+        {
+            await ShowChannelPreviewDialogAsync(preview);
+        }
+    }
+
+    /// <summary>
+    /// Feuille d'aperçu d'un channel — contenu bâti en code-behind (cohérent
+    /// avec les autres dialogues de cette fenêtre, voir OnBlockClick /
+    /// OnPivotSelectionChanged). Pied : bouton principal S'abonner/Se
+    /// désabonner, ou aucun bouton (juste "Channel bloqué") si bloqué. Se
+    /// ferme dans tous les cas après l'action — le <c>CatalogListener</c>
+    /// existant rafraîchit les vues.
+    /// </summary>
+    private async Task ShowChannelPreviewDialogAsync(ChannelPreviewInfo preview)
+    {
+        var content = new StackPanel { Spacing = 8, Width = 320 };
+
+        content.Children.Add(new TextBlock { Text = preview.DisplayName, FontWeight = FontWeights.Bold, FontSize = 18 });
+
+        if (preview.Description.Length > 0)
+        {
+            content.Children.Add(new TextBlock { Text = preview.Description, TextWrapping = TextWrapping.Wrap });
+        }
+
+        if (!string.IsNullOrEmpty(preview.AvatarCid))
+        {
+            content.Children.Add(new TextBlock { Text = $"avatar : {preview.AvatarCid}", FontSize = 11, Opacity = 0.7 });
+        }
+
+        content.Children.Add(new TextBlock
+        {
+            Text = "Publications",
+            FontWeight = FontWeights.SemiBold,
+            Margin = new Thickness(0, 8, 0, 0),
+        });
+
+        if (preview.Items.Count == 0)
+        {
+            content.Children.Add(new TextBlock { Text = "aucune publication", Opacity = 0.7 });
+        }
+        else
+        {
+            var list = new StackPanel { Spacing = 4 };
+            foreach (var item in preview.Items)
+            {
+                list.Children.Add(new TextBlock { Text = item.Display, TextTrimming = TextTrimming.CharacterEllipsis });
+                if (item.TagsText.Length > 0)
+                {
+                    list.Children.Add(new TextBlock { Text = item.TagsText, FontSize = 11, Opacity = 0.7 });
+                }
+            }
+            content.Children.Add(new ScrollViewer { Content = list, MaxHeight = 220 });
+        }
+
+        // Pied de la feuille : libellé "Channel bloqué" (aucun bouton) ou
+        // bouton principal S'abonner/Se désabonner — même position que les
+        // jumeaux macOS/GTK (après la liste des publications, pas avant le nom).
+        if (preview.Blocked)
+        {
+            content.Children.Add(new TextBlock
+            {
+                Text = "Channel bloqué",
+                FontWeight = FontWeights.SemiBold,
+                Margin = new Thickness(0, 8, 0, 0),
+            });
+        }
+
+        var dialog = new ContentDialog
+        {
+            Title = "Aperçu du channel",
+            Content = content,
+            CloseButtonText = preview.Blocked ? "Fermer" : "Annuler",
+            DefaultButton = ContentDialogButton.Close,
+            XamlRoot = Content.XamlRoot,
+        };
+        if (!preview.Blocked)
+        {
+            dialog.PrimaryButtonText = preview.Subscribed ? "Se désabonner" : "S'abonner";
+        }
+
+        var result = await dialog.ShowAsync();
+        if (result == ContentDialogResult.Primary)
+        {
+            await Model.ToggleSubscriptionAsync(preview.PeerId, preview.Subscribed);
+        }
     }
 
     /// <summary>

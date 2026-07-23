@@ -87,6 +87,36 @@ public sealed class BlockedChannel
     public string DisplayText => PeerId.Length > 14 ? $"{PeerId[..8]}…{PeerId[^4..]}" : PeerId;
 }
 
+/// <summary>Une publication listée dans la feuille d'aperçu d'un channel
+/// (tâche 3) — même forme que <see cref="CatalogCid"/> mais sans les champs
+/// de pin (non pertinents avant abonnement).</summary>
+public sealed class ChannelPreviewItem
+{
+    public string Cid { get; init; } = "";
+    public string Title { get; init; } = "";
+    public IReadOnlyList<string> Tags { get; init; } = Array.Empty<string>();
+    public string Display => Title.Length > 0 ? Title : Cid;
+    public string TagsText => string.Join(" · ", Tags);
+}
+
+/// <summary>
+/// Aperçu d'un channel résolu par lien/PeerId (tâche 3, contrat v9) — type
+/// local public : le record généré par uniffi-bindgen-cs (<c>FfiChannelPreview</c>)
+/// est <c>internal</c> et ne peut pas être exposé sur une propriété publique du
+/// VM (CS0053, même piège que <see cref="NodeViewModel.SetStorageStats"/>).
+/// </summary>
+public sealed class ChannelPreviewInfo
+{
+    public string PeerId { get; init; } = "";
+    public string Name { get; init; } = "";
+    public string Description { get; init; } = "";
+    public string? AvatarCid { get; init; }
+    public IReadOnlyList<ChannelPreviewItem> Items { get; init; } = Array.Empty<ChannelPreviewItem>();
+    public bool Subscribed { get; init; }
+    public bool Blocked { get; init; }
+    public string DisplayName => Name.Length > 0 ? Name : (PeerId.Length > 14 ? $"{PeerId[..8]}…{PeerId[^4..]}" : PeerId);
+}
+
 /// <summary>
 /// Orchestration des appels au noyau Champinium. Toute la logique vit dans le
 /// core Rust : ce VM ne fait qu'enchaîner les appels du contrat et exposer l'état.
@@ -232,6 +262,15 @@ public sealed class NodeViewModel : INotifyPropertyChanged
     {
         get => _subscriptionStatus;
         private set => Set(ref _subscriptionStatus, value);
+    }
+
+    /// <summary>Vrai pendant la résolution d'un aperçu de channel (fetch réseau) —
+    /// liaison du bouton "Aperçu" (désactivé) et de son spinner.</summary>
+    private bool _isPreviewLoading;
+    public bool IsPreviewLoading
+    {
+        get => _isPreviewLoading;
+        private set => Set(ref _isPreviewLoading, value);
     }
 
     /// <summary>
@@ -390,27 +429,60 @@ public sealed class NodeViewModel : INotifyPropertyChanged
     private static string Truncate(string peerId) =>
         peerId.Length > 14 ? $"{peerId[..8]}…{peerId[^4..]}" : peerId;
 
-    /// <summary>S'abonne via le lien/PeerId collé dans <see cref="ChannelLinkField"/>.</summary>
-    public async Task SubscribeByLinkAsync()
+    /// <summary>
+    /// Résout l'aperçu du lien/PeerId collé dans <see cref="ChannelLinkField"/> —
+    /// SANS s'abonner (l'ancien abonnement direct au collage est supprimé,
+    /// tâche 3). L'abonnement se décide depuis la feuille d'aperçu, voir
+    /// <see cref="ToggleSubscriptionAsync"/>. Retourne <c>null</c> en cas
+    /// d'échec (message déjà posé dans <see cref="SubscriptionStatus"/>).
+    /// </summary>
+    public async Task<ChannelPreviewInfo?> PreviewByLinkAsync()
     {
         var link = ChannelLinkField.Trim();
-        if (link.Length == 0)
+        if (link.Length == 0 || _node is null)
         {
-            return;
+            return null;
         }
 
+        IsPreviewLoading = true;
         try
         {
-            await _node!.SubscribeChannel(link);
+            var preview = await _node.ResolveChannel(link);
             ChannelLinkField = "";
-            SubscriptionStatus = "abonné";
-            RefreshCatalog();
+            SubscriptionStatus = null;
+            return new ChannelPreviewInfo
+            {
+                PeerId = preview.peerId,
+                Name = preview.name,
+                Description = preview.description,
+                AvatarCid = preview.avatarCid,
+                Items = preview.items
+                    .Select(i => new ChannelPreviewItem { Cid = i.cid, Title = i.title, Tags = i.tags })
+                    .ToList(),
+                Subscribed = preview.subscribed,
+                Blocked = preview.blocked,
+            };
         }
         catch (Exception ex)
         {
-            SubscriptionStatus = DescribeSubscriptionError(ex);
+            SubscriptionStatus = DescribePreviewError(ex);
+            return null;
+        }
+        finally
+        {
+            IsPreviewLoading = false;
         }
     }
+
+    /// <summary>Erreur typée du contrat pour <see cref="PreviewByLinkAsync"/> —
+    /// la résolution n'est jamais refusée par la modération (voir doc
+    /// `resolve_channel`), seuls NotFound/InvalidInput sont attendus ici.</summary>
+    private static string DescribePreviewError(Exception ex) => ex switch
+    {
+        FfiException.NotFound => "channel introuvable pour l'instant",
+        FfiException.InvalidInput => "lien ou PeerId invalide",
+        _ => "erreur réseau",
+    };
 
     /// <summary>
     /// Bascule l'abonnement d'un émetteur (bouton par groupe/channel, disponible

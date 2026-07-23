@@ -37,3 +37,14 @@ public sealed class BooleanToVisibilityConverter : IValueConverter
     public object ConvertBack(object value, Type targetType, object parameter, string language) =>
         throw new NotImplementedException();
 }
+
+/// <summary>Inverse d'un booléen (utilisé pour désactiver le bouton "Aperçu"
+/// pendant le chargement — voir <c>NodeViewModel.IsPreviewLoading</c>).</summary>
+public sealed class InverseBooleanConverter : IValueConverter
+{
+    public object Convert(object value, Type targetType, object parameter, string language) =>
+        !(value is true);
+
+    public object ConvertBack(object value, Type targetType, object parameter, string language) =>
+        throw new NotImplementedException();
+}
