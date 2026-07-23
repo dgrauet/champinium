@@ -1120,8 +1120,12 @@ impl Node {
     ///
     /// Refuse un émetteur bloqué — **localement** (tâche 3, message "channel
     /// bloqué localement") OU par **denylist** (tâche 2, message "channel
-    /// banni par denylist") — avec `CoreError::Moderation` distinct selon la
-    /// source. Ce refus symétrique ferme un cas d'amplification : sans lui,
+    /// banni par denylist") — via `CoreError::Moderated` (et non
+    /// `CoreError::Moderation`, réservée aux erreurs de format/signature des
+    /// denylists elles-mêmes) pour que le contrat FFI v8 remonte bien
+    /// `FfiError::Moderated` (UX « refus volontaire »), pas `InvalidInput`
+    /// (UX « erreur de saisie ») — cf. `From<CoreError> for FfiError`. Ce
+    /// refus symétrique ferme un cas d'amplification : sans lui,
     /// `subscribe()` exempterait l'émetteur de la borne du catalogue
     /// (`subscribed` dans `Catalog::apply`) alors même que ses feeds y sont
     /// de toute façon rejetés à l'ingestion (voir `fetch_feed_inner`/
@@ -1134,10 +1138,10 @@ impl Node {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(&issuer)
         {
-            return Err(CoreError::Moderation("channel bloqué localement".into()));
+            return Err(CoreError::Moderated("channel bloqué localement".into()));
         }
         if is_key_blocked_inner(&self.moderation, &self.blocked_channels, &issuer) {
-            return Err(CoreError::Moderation("channel banni par denylist".into()));
+            return Err(CoreError::Moderated("channel banni par denylist".into()));
         }
         {
             let mut subs = self

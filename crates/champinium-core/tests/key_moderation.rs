@@ -557,8 +557,9 @@ async fn block_channel_rejects_future_feeds_and_refuses_subscribe() {
 
     let err = node_b.subscribe(node_a.peer_id()).unwrap_err();
     assert!(
-        matches!(err, CoreError::Moderation(msg) if msg.contains("bloqué localement")),
-        "message clair attendu"
+        matches!(err, CoreError::Moderated(msg) if msg.contains("bloqué localement")),
+        "message clair attendu, et Moderated (pas Moderation) pour que le contrat FFI v8 \
+         remonte FfiError::Moderated plutôt qu'InvalidInput"
     );
 
     let cid = cid_for(b"feed apres blocage local");

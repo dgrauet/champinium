@@ -20,7 +20,7 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
   capacité absente, ils **ouvrent une demande de changement de contrat** (voir
   protocole plus bas) — ils ne contournent pas via du code natif ad hoc.
 
-### Contrat actuel — v7 (`CONTRACT_VERSION = 7`)
+### Contrat actuel — v8 (`CONTRACT_VERSION = 8`)
 
 > v1 → v2 : ajout de `subscribe_denylist(json) -> u64` sur `ChampiniumNode`
 > (modération fédérée activable depuis les fronts). Purement additif.
@@ -68,6 +68,24 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
 > `set_seed_listener(listener)` (async — même patron que `CatalogListener`) :
 > notifie tout changement effectif du seed proactif (publication nouvellement
 > seedée, éviction, purge au désabonnement).
+>
+> v7 → v8 : **blocage local de channel** (spec channels lot d, tâche 3).
+> `block_channel(link_or_peer_id)` (async — même tolérance d'entrée que
+> `subscribe_channel` : lien `champinium://channel/<clé>` OU PeerId nu, entrée
+> invalide → `InvalidInput` ; désabonne si souscrit, purge catalogue/SeedIndex/
+> blockstore — **pins compris** — de ce qui était attribué à l'émetteur),
+> `unblock_channel(peer_id)` (async — retire la préférence ; rien n'est
+> retéléchargé automatiquement, le contenu revient naturellement au prochain
+> feed reçu), `blocked_channels() -> Vec<String>` (sync — PeerIds triés). Le
+> blocage local est un **état strictement privé de ce nœud, jamais publié** sur
+> le réseau (aucun rapport, aucun record signé — contrairement au blocage par
+> denylist fédérée, qui reste un choix partagé). `subscribe_channel` visant un
+> émetteur bloqué (localement OU par denylist) renvoie désormais
+> `FfiError::Moderated` (et non plus `InvalidInput` — correction du mapping
+> `CoreError::Moderated → FfiError::Moderated`, distinct de
+> `CoreError::Moderation`, réservée aux erreurs de format/signature des
+> denylists elles-mêmes). Purement additif côté surface (la correction du
+> mapping d'erreur est un changement de comportement, pas de signature).
 
 Fonctions libres (smoke test async, conservées de v0) :
 
@@ -107,6 +125,9 @@ Objet **`ChampiniumNode`** (méthodes) :
 | `pin_content(manifest_cid) -> ()` | **async** | épingle un manifeste (jamais évincé sous quota) |
 | `unpin_content(manifest_cid) -> ()` | **async** | retire l'épinglage (redevient évictable) |
 | `set_seed_listener(listener) -> ()` | **async** | enregistre un `SeedListener` (rafraîchissement réactif du seed) |
+| `block_channel(link_or_peer_id) -> ()` | **async** | bloque un émetteur localement (lien ou PeerId nu) : désabonne, purge catalogue/SeedIndex/blockstore (pins compris) |
+| `unblock_channel(peer_id) -> ()` | **async** | débloque un émetteur ; rien de retéléchargé automatiquement |
+| `blocked_channels() -> Vec<String>` | sync | channels bloqués localement (PeerIds triés) |
 
 Records `FfiCatalogEntry { issuer, seq, cids, items, channel, seeded_count,
 total_count, pinned }`, `FfiContentItem { cid, title, tags }`,
