@@ -11,7 +11,9 @@ use champinium_core::coldstore::receipts::{load_receipts, save_receipt};
 use champinium_core::coldstore::{ArchivePayload, ArchiveReceipt, ArweaveWallet, ColdStore};
 use champinium_core::content::cid_for;
 use champinium_core::identity::load_or_generate;
-use champinium_core::{Blockstore, Cid, CoreError, Denylist, Moderation, Node};
+use champinium_core::ingest::HlsSegment;
+use champinium_core::{Blockstore, Cid, CoreError, Denylist, HlsManifest, Moderation, Node};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use wiremock::matchers::{method, path};
@@ -539,5 +541,302 @@ async fn fallback_rejects_cid_mismatch_from_cold_store() {
     assert!(
         !node.blockstore().has(&cid),
         "des octets non vérifiés ne doivent jamais entrer au blockstore"
+    );
+}
+
+// --- Tâche 4 : devis en deux temps + signature/upload d'archive. ---
+//
+// La logique de devis (`archive_publication`) et de confirmation
+// (`confirm_archive`) est prouvée avec un `ColdStore` mock à prix/solde fixés
+// qui **compte les uploads** : le devis n'envoie rien (0 upload), la
+// confirmation n'envoie que sur solde suffisant. La correction cryptographique
+// (deep hash, data_root, RSA-PSS) est couverte par les tests unitaires du
+// module `coldstore::arweave_tx` (vecteurs de référence indépendants +
+// aller-retour de signature). Le test d'archivage réel contre arweave.net est
+// `#[ignore]` et gaté par variable d'environnement (coûte de vrais AR).
+
+/// `ColdStore` mock pour le devis : prix linéaire (`price_per_byte`), solde
+/// fixe, et **compteur d'uploads** (`archive`). `retrieve` renvoie None (non
+/// exercé ici). Le portefeuille est ignoré (le solde est fixé).
+struct QuoteMockColdStore {
+    price_per_byte: u64,
+    balance: u64,
+    uploads: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl ColdStore for QuoteMockColdStore {
+    async fn retrieve(&self, _cid: Cid) -> champinium_core::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    async fn archive(
+        &self,
+        publication: &ArchivePayload,
+        _wallet: &ArweaveWallet,
+    ) -> champinium_core::Result<ArchiveReceipt> {
+        self.uploads.fetch_add(1, Ordering::SeqCst);
+        let bytes: u64 = publication.items.iter().map(|(_, b)| b.len() as u64).sum();
+        Ok(ArchiveReceipt {
+            manifest_cid: publication.manifest_cid.to_string(),
+            tx_id: "mock-tx-id".to_string(),
+            timestamp: 0,
+            bytes,
+            cost_winston: bytes * self.price_per_byte,
+        })
+    }
+
+    async fn price(&self, bytes: u64) -> champinium_core::Result<u64> {
+        Ok(bytes * self.price_per_byte)
+    }
+
+    async fn balance(&self, _wallet: &ArweaveWallet) -> champinium_core::Result<u64> {
+        Ok(self.balance)
+    }
+}
+
+/// Crée un fichier de portefeuille factice aux permissions 0600 et le référence
+/// (le contenu importe peu : les mocks ignorent le JWK, seul l'archivage réel
+/// le lit). Sur non-Unix, `from_path` ne vérifie que l'existence.
+fn dummy_wallet(dir: &std::path::Path) -> ArweaveWallet {
+    let path = dir.join("wallet.json");
+    std::fs::write(&path, b"{}").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    ArweaveWallet::from_path(&path).unwrap()
+}
+
+/// Ingère une publication factice (deux segments + un manifeste) directement
+/// dans le blockstore du nœud via `add`, et renvoie le CID du manifeste et la
+/// taille totale (manifeste + segments). Pas de ffmpeg : on fabrique le
+/// manifeste à la main comme le ferait `ingest_file`.
+async fn seed_publication(node: &Node) -> (Cid, u64) {
+    let seg_a = b"segment A octets".to_vec();
+    let seg_b = b"segment B un peu plus long".to_vec();
+    let cid_a = node.add(&seg_a).await.unwrap();
+    let cid_b = node.add(&seg_b).await.unwrap();
+    let manifest = HlsManifest::new(
+        4.0,
+        vec![
+            HlsSegment {
+                cid: cid_a.to_string(),
+                duration: 4.0,
+            },
+            HlsSegment {
+                cid: cid_b.to_string(),
+                duration: 3.5,
+            },
+        ],
+    );
+    let manifest_bytes = manifest.to_json().unwrap().into_bytes();
+    let manifest_cid = node.add(&manifest_bytes).await.unwrap();
+    let total = seg_a.len() as u64 + seg_b.len() as u64 + manifest_bytes.len() as u64;
+    (manifest_cid, total)
+}
+
+/// Devis cohérent + ZÉRO upload : `archive_publication` calcule bytes (somme
+/// des tailles), cost (somme des prix par item), solde, `sufficient` — et
+/// n'appelle jamais `archive` (compteur d'uploads à 0).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archive_publication_quotes_without_sending_anything() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = solo_node(dir.path(), "quote").await;
+    let (manifest_cid, total_bytes) = seed_publication(&node).await;
+
+    let uploads = Arc::new(AtomicUsize::new(0));
+    let cold = Arc::new(QuoteMockColdStore {
+        price_per_byte: 5,
+        balance: 1_000_000,
+        uploads: uploads.clone(),
+    });
+    let node = node.with_cold_and_wallet_for_tests(cold, dummy_wallet(dir.path()));
+
+    let quote = node.archive_publication(manifest_cid).await.unwrap();
+
+    assert_eq!(quote.manifest_cid, manifest_cid.to_string());
+    assert_eq!(quote.bytes, total_bytes);
+    // cost = somme des prix par item = price_per_byte * bytes total (le prix est
+    // linéaire dans ce mock).
+    assert_eq!(quote.cost_winston, total_bytes * 5);
+    assert_eq!(quote.balance_winston, 1_000_000);
+    assert!(quote.sufficient);
+    // Le devis n'envoie RIEN.
+    assert_eq!(uploads.load(Ordering::SeqCst), 0);
+}
+
+/// Devis à solde insuffisant : `sufficient = false`, toujours 0 upload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archive_publication_quote_reflects_insufficient_balance() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = solo_node(dir.path(), "quote_low").await;
+    let (manifest_cid, total_bytes) = seed_publication(&node).await;
+
+    let uploads = Arc::new(AtomicUsize::new(0));
+    let cold = Arc::new(QuoteMockColdStore {
+        price_per_byte: 100,
+        balance: 1, // trop faible pour couvrir total_bytes * 100
+        uploads: uploads.clone(),
+    });
+    let node = node.with_cold_and_wallet_for_tests(cold, dummy_wallet(dir.path()));
+
+    let quote = node.archive_publication(manifest_cid).await.unwrap();
+    assert_eq!(quote.cost_winston, total_bytes * 100);
+    assert!(!quote.sufficient);
+    assert_eq!(uploads.load(Ordering::SeqCst), 0);
+}
+
+/// `confirm_archive` sur solde insuffisant → erreur, ZÉRO upload, aucun reçu
+/// persisté.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirm_archive_refuses_insufficient_balance_without_upload() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = solo_node(dir.path(), "confirm_low").await;
+    let (manifest_cid, _total) = seed_publication(&node).await;
+
+    let uploads = Arc::new(AtomicUsize::new(0));
+    let cold = Arc::new(QuoteMockColdStore {
+        price_per_byte: 100,
+        balance: 1,
+        uploads: uploads.clone(),
+    });
+    let node = node.with_cold_and_wallet_for_tests(cold, dummy_wallet(dir.path()));
+
+    let quote = node.archive_publication(manifest_cid).await.unwrap();
+    assert!(!quote.sufficient);
+
+    let err = node.confirm_archive(&quote).await.unwrap_err();
+    assert!(
+        matches!(err, CoreError::Network(_)),
+        "solde insuffisant → refus explicite"
+    );
+    assert_eq!(uploads.load(Ordering::SeqCst), 0, "aucun upload sur refus");
+    assert!(
+        load_receipts(node.blockstore().root()).is_empty(),
+        "aucun reçu persisté sur refus"
+    );
+}
+
+/// `confirm_archive` sur solde suffisant → exactement 1 upload + reçu persisté.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn confirm_archive_uploads_once_and_persists_receipt_when_sufficient() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = solo_node(dir.path(), "confirm_ok").await;
+    let (manifest_cid, total_bytes) = seed_publication(&node).await;
+
+    let uploads = Arc::new(AtomicUsize::new(0));
+    let cold = Arc::new(QuoteMockColdStore {
+        price_per_byte: 2,
+        balance: 10_000_000,
+        uploads: uploads.clone(),
+    });
+    let node = node.with_cold_and_wallet_for_tests(cold, dummy_wallet(dir.path()));
+
+    let quote = node.archive_publication(manifest_cid).await.unwrap();
+    assert!(quote.sufficient);
+    assert_eq!(uploads.load(Ordering::SeqCst), 0, "le devis n'envoie rien");
+
+    let receipt = node.confirm_archive(&quote).await.unwrap();
+    assert_eq!(receipt.manifest_cid, manifest_cid.to_string());
+    assert_eq!(receipt.bytes, total_bytes);
+    assert_eq!(uploads.load(Ordering::SeqCst), 1, "exactement un upload");
+
+    // Reçu persisté dans le dotfile `.archives`.
+    let receipts = load_receipts(node.blockstore().root());
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].tx_id, "mock-tx-id");
+    assert_eq!(receipts[0].manifest_cid, manifest_cid.to_string());
+}
+
+/// Archivage impossible d'un contenu absent localement : on n'archive que son
+/// propre contenu détenu (`BlockNotFound`), jamais un CID qu'on ne possède pas.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archive_publication_fails_when_manifest_absent_locally() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = solo_node(dir.path(), "absent").await;
+    let unknown = cid_for(b"un manifeste que ce noeud ne detient pas");
+
+    let uploads = Arc::new(AtomicUsize::new(0));
+    let cold = Arc::new(QuoteMockColdStore {
+        price_per_byte: 1,
+        balance: 1_000,
+        uploads: uploads.clone(),
+    });
+    let node = node.with_cold_and_wallet_for_tests(cold, dummy_wallet(dir.path()));
+
+    let err = node.archive_publication(unknown).await.unwrap_err();
+    assert!(matches!(
+        err,
+        CoreError::BlockNotFound(_) | CoreError::Io(_)
+    ));
+    assert_eq!(uploads.load(Ordering::SeqCst), 0);
+}
+
+/// Archivage RÉEL contre arweave.net — JAMAIS en CI. Gaté par
+/// `CHAMPINIUM_ARWEAVE_IT=1` et un JWK financé référencé par
+/// `CHAMPINIUM_ARWEAVE_JWK` (permissions 0600). Coûte de vrais AR. Archive une
+/// publication minuscule (un seul item = le manifeste) puis tente de la
+/// re-récupérer par CID (best-effort : l'indexation par tag peut prendre
+/// plusieurs minutes, d'où la boucle bornée qui n'échoue pas sur un simple
+/// délai d'indexation, seulement sur un contenu FAUX).
+#[tokio::test]
+#[ignore = "archivage Arweave réel : coûte de vrais AR ; lancer avec CHAMPINIUM_ARWEAVE_IT=1 + CHAMPINIUM_ARWEAVE_JWK=<chemin JWK 0600>"]
+async fn real_archive_then_retrieve_roundtrip() {
+    if std::env::var("CHAMPINIUM_ARWEAVE_IT").ok().as_deref() != Some("1") {
+        eprintln!("ignoré : CHAMPINIUM_ARWEAVE_IT != 1");
+        return;
+    }
+    let jwk_path = std::env::var("CHAMPINIUM_ARWEAVE_JWK")
+        .expect("CHAMPINIUM_ARWEAVE_JWK doit pointer un fichier JWK Arweave financé (0600)");
+    let wallet = ArweaveWallet::from_path(&jwk_path).expect("JWK Arweave lisible et 0600");
+
+    let store = ArweaveColdStore::new(vec!["https://arweave.net".to_string()]);
+
+    // Publication minuscule : un unique item (le « manifeste »), horodaté pour
+    // l'unicité du contenu (donc du CID) entre deux lancements.
+    let payload_bytes = format!(
+        "champinium archive IT {}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    )
+    .into_bytes();
+    let cid = cid_for(&payload_bytes);
+    let payload = ArchivePayload {
+        manifest_cid: cid,
+        items: vec![(cid, payload_bytes.clone())],
+    };
+
+    let receipt = store
+        .archive(&payload, &wallet)
+        .await
+        .expect("archivage réel");
+    assert!(!receipt.tx_id.is_empty(), "un tx_id doit être renvoyé");
+    assert_eq!(receipt.bytes, payload_bytes.len() as u64);
+    eprintln!(
+        "archivé : tx_id={} cost={} winston",
+        receipt.tx_id, receipt.cost_winston
+    );
+
+    // Re-récupération best-effort (l'indexation par tag peut tarder).
+    for attempt in 0..20 {
+        match store.retrieve(cid).await {
+            Ok(Some(got)) => {
+                assert_eq!(
+                    got, payload_bytes,
+                    "les octets récupérés doivent être identiques"
+                );
+                eprintln!("récupéré après {attempt} tentatives");
+                return;
+            }
+            Ok(None) => tokio::time::sleep(Duration::from_secs(15)).await,
+            Err(e) => panic!("erreur de récupération: {e}"),
+        }
+    }
+    eprintln!(
+        "archivé (tx_id valide) mais pas encore ré-indexé par tag — normal sous quelques minutes"
     );
 }

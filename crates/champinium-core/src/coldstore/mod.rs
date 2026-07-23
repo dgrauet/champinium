@@ -8,6 +8,7 @@
 //! Arweave à la Tâche 4, `reqwest` comme seul ajout HTTP).
 
 pub mod arweave;
+mod arweave_tx;
 pub mod receipts;
 
 use crate::error::{CoreError, Result as CoreResult};
@@ -53,6 +54,21 @@ pub struct ArchivePayload {
     pub manifest_cid: Cid,
     /// (CID du bloc, octets du bloc) — manifeste inclus.
     pub items: Vec<(Cid, Vec<u8>)>,
+}
+
+/// Devis d'archivage calculé par [`crate::Node::archive_publication`] —
+/// **n'envoie rien** : taille totale de la publication, coût estimé (winston,
+/// somme des récompenses par transaction), solde courant du portefeuille, et
+/// `sufficient` = le solde couvre-t-il le coût. L'opt-in en deux temps (devis
+/// puis confirmation explicite) est imposé par la spec (ADR 0008) : aucun AR
+/// n'est dépensé sans que l'utilisateur ait vu ce devis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveQuote {
+    pub manifest_cid: String,
+    pub bytes: u64,
+    pub cost_winston: u64,
+    pub balance_winston: u64,
+    pub sufficient: bool,
 }
 
 /// Reçu local d'un archivage — purement informatif : l'index de récupération
