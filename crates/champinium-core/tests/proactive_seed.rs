@@ -359,22 +359,33 @@ async fn quota_pressure_reaches_a_fixpoint_without_oscillation() {
     node_b.subscribe(node_a.peer_id()).unwrap();
     inject_feed(&node_b, &kp_a, 1, &[m1, m2]);
 
-    // Laisse plusieurs passes tourner (FAST = 100 ms) sans qu'aucun évènement
-    // catalogue/quota supplémentaire n'intervienne, puis échantillonne l'état
-    // seedé deux fois, séparées par plusieurs passes de plus.
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    let first_window = (node_b.blockstore().has(&m1), node_b.blockstore().has(&m2));
-    assert_ne!(
-        first_window.0, first_window.1,
-        "exactement une des deux publications doit être seedée sous ce quota, obtenu {first_window:?}"
-    );
+    // Attend la convergence (déterministe, échéance généreuse) plutôt qu'une
+    // pause fixe : on veut exactement une des deux publications seedée, pas
+    // un état intermédiaire capturé trop tôt sous charge CI.
+    let first_window = tokio::time::timeout(CONVERGE, async {
+        loop {
+            let window = (node_b.blockstore().has(&m1), node_b.blockstore().has(&m2));
+            if window.0 != window.1 {
+                return window;
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    })
+    .await
+    .expect("exactement une des deux publications doit finir par être seedée sous ce quota");
 
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    let second_window = (node_b.blockstore().has(&m1), node_b.blockstore().has(&m2));
-    assert_eq!(
-        first_window, second_window,
-        "le jeu seedé ne doit plus changer d'une fenêtre à l'autre (oscillation détectée)"
-    );
+    // Puis vérifie le point fixe : le jeu seedé capturé ci-dessus ne doit
+    // JAMAIS changer sur une fenêtre d'échantillonnage ultérieure (une seule
+    // divergence trahirait une oscillation P1<->P2 sans fin).
+    let oscillation_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < oscillation_deadline {
+        let window = (node_b.blockstore().has(&m1), node_b.blockstore().has(&m2));
+        assert_eq!(
+            first_window, window,
+            "le jeu seedé ne doit plus changer d'une fenêtre à l'autre (oscillation détectée)"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
 
     let (used, quota) = node_b.storage_stats();
     assert!(used <= quota, "le quota ne doit jamais être dépassé");
