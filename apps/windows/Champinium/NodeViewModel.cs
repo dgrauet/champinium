@@ -179,21 +179,20 @@ public sealed class NodeViewModel : INotifyPropertyChanged
     /// <summary>PeerIds actuellement souscrits (pour calculer l'état des boutons Explorer).</summary>
     private HashSet<string> _subscriptions = new();
 
-    /// <summary>`(octets_utilisés, quota_octets)` du seed proactif de ce nœud (lot c).</summary>
+    /// <summary>`(octets_utilisés, quota_octets)` du seed proactif de ce nœud (lot c).
+    /// Type généré par uniffi-bindgen-cs (`internal record`) — jamais exposé sur la
+    /// surface publique du VM (CS0053) : seul <see cref="StorageStatsText"/>, déjà
+    /// une `string`, est lié depuis le XAML.</summary>
     private FfiStorageStats _storageStats = new(0, 0);
-    public FfiStorageStats StorageStats
+
+    private void SetStorageStats(FfiStorageStats value)
     {
-        get => _storageStats;
-        private set
+        if (Equals(_storageStats, value))
         {
-            if (Equals(_storageStats, value))
-            {
-                return;
-            }
-            _storageStats = value;
-            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(StorageStats)));
-            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(StorageStatsText)));
+            return;
         }
+        _storageStats = value;
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(StorageStatsText)));
     }
 
     /// <summary>Quota de seeding saisi par l'utilisateur, en Go (liaison TextBox).</summary>
@@ -206,7 +205,7 @@ public sealed class NodeViewModel : INotifyPropertyChanged
 
     /// <summary>Affichage humain de l'usage courant (liaison TextBlock du popover de réglages).</summary>
     public string StorageStatsText =>
-        $"Utilisé : {GigabytesText(StorageStats.usedBytes)} Go / {GigabytesText(StorageStats.quotaBytes)} Go";
+        $"Utilisé : {GigabytesText(_storageStats.usedBytes)} Go / {GigabytesText(_storageStats.quotaBytes)} Go";
 
     /// <summary>Émis quand un abonnement/désabonnement échoue ou réussit — la vue
     /// affiche un message court (distinct des erreurs réseau pour un refus de
@@ -265,7 +264,7 @@ public sealed class NodeViewModel : INotifyPropertyChanged
 
             Status = "nœud en ligne";
             RefreshCatalog();
-            QuotaField = GigabytesText(StorageStats.quotaBytes);
+            QuotaField = GigabytesText(_storageStats.quotaBytes);
         }
         catch (Exception ex)
         {
@@ -326,7 +325,7 @@ public sealed class NodeViewModel : INotifyPropertyChanged
             return;
         }
 
-        StorageStats = _node.StorageStats();
+        SetStorageStats(_node.StorageStats());
         // Abonnements seul montre le pin : épingler un contenu hors abonnement
         // n'a pas de sens dans cette UI (même décision que le jumeau macOS).
         Fill(SubscribedGroups, _node.CatalogSubscribed(), showPin: true);
