@@ -1,12 +1,27 @@
 //! Modération par CLÉ (lot channels d, tâches 2/3 — finding M2 de lot c).
 //!
 //! Tâche 2 : une clé entière peut être bannie (denylist v2, `key_entries`) —
-//! ses feeds sont rejetés aux trois points d'entrée (gossip, DHT/`fetch_feed`,
-//! réception/service), et une souscription à chaud purge rétroactivement
-//! catalogue + SeedIndex + blockstore de tout ce qui est déjà connu d'elle.
+//! ses feeds sont rejetés à l'ingestion du catalogue (gossip, DHT/`fetch_feed`),
+//! et une souscription à chaud purge rétroactivement ce que ce nœud avait
+//! lui-même ATTRIBUÉ à cette clé (son entrée de catalogue, son SeedIndex) —
+//! jamais du contenu tiers simplement mentionné par elle (voir la revue
+//! post-implémentation ci-dessous). Le checkpoint #2/service (`get_with`,
+//! `handle_block_message`) reste un check CID direct (`moderation.is_blocked`),
+//! inchangé par cette tâche.
 //!
 //! Tâche 3 : un channel peut aussi être bloqué LOCALEMENT (préférence privée
-//! d'un nœud, jamais publiée) — mêmes checkpoints, purge en plus des pins.
+//! d'un nœud, jamais publiée) — même mécanisme d'ingestion catalogue et de
+//! purge attribuée, en plus des pins.
+//!
+//! **Revue post-implémentation (finding critique I2)** : une première version
+//! captait passivement, dans un registre dérivé, les CIDs *listés* par le
+//! feed d'une clé bannie, puis les bloquait au checkpoint #2/service. Ce
+//! mécanisme a été retiré : lister un CID ne prouve rien sur qui le détient
+//! réellement, une clé bannie aurait donc pu faire disparaître le contenu
+//! d'un tiers innocent en le mentionnant dans son propre feed (censure par
+//! injection) — voir `blocked_key_cannot_censor_an_innocent_third_party_cid_by_listing_it`
+//! ci-dessous. La purge se limite désormais à ce que ce nœud peut réellement
+//! attribuer à la clé bannie.
 
 use champinium_core::content::cid_for;
 use champinium_core::identity::load_or_generate;
@@ -137,34 +152,170 @@ async fn fetch_feed_from_key_blocked_issuer_returns_none() {
     .expect("fetch_feed doit finir par renvoyer None pour une clé bannie");
 }
 
-/// #2 réception : une fois le feed d'une clé bannie vu passer (capturant ses
-/// CIDs), `get` refuse ces CIDs même s'ils ne figurent pas eux-mêmes dans la
-/// liste de CIDs de la denylist — seule la clé y figure.
+/// Régression anti-injection (finding critique I2, revue post-implémentation) :
+/// une clé bannie ne peut PAS faire disparaître le contenu d'un tiers innocent
+/// en le listant dans son propre feed. Le mécanisme de capture passive des
+/// CIDs "connus" d'une clé bloquée a été retiré précisément pour ça — lister
+/// un CID ne prouve rien sur qui le détient réellement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn get_refuses_cids_captured_from_key_blocked_issuer() {
+async fn blocked_key_cannot_censor_an_innocent_third_party_cid_by_listing_it() {
     let dir = tempfile::tempdir().unwrap();
+
+    // Le tiers innocent possède réellement le contenu et le sert.
+    let node_victim = node(dir.path(), "victim").await;
+    let content = b"contenu innocent d'un tiers".to_vec();
+    let victim_cid = node_victim.add(&content).await.unwrap();
+
+    // La clé bannie ne possède PAS ce contenu — elle se contente de le
+    // mentionner dans son propre feed (injection).
     let node_bad = node(dir.path(), "bad").await;
-    let bad_cid = cid_for(b"contenu jamais recuperable");
 
     let moderation = moderation_blocking_key(&dir.path().join("issuer.key"), node_bad.peer_id());
     let node_b = node_with(dir.path(), "b", moderation).await;
+    connect(&node_victim, &node_b).await;
     connect(&node_bad, &node_b).await;
 
-    // Attend que le feed (rejeté) soit passé, donc que ses CIDs soient
-    // capturés dans l'ensemble dérivé — republie tant que le mesh gossipsub
-    // n'est pas formé (heartbeat ~1 s).
+    // Republie tant que le mesh gossipsub n'est pas formé, pour être sûr que
+    // le feed d'injection a bien été vu (et rejeté) par `node_b` avant
+    // d'affirmer que son injection est restée sans effet.
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            node_bad.publish_feed(&[bad_cid]).await.unwrap();
-            if matches!(node_b.get(bad_cid).await, Err(CoreError::Moderated(_))) {
-                return;
+            node_bad.publish_feed(&[victim_cid]).await.unwrap();
+            if !node_b
+                .catalog_entries()
+                .iter()
+                .any(|e| e.issuer == node_bad.peer_id())
+            {
+                // Le feed d'injection est bien rejeté (attendu) ; mais le CID
+                // du tiers doit rester récupérable dès maintenant.
+                if let Ok(bytes) = node_b.get(victim_cid).await {
+                    if bytes == content {
+                        return;
+                    }
+                }
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     })
     .await
-    .expect("get doit finir par refuser un CID d'une clé bannie");
-    assert!(!node_b.blockstore().has(&bad_cid));
+    .expect("le CID d'un tiers innocent doit rester récupérable malgré l'injection");
+}
+
+/// Mirroir du patron lot (c) (`unsubscribe_keeps_segment_shared_with_a_pinned_publication`) :
+/// un segment partagé entre la publication d'un émetteur bloqué et celle d'un
+/// AUTRE émetteur non bloqué survit à `purge_blocked_issuer` (finding I1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn purge_blocked_issuer_keeps_segment_shared_with_another_issuer() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let node_a = node(dir.path(), "a").await; // sera bloqué
+    let node_b_creator = node(dir.path(), "bcreator").await; // reste sain
+
+    let shared_bytes = b"segment partage entre deux emetteurs";
+    let shared_cid_a = node_a.add(shared_bytes).await.unwrap();
+    let shared_cid_b = node_b_creator.add(shared_bytes).await.unwrap();
+    assert_eq!(shared_cid_a, shared_cid_b, "contenu identique -> même CID");
+
+    // Chaque manifeste porte AUSSI un segment propre à son émetteur, pour que
+    // les deux manifestes (donc leurs CIDs) restent distincts malgré le
+    // segment partagé — sinon un manifeste identique en tout point produirait
+    // le MÊME CID des deux côtés (contenu adressé), rendant "le manifeste de
+    // l'émetteur sain survit" indissociable de "le segment partagé survit".
+    let unique_a = node_a
+        .add(b"segment propre a l'emetteur bloque")
+        .await
+        .unwrap();
+    let manifest_a = champinium_core::HlsManifest::new(
+        4.0,
+        vec![
+            champinium_core::ingest::HlsSegment {
+                cid: unique_a.to_string(),
+                duration: 4.0,
+            },
+            champinium_core::ingest::HlsSegment {
+                cid: shared_cid_a.to_string(),
+                duration: 4.0,
+            },
+        ],
+    );
+    let manifest_cid_a = node_a
+        .add(manifest_a.to_json().unwrap().as_bytes())
+        .await
+        .unwrap();
+    node_a.publish_feed(&[manifest_cid_a]).await.unwrap();
+
+    let unique_b = node_b_creator
+        .add(b"segment propre a l'emetteur sain")
+        .await
+        .unwrap();
+    let manifest_b = champinium_core::HlsManifest::new(
+        4.0,
+        vec![
+            champinium_core::ingest::HlsSegment {
+                cid: unique_b.to_string(),
+                duration: 4.0,
+            },
+            champinium_core::ingest::HlsSegment {
+                cid: shared_cid_b.to_string(),
+                duration: 4.0,
+            },
+        ],
+    );
+    let manifest_cid_b = node_b_creator
+        .add(manifest_b.to_json().unwrap().as_bytes())
+        .await
+        .unwrap();
+    node_b_creator
+        .publish_feed(&[manifest_cid_b])
+        .await
+        .unwrap();
+    assert_ne!(manifest_cid_a, manifest_cid_b);
+
+    let node_test = node(dir.path(), "test").await;
+    connect(&node_a, &node_test).await;
+    connect(&node_b_creator, &node_test).await;
+    node_test.subscribe(node_a.peer_id()).unwrap();
+    node_test.subscribe(node_b_creator.peer_id()).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let _ = node_test.fetch_feed(node_a.peer_id()).await;
+            let _ = node_test.fetch_feed(node_b_creator.peer_id()).await;
+            if node_test.blockstore().has(&manifest_cid_a)
+                && node_test.blockstore().has(&manifest_cid_b)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("le seed proactif doit retenir les deux publications avant le blocage");
+
+    let issuer = load_or_generate(dir.path().join("issuer.key")).unwrap();
+    let dl = Denylist::build_signed("test", UPDATED, &issuer, &[], &[node_a.peer_id()]).unwrap();
+    node_test.subscribe_denylist(&dl).await.unwrap();
+
+    assert!(
+        !node_test.blockstore().has(&manifest_cid_a),
+        "le manifeste de l'émetteur bloqué doit être purgé"
+    );
+    assert!(
+        node_test.blockstore().has(&manifest_cid_b),
+        "le manifeste de l'émetteur sain doit survivre"
+    );
+    assert!(
+        node_test.blockstore().has(&shared_cid_a),
+        "le segment PARTAGÉ doit survivre — encore référencé par l'émetteur sain"
+    );
+    assert!(
+        !node_test.blockstore().has(&unique_a),
+        "le segment propre à l'émetteur bloqué doit être purgé"
+    );
+    assert!(
+        node_test.blockstore().has(&unique_b),
+        "le segment propre à l'émetteur sain doit survivre"
+    );
 }
 
 /// Souscription à chaud d'une denylist à clé : purge rétroactive de
@@ -249,10 +400,18 @@ async fn subscribe_denylist_purges_catalog_and_seeded_stock_including_pins() {
         used_after, 0,
         "le SeedIndex doit refléter la purge (stats cohérentes)"
     );
-    assert!(
-        matches!(node_b.get(manifest_cid).await, Err(CoreError::Moderated(_))),
-        "get doit désormais refuser ce contenu"
-    );
+    // Depuis le retrait de la capture passive (finding I2), la purge par clé
+    // est purement locale/attribuée — PAS une interdiction du CID au niveau
+    // réseau : `get` peut donc encore récupérer ce même contenu si un pair le
+    // sert toujours (ici l'émetteur bloqué lui-même, qui n'est pas modéré
+    // vis-à-vis de son propre contenu). Ça prouve que la purge n'agit pas
+    // comme une modération par CID — seul `moderation.is_blocked` (denylist
+    // CID directe) ferait refuser durablement ce contenu.
+    let refetched = node_b
+        .get(manifest_cid)
+        .await
+        .expect("le contenu n'est pas bloqué par CID, seulement purgé localement");
+    assert!(!refetched.is_empty());
 }
 
 /// Cas sain : une denylist à clé qui ne concerne personne du catalogue
@@ -295,9 +454,10 @@ async fn subscribe_denylist_does_not_affect_unrelated_issuer() {
         .any(|e| e.issuer == node_clean.peer_id()));
 }
 
-/// Un feed invalide (non signé par la clé revendiquée) ne doit pas fuiter
-/// d'information dans `blocked_cids` : `feed.verify()` a lieu AVANT tout
-/// check de clé bloquée.
+/// Un feed invalide (non signé par la clé revendiquée) ne doit jamais être
+/// exploitable pour un check de clé bloquée : `feed.verify()` a lieu AVANT
+/// toute lecture de `issuer_pubkey`/`issuer_peer_id()` aux points d'entrée du
+/// catalogue (`handle_feed_message`, `fetch_feed_inner`).
 #[test]
 fn unsigned_feed_forging_a_blocked_issuer_pubkey_does_not_verify() {
     let real_issuer = Keypair::generate_ed25519();
