@@ -1,4 +1,4 @@
-//! Surface UniFFI exposée aux fronts natifs (contrat v7).
+//! Surface UniFFI exposée aux fronts natifs (contrat v9).
 //!
 //! C'est la **frontière de contrat** : les fronts (Swift, C#) codent contre cet
 //! objet, jamais contre l'implémentation. Toute évolution passe par l'agent NOYAU
@@ -102,6 +102,26 @@ pub struct FfiChannelProfile {
     pub name: String,
     pub description: String,
     pub avatar_cid: Option<String>,
+}
+
+/// Aperçu d'un channel résolu par lien ou PeerId nu (spec 2026-07-23, partie
+/// A), voir [`ChampiniumNode::resolve_channel`]. `name`/`description`/
+/// `avatar_cid` sont l'identité éditoriale du channel (`ChannelMeta` aplatie —
+/// pas de type imbriqué, même choix que `FfiCatalogEntry`).
+#[derive(uniffi::Record)]
+pub struct FfiChannelPreview {
+    /// PeerId de l'émetteur (chaîne).
+    pub peer_id: String,
+    pub name: String,
+    pub description: String,
+    pub avatar_cid: Option<String>,
+    /// Contenus publiés par ce channel, tels que connus localement.
+    pub items: Vec<FfiContentItem>,
+    /// Vrai si CE nœud est déjà abonné à cet émetteur.
+    pub subscribed: bool,
+    /// Vrai si CE nœud a bloqué localement cet émetteur (l'aperçu reste
+    /// consultable malgré le blocage — voir doc de `resolve_channel`).
+    pub blocked: bool,
 }
 
 /// Une entrée de catalogue, vue par les fronts.
@@ -372,6 +392,25 @@ impl ChampiniumNode {
         Ok(())
     }
 
+    /// Résout un aperçu de channel par lien `champinium://channel/<peerid>`
+    /// (ou PeerId nu, même tolérance que `subscribe_channel`) : catalogue
+    /// d'abord, sinon DHT (voir `Node::resolve_channel`). Un émetteur bloqué
+    /// localement reste résolvable (`blocked = true`) ; un émetteur introuvable
+    /// (aucun fournisseur) renvoie `NotFound`.
+    pub async fn resolve_channel(
+        &self,
+        link_or_peer_id: String,
+    ) -> Result<FfiChannelPreview, FfiError> {
+        // Parse tolérant explicite : PAS de `?` direct sur `channel_link::parse`,
+        // son erreur n'est pas un `CoreError` et ne doit surtout pas retomber
+        // dans le mapping `Identity` → `Internal` (piège documenté sur
+        // `subscribe_channel`/`block_channel`).
+        let peer = crate::channel_link::parse(&link_or_peer_id)
+            .map_err(|e| FfiError::InvalidInput { msg: e.to_string() })?;
+        let preview = self.inner.resolve_channel(peer).await?;
+        Ok(channel_preview_to_ffi(preview))
+    }
+
     /// Bloque un channel **localement** (lien `champinium://channel/<peerid>`
     /// ou PeerId nu, même tolérance que `subscribe_channel`) : préférence
     /// strictement privée de ce nœud, jamais publiée. Désabonne si souscrit,
@@ -481,6 +520,26 @@ fn catalog_entry_to_ffi(node: &Node, e: crate::catalog::CatalogEntry) -> FfiCata
         seeded_count: seeded_count as u32,
         total_count: total_count as u32,
         pinned,
+    }
+}
+
+fn channel_preview_to_ffi(p: crate::p2p::ChannelPreview) -> FfiChannelPreview {
+    FfiChannelPreview {
+        peer_id: p.issuer.to_string(),
+        name: p.channel.name,
+        description: p.channel.description,
+        avatar_cid: p.channel.avatar_cid,
+        items: p
+            .items
+            .into_iter()
+            .map(|i| FfiContentItem {
+                cid: i.cid.to_string(),
+                title: i.title,
+                tags: i.tags,
+            })
+            .collect(),
+        subscribed: p.subscribed,
+        blocked: p.blocked,
     }
 }
 
@@ -954,6 +1013,86 @@ mod tests {
 
         // Débloqué : `subscribe_channel` doit maintenant réussir.
         b.subscribe_channel(a.peer_id()).await.unwrap();
+    }
+
+    /// Contrat v9 : `resolve_channel` sur son propre channel (publication
+    /// locale, sans réseau) renvoie un aperçu peuplé — profil, items,
+    /// `subscribed = false` (on ne s'abonne jamais à soi-même).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_channel_local_publication_populates_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = open_node(dir.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+
+        node.set_channel_profile(FfiChannelProfile {
+            name: "Aurores".into(),
+            description: "Ciels nocturnes".into(),
+            avatar_cid: None,
+        })
+        .await
+        .unwrap();
+
+        let cid = crate::content::cid_for(b"contenu v9").to_string();
+        node.publish_feed_with(vec![FfiContentItem {
+            cid: cid.clone(),
+            title: "Aurores boréales".into(),
+            tags: vec!["nature".into()],
+        }])
+        .await
+        .unwrap();
+
+        let link = node.channel_link(node.peer_id()).unwrap();
+        let preview = node.resolve_channel(link).await.unwrap();
+
+        assert_eq!(preview.peer_id, node.peer_id());
+        assert_eq!(preview.name, "Aurores");
+        assert_eq!(preview.items.len(), 1);
+        assert_eq!(preview.items[0].cid, cid);
+        assert!(!preview.subscribed);
+        assert!(!preview.blocked);
+    }
+
+    /// Une entrée invalide (ni lien, ni PeerId nu) est une InvalidInput.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_channel_with_garbage_is_invalid_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = open_node(dir.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+
+        let result = node.resolve_channel("nimporte quoi".into()).await;
+        assert!(matches!(result, Err(FfiError::InvalidInput { .. })));
+    }
+
+    /// `resolve_channel` accepte un PeerId nu (même tolérance que
+    /// `subscribe_channel`/`block_channel`), pas seulement un lien.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_channel_accepts_bare_peer_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = open_node(dir.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+
+        let cid = crate::content::cid_for(b"contenu v9 bare").to_string();
+        node.publish_feed(vec![cid]).await.unwrap();
+
+        let preview = node.resolve_channel(node.peer_id()).await.unwrap();
+        assert_eq!(preview.peer_id, node.peer_id());
+    }
+
+    /// Un émetteur inconnu/injoignable (aucun fournisseur DHT) est un
+    /// `NotFound`, pas une `Internal`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_channel_of_unreachable_issuer_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = open_node(dir.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+
+        let unknown = crate::PeerId::random();
+        let result = node.resolve_channel(unknown.to_string()).await;
+        assert!(matches!(result, Err(FfiError::NotFound { .. })));
     }
 
     async fn ffmpeg_available() -> bool {
