@@ -20,7 +20,7 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
   capacité absente, ils **ouvrent une demande de changement de contrat** (voir
   protocole plus bas) — ils ne contournent pas via du code natif ad hoc.
 
-### Contrat actuel — v6 (`CONTRACT_VERSION = 6`)
+### Contrat actuel — v7 (`CONTRACT_VERSION = 7`)
 
 > v1 → v2 : ajout de `subscribe_denylist(json) -> u64` sur `ChampiniumNode`
 > (modération fédérée activable depuis les fronts). Purement additif.
@@ -54,6 +54,20 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
 > (sync — PeerIds triés), `catalog_subscribed()` (sync — catalogue restreint
 > aux émetteurs souscrits), `channel_link(peer_id)` (sync — pour le bouton
 > « copier le lien de mon channel »). Purement additif.
+>
+> v6 → v7 : **seed proactif — quota, stats, pins** (spec channels lot c,
+> surface FFI). `seed_quota() -> u64` (sync), `set_seed_quota(bytes)`
+> (async — persiste puis réveille la boucle de seed), `storage_stats() ->
+> FfiStorageStats { used_bytes, quota_bytes }` (sync), `pin_content
+> (manifest_cid)` / `unpin_content(manifest_cid)` (async, CID invalide →
+> `InvalidInput` — épingle/dé-épingle, exempte ou remet évictable sous quota) ;
+> `FfiCatalogEntry` gagne `seeded_count`, `total_count` (couverture du seed
+> proactif sur le feed courant de l'émetteur) et `pinned` (manifestes épinglés
+> de ce feed) — rupture pour qui construit le record. Callback interface
+> **`SeedListener`** (`on_seed_updated()`), enregistrée via
+> `set_seed_listener(listener)` (async — même patron que `CatalogListener`) :
+> notifie tout changement effectif du seed proactif (publication nouvellement
+> seedée, éviction, purge au désabonnement).
 
 Fonctions libres (smoke test async, conservées de v0) :
 
@@ -87,14 +101,23 @@ Objet **`ChampiniumNode`** (méthodes) :
 | `subscriptions() -> Vec<String>` | sync | abonnements courants (PeerIds triés) |
 | `catalog_subscribed() -> Vec<FfiCatalogEntry>` | sync | catalogue restreint aux émetteurs souscrits |
 | `channel_link(peer_id) -> String` | sync | lien partageable `champinium://channel/<peerid>` |
+| `seed_quota() -> u64` | sync | quota de seed courant (octets) |
+| `storage_stats() -> FfiStorageStats` | sync | `(used_bytes, quota_bytes)` du seed proactif |
+| `set_seed_quota(bytes) -> ()` | **async** | définit le quota, persiste, réveille la boucle de seed |
+| `pin_content(manifest_cid) -> ()` | **async** | épingle un manifeste (jamais évincé sous quota) |
+| `unpin_content(manifest_cid) -> ()` | **async** | retire l'épinglage (redevient évictable) |
+| `set_seed_listener(listener) -> ()` | **async** | enregistre un `SeedListener` (rafraîchissement réactif du seed) |
 
-Records `FfiCatalogEntry { issuer, seq, cids, items, channel }`,
-`FfiContentItem { cid, title, tags }`, `FfiSearchHit { issuer, cid, title, tags }`,
-`FfiChannelProfile { name, description, avatar_cid }`.
+Records `FfiCatalogEntry { issuer, seq, cids, items, channel, seeded_count,
+total_count, pinned }`, `FfiContentItem { cid, title, tags }`,
+`FfiSearchHit { issuer, cid, title, tags }`,
+`FfiChannelProfile { name, description, avatar_cid }`,
+`FfiStorageStats { used_bytes, quota_bytes }`.
 Erreur **`FfiError` typée**
 (`Moderated` / `Network` / `NotFound` / `InvalidInput` / `Internal`, chacune avec
-`msg`). Callback interface **`CatalogListener`** : `on_catalog_updated()` —
-rappelé hors du thread UI, le front re-dispatche puis relit `catalog()`.
+`msg`). Callback interfaces **`CatalogListener`** (`on_catalog_updated()`) et
+**`SeedListener`** (`on_seed_updated()`) : rappelées hors du thread UI, le front
+re-dispatche puis relit `catalog()` / `storage_stats()`.
 Validé : bindings Swift **et** C# générés pour toute cette surface (objet + async).
 
 ## Mapping périmètre d'agent → répertoires du repo

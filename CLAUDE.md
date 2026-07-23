@@ -66,9 +66,10 @@ La suppression centrale est impossible par construction → modération côté n
 
 ## Risques classés
 
-1. **Persistance** — contenu sans seeder disparaît. Mitigation : seed-what-you-consume
-   + réplication opportuniste ; cold storage (Filecoin/Arweave) documenté, non
-   implémenté au pilot.
+1. **Persistance** — contenu sans seeder disparaît. Mitigation : seed proactif
+   des abonnés (chaque abonné retient et resert ce qu'il suit, sous quota) +
+   pins (contenu propre auto-épinglé, plus tout manifeste épinglé manuellement) ;
+   cold storage (Filecoin/Arweave) documenté, non implémenté au pilot.
 2. **Async FFI** — async/streams tokio → Swift ET C#. Mitigé par le spike Phase 0.
 3. **Modération décentralisée** — deux checkpoints, denylists signées.
 4. **Recherche décentralisée non résolue** — tags DHT + index local ; limites assumées.
@@ -146,10 +147,13 @@ connect → catalogue → `fetchHls` → lecture **AVPlayer**. `swift build` OK
 (compile + link contre le binding réel). Lecture GUI à valider hors headless.
 Voir [`AGENTS.md`](AGENTS.md) pour le tableau du contrat.
 
-**Critère de sortie MVP (Phase 3) déroulé** — voir
-[`docs/mvp-demo.md`](docs/mvp-demo.md) : A ingère/publie, B découvre par gossip
-et reconstruit un HLS jouable, puis — A éteint — un nœud C obtient le contenu
-identique depuis B seul (seed-what-you-consume prouvé). Reste à rejouer en GUI
+**Critère de sortie MVP (Phase 3) déroulé (historique)** — à l'origine prouvé
+via seed-what-you-consume (démo du 2026-07-04, v0.2.0) : A ingère/publie, B
+découvre par gossip et reconstruit un HLS jouable, puis — A éteint — un nœud C
+obtient le contenu identique depuis B seul.
+[`docs/mvp-demo.md`](docs/mvp-demo.md) a depuis été réécrit sur le flux
+d'abonnement (channels lot (c), voir plus bas), qui a remplacé
+seed-what-you-consume comme mécanisme de persistance. Reste à rejouer en GUI
 sur deux machines physiques.
 
 **Phase 4 — close.**
@@ -215,8 +219,9 @@ sur deux machines physiques.
   les éditeurs de denylists, **aucun effet automatique**. Topic couvert par la
   validation applicative + peer scoring. `Node::report_count(s)`.
 - **Réplication mesurée ✔** : `Node::replication_factor(cid)` (fournisseurs
-  DHT), CLI `replication <cid> --peer …`. Testé : 1 → 2 après
-  seed-what-you-consume.
+  DHT), CLI `replication <cid> --peer …`. Testé à l'époque (avant le retrait de
+  seed-what-you-consume, lot (c) channels) : 1 → 2 après un `get` simple ; ce
+  comportement a depuis été inversé par défaut, voir lot (c) ci-dessous.
 - **Channels lot (a) ✔** : feed `champinium-feed/v3` (identité de channel
   signée : nom/description/avatar, formats v1/v2 supprimés — zéro
   utilisateur), profil persisté (`.channel_profile`) avec republication au
@@ -242,21 +247,52 @@ sur deux machines physiques.
   désabonnement possible depuis les deux. L'enregistrement OS du scheme
   `champinium://` (Info.plist / appxmanifest / .desktop) est différé au
   packaging (Phase 6) — coller le lien reste manuel jusque-là.
-- **Restent** (issues) : IPNS durable (#21), réplication opportuniste au-delà du
-  reseed à la consommation, seed proactif des channels souscrits (lot c).
+- **Channels lot (c) ✔** : politique de stockage explicite par appel,
+  **`StorePolicy::Stream` par défaut** (`get` ne met plus le bloc en cache et
+  n'annonce plus le consommateur comme fournisseur) — **seed-what-you-consume
+  est retiré** (`StorePolicy::Seed` reste disponible en interne, utilisé par le
+  seed proactif lui-même). Persistance reprise par une **boucle de seed
+  proactif** : chaque nœud retient et resert les publications des channels
+  **souscrits**, en **round-robin** sur ses abonnements, sous un **quota**
+  d'octets persisté (`.seed_quota`, 20 Gio par défaut). Sous pression de
+  quota, **éviction par réplication** (la publication déjà la mieux répliquée
+  ailleurs sur le réseau part en premier, la plus ancienne en cas d'égalité) —
+  amortie par une **inégalité stricte anti-oscillation** : on n'évince que si
+  la victime potentielle est *strictement* mieux répliquée que le candidat
+  entrant, jamais à égalité. **Pins** : un manifeste épinglé n'est jamais
+  évincé ; tout contenu **publié par le nœud lui-même est auto-épinglé** à
+  l'ingestion. **Désabonnement** : purge du `SeedIndex` les publications NON
+  épinglées de l'émetteur retiré (les pins survivent au désabonnement) ; les
+  blocs orphelins (non référencés par une autre publication indexée) sont
+  supprimés. Index persisté `SeedIndex` (fichier dotfile `.seed_index`, à côté
+  des blocs) — logique pure, séparée du réseau (`crates/champinium-core/src/
+  seeding.rs`). **Réplication toutes-directions (opportuniste au-delà des
+  abonnements) SUPPRIMÉE à dessein** — ne pas la réintroduire hors d'une
+  décision explicite de spec ; `replicate_under_provided` et les flags du
+  démon associés (`--replication-target`/`--replicate-max`) sont retirés.
+  **Contrat FFI v7** : `seed_quota()`/`set_seed_quota(bytes)`,
+  `storage_stats() -> FfiStorageStats`, `pin_content`/`unpin_content`,
+  `FfiCatalogEntry` gagne `seeded_count`/`total_count`/`pinned`, callback
+  **`SeedListener`** (`on_seed_updated`). CLI : `quota [--set <octets>]` /
+  `pin <cid-manifeste>` / `unpin <cid-manifeste>`. Les trois fronts affichent
+  l'état de seed par channel (« à jour » / « seed en cours (x/y) ») et des
+  actions pin/unpin. Spec :
+  `~/Work/.superpowers/champinium/specs/2026-07-22-channels-subscriptions-design.md`.
+- **Restent** (issues) : IPNS durable (#21), channels lot (d) — blocage local
+  de channel, denylists par clé, agrégation des signalements par channel.
 
 Phasing : 0 (spike async FFI ✔ contrat) → **1 (P2P nu CLI ✔)** → **2 (modération ✔,
 feeds/gossipsub/catalogue ✔, ingestion ffmpeg ✔)** → **3 (contrat UniFFI v3 ✔,
 UI macOS compile ✔, critère MVP déroulé ✔)** → **4 (close : 3 fronts ✔, relay
 NAT ✔, seeding ✔, feed DHT ✔, fetch concurrent ✔, déploiement tiers documenté ✔ ;
 bitswap différé)** → 5 (en cours : peer scoring ✔, signalement P2P ✔, réplication
-mesurée ✔, recherche ✔ (#20), channels lot (a) identité ✔ et lot (b) abonnements
-✔ ; IPNS #21, channels lot (c) seed proactif et lot (d) blocage local à venir).
-Voir le spec.
+mesurée ✔, recherche ✔ (#20), channels lot (a) identité ✔, lot (b) abonnements
+✔ et lot (c) seed proactif/quota/pins ✔ ; IPNS #21, channels lot (d) blocage
+local à venir). Voir le spec.
 
 **Dernière release : voir `.release-please-manifest.json` / CHANGELOG** —
 pas de version en dur ici, elle dérive (règle intendant DG006). Release-please
 gère le versionnement (`bump-minor-pre-major` actif :
 un breaking change bumpe la mineure tant qu'on est < 1.0.0 — la 1.0 sera un
 choix délibéré de stabilisation d'API). Versionnement du contrat FFI distinct :
-`CONTRACT_VERSION = 6` (voir `AGENTS.md`).
+`CONTRACT_VERSION = 7` (voir `AGENTS.md`).

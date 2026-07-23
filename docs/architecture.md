@@ -2,8 +2,9 @@
 
 > Public : quiconque veut comprendre comment le projet fonctionne de bout en
 > bout. Les renvois pointent vers le code (chemins cliquables) et les ADRs
-> (`docs/adr/`) pour les décisions. État au contrat FFI **v6** / release
-> **v0.6.x**.
+> (`docs/adr/`) pour les décisions. État au contrat FFI **v7** (voir
+> `.release-please-manifest.json` / `CHANGELOG.md` pour la version de release
+> — elle dérive, pas de version en dur ici, cf. `CLAUDE.md`).
 
 ## 1. Ce que c'est, en une phrase
 
@@ -195,9 +196,9 @@ appliqués — s'abonner garantit de voir ce channel. Les liens partageables
 `champinium://channel/<peerid>` (module `channel_link`) sont la forme
 échangée entre utilisateurs (« copier le lien de mon channel ») ; `parse` est
 tolérant et accepte aussi un `PeerId` nu. Se désabonner (`unsubscribe_channel`)
-retire seulement le suivi et la vue — au lot (b), il n'y a pas encore de stock
-proactif à purger (voir §11, lot channels (c) : seed proactif + éviction +
-retrait de seed-what-you-consume).
+retire le suivi et la vue, **et** purge le stock proactif de seed constitué
+pour cet émetteur (§6 bis) — sauf les manifestes épinglés, qui survivent au
+désabonnement.
 
 Nuance à connaître : la **liste** d'abonnements elle-même n'est jamais
 publiée, mais le suivi actif émet un `fetch_feed` — donc un GET DHT — vers
@@ -207,28 +208,107 @@ sur le chemin de cette requête. C'est inhérent au suivi actif voulu par la
 spec (§2), pas un défaut d'implémentation — mais ça mérite d'être dit
 explicitement plutôt que de laisser croire à une confidentialité totale.
 
-### Lecture + seed-what-you-consume
+### Lecture (`StorePolicy::Stream` par défaut)
 
 ```
 clic « Lire » → fetch_hls(manifeste)
   get(manifeste) : cache local ? sinon [modération #2] → providers DHT
       → requêtes à TOUS les fournisseurs EN PARALLÈLE, 1ʳᵉ réponse valide gagne
-      → bloc vérifié contre le CID → cache local → REPROVIDE (je deviens fournisseur)
+      → bloc vérifié contre le CID → rendu à l'appelant, PAS mis en cache,
+        PAS d'annonce fournisseur (StorePolicy::Stream)
   idem pour chaque segment → écrit index.m3u8 + .ts → lecteur natif
   (échec en route → répertoire de sortie nettoyé, pas de lecture partielle)
 ```
 
-Consommer, c'est répliquer : c'est la mitigation n°1 du risque « un contenu
-sans seeder disparaît ».
+`get` prend une politique de stockage explicite (`crate::p2p::StorePolicy`,
+interne) : **`Stream`** (défaut de toute lecture/consommation — rend les
+octets, ne cache pas, n'annonce pas) ou **`Seed`** (met en cache et s'annonce
+fournisseur). **`seed-what-you-consume` est retiré** : un simple visionnage ne
+fait plus du spectateur un fournisseur — testé par
+`consumer_does_not_reseed_by_default`
+([`crates/champinium-core/tests/replication.rs`](../crates/champinium-core/tests/replication.rs)).
+`StorePolicy::Seed` reste utilisé en interne par la boucle de seed proactif
+ci-dessous (§6 bis) — c'est elle, pas la lecture, qui décide quoi retenir.
+
+### Seed proactif des abonnements : quota, éviction, pins (§6 bis)
+
+Depuis le retrait de seed-what-you-consume, la persistance du contenu dépend
+d'un mécanisme **explicite et borné** plutôt que d'un effet de bord de la
+lecture : chaque nœud retient et resert proactivement les publications des
+channels **auxquels il est abonné**.
+
+- **`SeedIndex`** ([`crates/champinium-core/src/seeding.rs`](../crates/champinium-core/src/seeding.rs)) :
+  logique pure (aucun accès réseau), persistée en JSON dans le dotfile
+  **`.seed_index`** à côté des blocs (comme `.channel_profile`,
+  `.subscriptions`). Indexe les publications retenues par émetteur, un
+  ensemble de manifestes **épinglés** (`pin`/`unpin`, exemptés d'éviction) et
+  un compteur d'octets total.
+- **Quota** : un budget d'octets, persisté dans le dotfile **`.seed_quota`**
+  (20 Gio par défaut, `DEFAULT_SEED_QUOTA_BYTES`), modifiable via
+  `set_seed_quota(bytes)`.
+- **Boucle de seed** (`seed_loop`/`seed_pass` dans
+  [`p2p.rs`](../crates/champinium-core/src/p2p.rs)) : passe périodique en
+  **round-robin** sur les émetteurs souscrits (l'index de départ tourne à
+  chaque passe, pour ne pas toujours favoriser le même émetteur en tête de
+  liste) ; réveillée aussi par changement de catalogue, de quota ou
+  désabonnement (`subscribe_seed`/canal de réveil dédié, pas seulement le
+  minuteur).
+- **Éviction sous pression de quota** (`make_room_for`/`eviction_order`) :
+  quand une nouvelle publication ne rentre plus sous quota, la victime est
+  choisie par **réplication décroissante** (ce qui est déjà bien répliqué
+  ailleurs sur le réseau part en premier — mesurée via les providers DHT du
+  manifeste, `get_providers`), puis par ancienneté croissante en cas
+  d'égalité. Les manifestes **épinglés** sont exclus des candidats à
+  l'éviction.
+- **Amortisseur anti-oscillation (dampener)** : l'éviction n'a lieu que si la
+  réplication de la victime potentielle est **strictement supérieure** à
+  celle du candidat entrant (`victim_replication > candidate_replication`,
+  jamais `>=`) — sans cette inégalité stricte, deux nœuds à la limite de leur
+  quota et à réplication égale s'évinceraient mutuellement en boucle
+  (thrashing) au lieu de stabiliser leur seed. C'est un compromis assumé :
+  sous cette condition, une publication un peu trop volumineuse peut rester
+  bloquée hors quota plutôt que de forcer une éviction à réplication égale.
+- **Pins** : `pin_content(manifest_cid)`/`unpin_content(manifest_cid)`
+  épinglent/dé-épinglent un manifeste manuellement. **Tout contenu publié par
+  le nœud lui-même est auto-épinglé à l'ingestion** (`ingest_file`) — un
+  créateur ne voit jamais son propre contenu évincé par sa propre boucle de
+  seed.
+- **Désabonnement** (`unsubscribe_channel`) : purge du `SeedIndex` les
+  publications **non épinglées** de l'émetteur retiré ; les blocs devenus
+  orphelins (non référencés par une autre publication encore indexée) sont
+  supprimés du blockstore. Les manifestes épinglés de cet émetteur survivent
+  au désabonnement.
+- **Couplage avec les provider records DHT** : l'éviction retire la
+  publication du `SeedIndex` et supprime ses blocs devenus orphelins, mais ne
+  retire **pas** le provider record Kademlia annoncé pour ce CID (pas
+  d'appel `stop_providing`/`unprovide`) — celui-ci s'éteint naturellement par
+  expiration TTL côté DHT. La stabilité de l'amortisseur anti-oscillation
+  ci-dessus **dépend de ce choix** : mesurer la réplication en incluant un
+  provider record qu'on vient soi-même de retirer changerait le calcul
+  d'éligibilité à la volée et réintroduirait le risque de thrashing que le
+  dampener cherche à éviter.
+- **Réplication toutes-directions supprimée à dessein** : le lot (c) retire
+  aussi `replicate_under_provided` et les flags de démon associés
+  (`--replication-target`/`--replicate-max`) — un nœud ne réplique plus
+  spontanément du contenu hors de ses abonnements. Ne pas réintroduire cette
+  réplication opportuniste sans décision explicite de spec (règle §3 de la
+  spec channels).
+
+Consommer ne réplique plus automatiquement (§ ci-dessus) : la mitigation du
+risque « un contenu sans seeder disparaît » (risque #1) repose désormais sur
+le seed proactif des abonnés et les pins, pas sur la lecture.
 
 ### Persistance active
 
 - **`champinium-seed`** (démon, fichiers de service dans
-  [`infra/services/`](../infra/services)) : réannonce périodiquement tous les
-  CIDs détenus (le store de providers Kademlia est volatil), republie le feed,
-  et fait de la **réplication opportuniste** : tout contenu du catalogue ayant
-  moins de N fournisseurs (`replication_factor`, défaut cible 2) est répliqué
-  — manifeste **et** segments, bornes par passe.
+  [`infra/services/`](../infra/services)) : depuis le retrait de
+  seed-what-you-consume, le démon **resert seulement ce qu'il détient déjà** —
+  il réannonce périodiquement tous les CIDs détenus (le store de providers
+  Kademlia est volatil) via `reprovide_all`. Il **ne publie plus de feed**
+  (la publication reste le rôle du nœud créateur, pas du démon) et **ne fait
+  plus de réplication opportuniste** au-delà des abonnements (voir §6 bis,
+  ci-dessus) : ce qu'il détient à seeder est entièrement décidé par la boucle
+  de seed proactif du nœud, sur ses propres abonnements.
 - Un bloc local **corrompu** (crash pendant écriture) n'est pas fatal : `get`
   détecte l'incohérence d'intégrité et re-télécharge du réseau, ce qui répare
   le fichier.
@@ -259,7 +339,7 @@ Autour, deux mécanismes d'écosystème :
   catalogue borné à 1024 émetteurs (refus-quand-plein, pas d'éviction), c'est
   la défense contre l'inondation par clés jetables.
 
-## 8. La frontière FFI : le contrat v6
+## 8. La frontière FFI : le contrat v7
 
 La surface UniFFI de [`ffi.rs`](../crates/champinium-core/src/ffi.rs) est
 **le contrat** entre le noyau et les fronts (tableau exhaustif et protocole de
@@ -279,7 +359,7 @@ changement dans [`AGENTS.md`](../AGENTS.md)). Ce qui la caractérise :
 - **Bindings générés au build, jamais commités** : Swift via
   UniFFI/XCFramework (`just macos-prepare`), C# via `uniffi-bindgen-cs`
   (`just gen-csharp`). Le front Linux consomme le crate **directement** (pas
-  de FFI). `CONTRACT_VERSION` (=6) permet aux fronts de détecter une
+  de FFI). `CONTRACT_VERSION` (=7) permet aux fronts de détecter une
   incompatibilité au démarrage.
 - **Abonnements (v6)** : `subscribe_channel`/`unsubscribe_channel` (lien
   `champinium://channel/<peerid>` ou PeerId nu), `subscriptions` (liste
@@ -287,6 +367,17 @@ changement dans [`AGENTS.md`](../AGENTS.md)). Ce qui la caractérise :
   et `channel_link` (lien partageable du channel de ce nœud). Aucune de ces
   méthodes ne touche au réseau de façon synchrone-bloquante côté front : le
   suivi actif tourne dans la boucle de fond du noyau (§6).
+- **Seed proactif — quota, stats, pins (v7)** : `seed_quota()`/
+  `set_seed_quota(bytes)`, `storage_stats() -> FfiStorageStats {used_bytes,
+  quota_bytes}`, `pin_content(manifest_cid)`/`unpin_content(manifest_cid)`
+  (CID invalide → `InvalidInput`). `FfiCatalogEntry` gagne `seeded_count`,
+  `total_count` (couverture du seed proactif sur le feed courant de
+  l'émetteur) et `pinned` (manifestes épinglés de ce feed) — rupture pour qui
+  construit le record, d'où le bump de contrat. Callback interface
+  **`SeedListener`** (`on_seed_updated()`), même patron que
+  `CatalogListener` : notifie toute publication nouvellement seedée, éviction
+  ou purge au désabonnement ; le front re-dispatche puis relit
+  `storage_stats()`/`catalog()`.
 
 Les trois fronts ([`apps/macos`](../apps/macos),
 [`apps/windows`](../apps/windows), [`apps/linux`](../apps/linux)) font tous la
@@ -336,19 +427,19 @@ qui compte vit dans le réseau, chaque nœud n'en garde qu'une vue.
 | Sujet | État | Référence |
 |---|---|---|
 | bitswap | différé (amont cassé ; le fetch multi-fournisseurs couvre le bénéfice pratique) — débloquable par un bump `multihash-codetable` côté beetswap | ADR 0006 |
-| IPNS | différé, adossé à bitswap (sa valeur = interop IPFS public) ; durabilité déjà couverte par la republication du seed | ADR 0007 |
+| IPNS | différé, adossé à bitswap (sa valeur = interop IPFS public) ; durabilité déjà couverte par le seed proactif des abonnés + les pins | ADR 0007 |
 | Recherche | locale (ce que le nœud a vu) + tags DHT ; pas d'index global — assumé | risque #4, §6 |
-| Persistance | seed-what-you-consume + réplication opportuniste ; cold storage (Filecoin/Arweave) documenté non implémenté | risque #1 |
+| Persistance | seed proactif des abonnés (quota + éviction par réplication) + pins ; cold storage (Filecoin/Arweave) documenté non implémenté | risque #1 |
 | NAT | relay v2 + DCUtR testés ; relays multipliables | risque #6 |
 | Signature payante | palier gratuit livré ; notarisation/Authenticode différés | `packaging.md` |
 | Windows/C# | validé par CI ; pas de stack intendant | `.intendant.toml` |
-| Channels lot (c) | seed proactif des channels souscrits + quota + éviction + cache de lecture séparé + retrait de seed-what-you-consume — pas encore implémenté (le désabonnement au lot (b) ne purge rien) | §6 |
+| Channels lot (c) | seed proactif des channels souscrits + quota + éviction + pins + retrait de seed-what-you-consume — **implémenté** (contrat FFI v7) | §6 bis |
 | Channels lot (d) | blocage local de channel, denylists par clé, agrégation des signalements par channel — pas encore implémenté | §7 |
 
 ## 12. Carte des documents
 
 - [`CLAUDE.md`](../CLAUDE.md) — principes + état d'avancement (source de vérité).
-- [`AGENTS.md`](../AGENTS.md) — contrat FFI (tableau v6) + garde-fous d'équipe.
+- [`AGENTS.md`](../AGENTS.md) — contrat FFI (tableau v7) + garde-fous d'équipe.
 - [`docs/adr/`](adr/) — décisions : libp2p vs iroh (0001), modération côté
   nœud (0002), feeds signés (0003), transport de blocs (0006), IPNS (0007)…
 - [`docs/mvp-demo.md`](mvp-demo.md) / [`docs/gui-demo.md`](gui-demo.md) —

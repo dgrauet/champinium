@@ -19,6 +19,7 @@ use crate::identity;
 use crate::ingest::{self, HlsManifest, HlsSegment};
 use crate::moderation::{Denylist, Moderation};
 use crate::report::{Report, ReportBook};
+use crate::seeding::{self, eviction_order, SeedIndex, SeededPublication};
 use cid::Cid;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -69,6 +70,13 @@ const MAX_DHT_RECORDS: usize = 100_000;
 /// le test expirait. D'où l'intervalle passé **au constructeur**, effectif
 /// avant même le `tokio::spawn` de la boucle — aucune course possible.
 const FOLLOW_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// Intervalle du seed proactif des channels souscrits (lot c) : à chaque tic
+/// (et à chaque évènement catalogue, cf. `seed_loop`), passe en revue les
+/// channels souscrits et complète leurs publications manquantes sous quota.
+/// Même leçon que [`FOLLOW_INTERVAL`] : surchargeable au constructeur
+/// ([`Node::with_moderation_and_intervals`]), jamais par un setter posé après
+/// le `tokio::spawn`.
+const SEED_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Demande d'un bloc par CID (octets du CID).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +221,24 @@ enum Command {
     },
 }
 
+/// Politique de stockage appliquée par [`Node::get_with`] lors d'une
+/// récupération réseau (retrait de seed-what-you-consume, spec channels
+/// lot c) : un hit local est toujours servi tel quel et le checkpoint
+/// modération #2 s'applique dans les deux cas — seul le sort du bloc
+/// *nouvellement récupéré depuis le réseau* diffère.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StorePolicy {
+    /// Ancien comportement : le bloc est mis en cache ET réannoncé (le nœud
+    /// devient fournisseur). Réservé aux cas où le nœud choisit explicitement
+    /// de seeder ce contenu (channel souscrit, ingestion, réparation d'un
+    /// cache local corrompu).
+    Seed,
+    /// Rien n'est écrit ni annoncé : les octets sont rendus à l'appelant et
+    /// oubliés. C'est le nouveau défaut de [`Node::get`] — consommer un
+    /// contenu ne doit plus, par défaut, engager le nœud à le seeder.
+    Stream,
+}
+
 /// Poignée vers un nœud P2P en fonctionnement.
 #[derive(Clone)]
 pub struct Node {
@@ -228,6 +254,18 @@ pub struct Node {
     /// Abonnements locaux (channels suivis) — état **privé** du nœud, jamais
     /// publié sur le réseau (spec channels §2).
     subscriptions: Arc<Mutex<BTreeSet<PeerId>>>,
+    /// Index de seed proactif (spec channels lot c) : publications retenues
+    /// par émetteur, pins, quota — voir [`crate::seeding`].
+    seed_index: Arc<Mutex<SeedIndex>>,
+    /// Quota de seed courant (octets), persisté à côté de l'index.
+    seed_quota: Arc<Mutex<u64>>,
+    /// Notifie chaque publication nouvellement seedée ou purgée (FFI listener
+    /// à venir tâche 5).
+    seed_events: tokio::sync::broadcast::Sender<()>,
+    /// Réveil best-effort de `seed_loop` (ex. changement de quota) — distinct
+    /// de `catalog_events` : un changement de quota n'est pas un changement de
+    /// catalogue.
+    seed_wake: tokio::sync::broadcast::Sender<()>,
     /// Marqueur de vivacité : la tâche de suivi périodique n'en tient qu'un
     /// [`Weak`], ce qui lui permet de s'arrêter dès que toutes les poignées
     /// `Node` (qui clonent ce `Arc`) sont tombées, sans jamais retenir un
@@ -275,18 +313,43 @@ impl Node {
 
     /// Comme [`Node::with_moderation`], mais avec un `follow_interval` de
     /// suivi actif explicite plutôt que la constante de production
-    /// [`FOLLOW_INTERVAL`] (5 min, bien trop longue pour un test). Réservé
-    /// aux tests : contrairement à un setter post-construction (qui entrerait
-    /// en course avec la toute première lecture de `follow_interval` par
-    /// `follow_loop` — voir le commentaire sur `FOLLOW_INTERVAL`),
-    /// l'intervalle est effectif **avant** le `tokio::spawn` de la boucle,
-    /// donc sans course possible.
+    /// [`FOLLOW_INTERVAL`] (5 min, bien trop longue pour un test). Le
+    /// `seed_interval` (lot c) reste la constante de production
+    /// [`SEED_INTERVAL`] — utiliser [`Node::with_moderation_and_intervals`]
+    /// pour le surcharger aussi.
     #[doc(hidden)]
     pub async fn with_moderation_and_follow_interval(
         keypair: Keypair,
         blockstore: Blockstore,
         moderation: Moderation,
         follow_interval: Duration,
+    ) -> CoreResult<Self> {
+        Self::with_moderation_and_intervals(
+            keypair,
+            blockstore,
+            moderation,
+            follow_interval,
+            SEED_INTERVAL,
+        )
+        .await
+    }
+
+    /// Comme [`Node::with_moderation`], mais avec `follow_interval` (suivi de
+    /// channel) ET `seed_interval` (seed proactif, lot c) explicites plutôt
+    /// que les constantes de production [`FOLLOW_INTERVAL`]/[`SEED_INTERVAL`]
+    /// (5 min chacune, bien trop long pour un test). Réservé aux tests :
+    /// contrairement à un setter post-construction (qui entrerait en course
+    /// avec la toute première lecture de l'intervalle par la boucle
+    /// correspondante — voir le commentaire sur `FOLLOW_INTERVAL`), les deux
+    /// intervalles sont effectifs **avant** le `tokio::spawn` de leur boucle,
+    /// donc sans course possible.
+    #[doc(hidden)]
+    pub async fn with_moderation_and_intervals(
+        keypair: Keypair,
+        blockstore: Blockstore,
+        moderation: Moderation,
+        follow_interval: Duration,
+        seed_interval: Duration,
     ) -> CoreResult<Self> {
         let peer_id = identity::peer_id(&keypair);
         let mut swarm = build_swarm(keypair.clone())?;
@@ -338,6 +401,14 @@ impl Node {
         // channels §1) : un profil corrompu ne doit pas empêcher le démarrage.
         let channel_profile = Arc::new(Mutex::new(load_channel_profile(&blockstore)));
 
+        // Index de seed proactif (lot c) : rechargé depuis le disque (défaut
+        // vide/quota par défaut si absent — un index/quota corrompu ne doit
+        // pas empêcher le démarrage, même logique que le profil de channel).
+        let seed_index = Arc::new(Mutex::new(seeding::load_seed_index(&blockstore)));
+        let seed_quota = Arc::new(Mutex::new(seeding::load_seed_quota(&blockstore)));
+        let (seed_events, _) = tokio::sync::broadcast::channel(64);
+        let (seed_wake, _) = tokio::sync::broadcast::channel(16);
+
         let alive = Arc::new(());
 
         // Suivi actif périodique des channels souscrits (spec channels §2) : ne
@@ -357,6 +428,31 @@ impl Node {
             follow_interval,
         ));
 
+        // Seed proactif des channels souscrits (lot c) : même patron de
+        // vivacité que `follow_loop` (Weak, jamais un `Node` fort). Se
+        // réveille aussi sur `catalog_events` (nouvelle publication à seeder
+        // au plus vite) et sur `seed_wake` (ex. changement de quota).
+        tokio::spawn(seed_loop(
+            Arc::downgrade(&alive),
+            SeedLoopState {
+                cmd_tx: cmd_tx.clone(),
+                blockstore: blockstore.clone(),
+                moderation: moderation.clone(),
+                catalog: catalog.clone(),
+                subscriptions: subscriptions.clone(),
+                seed_index: seed_index.clone(),
+                seed_quota: seed_quota.clone(),
+                seed_events: seed_events.clone(),
+                reports: reports.clone(),
+                keypair: keypair.clone(),
+                peer_id,
+                quota_blocked: Arc::new(Mutex::new(HashSet::new())),
+            },
+            catalog_events.subscribe(),
+            seed_wake.subscribe(),
+            seed_interval,
+        ));
+
         Ok(Self {
             peer_id,
             keypair,
@@ -368,6 +464,10 @@ impl Node {
             feed_seq,
             channel_profile,
             subscriptions,
+            seed_index,
+            seed_quota,
+            seed_events,
+            seed_wake,
             alive,
             cmd_tx,
         })
@@ -406,6 +506,13 @@ impl Node {
     /// manquer, un tic ultérieur suffit à relire l'instantané (`catalog_entries`).
     pub fn subscribe_catalog(&self) -> tokio::sync::broadcast::Receiver<()> {
         self.catalog_events.subscribe()
+    }
+
+    /// S'abonne aux évènements de seed proactif (lot c) : un tic est émis à
+    /// chaque publication nouvellement seedée ou purgée (désabonnement). Le
+    /// listener FFI viendra en tâche 5 ; ce canal est le point d'accroche.
+    pub fn subscribe_seed(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.seed_events.subscribe()
     }
 
     /// `PeerId` du nœud.
@@ -628,16 +735,54 @@ impl Node {
         let (target, segs) = ingest::parse_playlist(&m3u8, work.path())?;
 
         let mut segments = Vec::with_capacity(segs.len());
+        let mut segment_cids = Vec::with_capacity(segs.len());
+        let mut total_bytes = 0u64;
         for (path, duration) in segs {
             let bytes = tokio::fs::read(&path).await?;
             let cid = self.add(&bytes).await?; // modération #1 + store + provide
+            total_bytes += self.blockstore.size_of(&cid).unwrap_or(bytes.len() as u64);
+            segment_cids.push(cid.to_string());
             segments.push(HlsSegment {
                 cid: cid.to_string(),
                 duration,
             });
         }
         let manifest = HlsManifest::new(target, segments);
-        self.add(manifest.to_json()?.as_bytes()).await
+        let manifest_cid = self.add(manifest.to_json()?.as_bytes()).await?;
+        total_bytes += self.blockstore.size_of(&manifest_cid).unwrap_or(0);
+
+        // Contenu propre : retenu au SeedIndex, ÉPINGLÉ d'office (jamais
+        // évincé sous quota) — c'est le créateur, il seed toujours ce qu'il
+        // publie lui-même (spec channels lot c). Garde `contains_manifest` :
+        // `SeedIndex::insert` ne déduplique PAS (elle pousse toujours une
+        // nouvelle entrée) — un ré-ingest du même contenu (même manifeste,
+        // même CID) ne doit pas compter deux fois ses octets dans le quota.
+        // L'épinglage, lui, est idempotent (`BTreeSet::insert`) et refait
+        // dans tous les cas.
+        {
+            let mut idx = self
+                .seed_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let manifest_cid_str = manifest_cid.to_string();
+            if !idx.contains_manifest(&manifest_cid_str) {
+                idx.insert(
+                    self.peer_id.to_string(),
+                    SeededPublication {
+                        manifest_cid: manifest_cid_str.clone(),
+                        segment_cids,
+                        total_bytes,
+                        order: 0, // ignoré par `insert`, réassigné par l'index.
+                    },
+                );
+            }
+            idx.pin(&manifest_cid_str);
+            if let Err(e) = seeding::save_seed_index(&self.blockstore, &idx) {
+                tracing::warn!("persistance de l'index de seed échouée: {e}");
+            }
+        }
+        let _ = self.seed_events.send(());
+        Ok(manifest_cid)
     }
 
     /// Reconstruit un HLS jouable depuis un manifeste : récupère le manifeste et
@@ -656,12 +801,25 @@ impl Node {
     }
 
     async fn fetch_hls_inner(&self, manifest_cid: Cid, out_dir: &Path) -> CoreResult<PathBuf> {
-        let bytes = self.get(manifest_cid).await?;
+        // Politique : `Seed` si le manifeste appartient à un channel souscrit
+        // (suivi actif — on veut le resservir), `Stream` sinon (simple
+        // consultation, ex. Explorer) — le retrait de seed-what-you-consume ne
+        // doit pas priver un channel suivi de sa réplication.
+        let policy = if self
+            .catalog_subscribed()
+            .iter()
+            .any(|e| e.cids.contains(&manifest_cid))
+        {
+            StorePolicy::Seed
+        } else {
+            StorePolicy::Stream
+        };
+        let bytes = self.get_with(manifest_cid, policy).await?;
         let manifest = HlsManifest::from_json(&bytes)?;
         tokio::fs::create_dir_all(out_dir).await?;
         for seg in &manifest.segments {
             let cid: Cid = seg.cid.parse().map_err(CoreError::Cid)?;
-            let data = self.get(cid).await?;
+            let data = self.get_with(cid, policy).await?;
             tokio::fs::write(out_dir.join(format!("{}.ts", seg.cid)), &data).await?;
         }
         let playlist = out_dir.join("index.m3u8");
@@ -716,16 +874,49 @@ impl Node {
         Ok(())
     }
 
-    /// Se désabonne d'un émetteur : persiste immédiatement. Le feed déjà
-    /// appliqué au catalogue n'est pas rétroactivement retiré (le catalogue
-    /// reste un instantané "meilleur effort" de ce que le nœud a vu).
+    /// Se désabonne d'un émetteur : persiste immédiatement, puis purge du
+    /// SeedIndex les publications NON épinglées de ce channel (spec channels
+    /// lot c) — les blocs correspondants sont supprimés du magasin, SAUF
+    /// ceux encore référencés par une autre publication indexée (`all_cids`
+    /// de l'index restant). Le feed déjà appliqué au catalogue n'est pas
+    /// rétroactivement retiré (le catalogue reste un instantané "meilleur
+    /// effort" de ce que le nœud a vu).
     pub fn unsubscribe(&self, issuer: PeerId) -> CoreResult<()> {
-        let mut subs = self
-            .subscriptions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        subs.remove(&issuer);
-        save_subscriptions(&self.blockstore, &subs)
+        {
+            let mut subs = self
+                .subscriptions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            subs.remove(&issuer);
+            save_subscriptions(&self.blockstore, &subs)?;
+        }
+
+        let evicted = {
+            let mut idx = self
+                .seed_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let evicted = idx.purge_issuer(&issuer.to_string(), true);
+            if !evicted.is_empty() {
+                if let Err(e) = seeding::save_seed_index(&self.blockstore, &idx) {
+                    tracing::warn!("persistance de l'index de seed échouée: {e}");
+                }
+            }
+            evicted
+        };
+        if !evicted.is_empty() {
+            remove_unshared_blocks(&self.blockstore, &self.seed_index, &evicted);
+            let _ = self.seed_events.send(());
+        }
+        // Réveille `seed_loop` même si rien n'a été purgé (ex. désabonnement
+        // d'un émetteur sans publication indexée) : la place libérée par une
+        // purge peut suffire à faire rentrer une publication ailleurs
+        // sautée faute de quota, ET `seed_loop` vide `quota_blocked` sur
+        // cette branche (cf. son `tokio::select!`) — sans ce réveil, une
+        // publication mémorisée bloquée resterait sautée indéfiniment même
+        // après que le désabonnement a libéré son quota.
+        let _ = self.seed_wake.send(());
+        Ok(())
     }
 
     /// Abonnements courants, triés (stabilité d'affichage).
@@ -736,6 +927,117 @@ impl Node {
             .iter()
             .copied()
             .collect()
+    }
+
+    /// Épingle un manifeste : exempté d'éviction par le seed proactif (lot c),
+    /// qu'il soit ou non déjà retenu par `seed_loop`.
+    pub fn pin(&self, manifest_cid: Cid) -> CoreResult<()> {
+        let mut idx = self
+            .seed_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        idx.pin(&manifest_cid.to_string());
+        seeding::save_seed_index(&self.blockstore, &idx)
+    }
+
+    /// Retire l'épinglage d'un manifeste (redevient évictable sous quota).
+    pub fn unpin(&self, manifest_cid: Cid) -> CoreResult<()> {
+        let mut idx = self
+            .seed_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        idx.unpin(&manifest_cid.to_string());
+        seeding::save_seed_index(&self.blockstore, &idx)
+    }
+
+    /// `(publications_seedées, publications_totales_du_feed_courant)` pour un
+    /// émetteur : mesure la couverture du seed proactif sur son feed courant
+    /// tel que connu du catalogue local (pas nécessairement souscrit).
+    pub fn seed_status(&self, issuer: PeerId) -> (u64, u64) {
+        let Some(entry) = self
+            .catalog_entries()
+            .into_iter()
+            .find(|e| e.issuer == issuer)
+        else {
+            return (0, 0);
+        };
+        let (seeded, total, _pinned) = self.seed_coverage(&entry.cids);
+        (seeded, total)
+    }
+
+    /// `(publications_seedées, publications_totales, pins)` pour une liste de
+    /// CIDs **déjà résolue** (ex. `entry.cids` d'une entrée de catalogue en
+    /// main) — un seul verrou `seed_index`, sans re-parcourir le catalogue.
+    /// `seed_status`/`pinned_manifests_of` s'appuient dessus pour un appel
+    /// isolé par PeerId ; la FFI (`catalog_entry_to_ffi`) l'appelle
+    /// directement par entrée pour rester O(N) sur tout le catalogue au lieu
+    /// de re-cloner le catalogue entier (verrou + reconstruction CRDT) par
+    /// entrée, ce qui serait O(N²) (retour de review, tâche c5).
+    pub fn seed_coverage(&self, cids: &[Cid]) -> (u64, u64, Vec<Cid>) {
+        let idx = self
+            .seed_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut seeded = 0u64;
+        let mut pinned = Vec::new();
+        for c in cids {
+            let s = c.to_string();
+            if idx.contains_manifest(&s) {
+                seeded += 1;
+            }
+            if idx.is_pinned(&s) {
+                pinned.push(*c);
+            }
+        }
+        (seeded, cids.len() as u64, pinned)
+    }
+
+    /// `(octets_utilisés, quota_octets)` — `used` vient du SeedIndex (source
+    /// de vérité pour la comptabilité de quota, cf. rapport tâche c4 §Minor),
+    /// pas d'un balayage concurrent du blockstore.
+    pub fn storage_stats(&self) -> (u64, u64) {
+        let used = self
+            .seed_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .total_bytes();
+        let quota = *self
+            .seed_quota
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (used, quota)
+    }
+
+    /// Définit le quota de seed : persiste puis réveille `seed_loop` (une
+    /// baisse de quota peut nécessiter une éviction immédiate, une hausse
+    /// peut permettre de reprendre des publications sautées faute de place).
+    pub fn set_seed_quota(&self, bytes: u64) -> CoreResult<()> {
+        {
+            let mut quota = self
+                .seed_quota
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *quota = bytes;
+        }
+        seeding::save_seed_quota(&self.blockstore, bytes)?;
+        let _ = self.seed_wake.send(());
+        Ok(())
+    }
+
+    /// CIDs de manifestes de `issuer` (tels que connus du catalogue local)
+    /// actuellement épinglés. Sert le contrat FFI v7 (`FfiCatalogEntry.pinned`)
+    /// pour un appel isolé par PeerId ; la FFI, elle, appelle `seed_coverage`
+    /// directement par entrée (voir sa doc) pour rester O(N) sur le catalogue.
+    pub fn pinned_manifests_of(&self, issuer: PeerId) -> Vec<Cid> {
+        let Some(entry) = self
+            .catalog_entries()
+            .into_iter()
+            .find(|e| e.issuer == issuer)
+        else {
+            return Vec::new();
+        };
+        let (_seeded, _total, pinned) = self.seed_coverage(&entry.cids);
+        pinned
     }
 
     /// Entrées du catalogue restreintes aux émetteurs souscrits.
@@ -852,174 +1154,67 @@ impl Node {
     /// s'annoncer fournisseur d'un contenu qu'on refuse de servir serait à la
     /// fois incohérent et un signal au réseau qu'on le détient.
     pub async fn provide(&self, cid: Cid) -> CoreResult<()> {
-        if self.is_blocked(&cid) {
-            return Ok(());
-        }
-        let (tx, rx) = oneshot::channel();
-        self.send(Command::Provide {
-            key: RecordKey::new(&cid.to_bytes()),
-            tx,
-        })
-        .await?;
-        rx.await.map_err(|_| CoreError::Shutdown)?
+        provide_inner(&self.cmd_tx, &self.moderation, cid).await
     }
 
     /// Recherche les fournisseurs d'un CID via la DHT.
     pub async fn get_providers(&self, cid: Cid) -> CoreResult<HashSet<PeerId>> {
-        let (tx, rx) = oneshot::channel();
-        self.send(Command::GetProviders {
-            key: RecordKey::new(&cid.to_bytes()),
-            tx,
-        })
-        .await?;
-        rx.await.map_err(|_| CoreError::Shutdown)
+        get_providers_inner(&self.cmd_tx, cid).await
     }
 
     /// Facteur de réplication **mesuré** d'un CID : nombre de fournisseurs
     /// annoncés dans la DHT (soi-même compris). Observabilité de la mitigation
-    /// du risque #1 (persistance) : seed-what-you-consume doit le faire croître.
+    /// du risque #1 (persistance) : un `get_with(Seed)` doit le faire croître,
+    /// un `get` (Stream) par défaut ne le doit plus.
     pub async fn replication_factor(&self, cid: Cid) -> CoreResult<usize> {
         Ok(self.get_providers(cid).await?.len())
     }
 
-    /// Réplication **opportuniste** (au-delà de seed-what-you-consume,
-    /// mitigation du risque #1 persistance) : parcourt les contenus connus du
-    /// catalogue, mesure leur facteur de réplication, et réplique ceux qui ont
-    /// moins de `target` fournisseurs — manifeste HLS **et** segments (tout
-    /// passe par `get`, donc le checkpoint modération #2 s'applique). Au plus
-    /// `max_items` contenus par passe (borne bande passante/disque). Renvoie le
-    /// nombre de contenus répliqués.
-    pub async fn replicate_under_provided(
-        &self,
-        target: usize,
-        max_items: usize,
-    ) -> CoreResult<usize> {
-        if target == 0 {
-            return Ok(0);
-        }
-        let mut replicated = 0;
-        for cid in self.catalog_cids() {
-            if replicated >= max_items {
-                break;
-            }
-            if self.blockstore.has(&cid) || self.is_blocked(&cid) {
-                continue;
-            }
-            if self.replication_factor(cid).await? >= target {
-                continue;
-            }
-            match self.replicate(cid).await {
-                Ok(()) => replicated += 1,
-                // Best-effort : un contenu irrécupérable (fournisseur parti,
-                // segment bloqué) ne doit pas stopper la passe.
-                Err(e) => tracing::debug!("réplication de {cid} échouée: {e}"),
-            }
-        }
-        Ok(replicated)
-    }
-
-    /// Réplique un contenu : récupère le bloc (mise en cache + réannonce via
-    /// `get`) et, si c'est un manifeste HLS, tous ses segments.
-    async fn replicate(&self, cid: Cid) -> CoreResult<()> {
-        let bytes = self.get(cid).await?;
-        if let Ok(manifest) = HlsManifest::from_json(&bytes) {
-            for seg in &manifest.segments {
-                let seg_cid: Cid = seg.cid.parse().map_err(CoreError::Cid)?;
-                self.get(seg_cid).await?;
-            }
-        }
-        Ok(())
+    /// Récupère un bloc SANS engager le nœud à le seeder : alias de
+    /// [`Node::get_with`] avec [`StorePolicy::Stream`]. C'est le nouveau
+    /// défaut depuis le retrait de seed-what-you-consume — un hit local est
+    /// toujours servi, mais une récupération réseau n'est ni mise en cache ni
+    /// annoncée. Pour l'ancien comportement (stocker + fournir), utiliser
+    /// `get_with(cid, StorePolicy::Seed)`.
+    pub async fn get(&self, cid: Cid) -> CoreResult<Vec<u8>> {
+        self.get_with(cid, StorePolicy::Stream).await
     }
 
     /// Récupère un bloc : cache local → sinon découverte DHT + transfert + vérif.
     /// Interroge **tous les fournisseurs en parallèle** et retient la première
-    /// réponse valide. Applique seed-what-you-consume : le bloc est mis en cache
-    /// **et réannoncé** (le consommateur devient fournisseur → réplication).
+    /// réponse valide. `policy` gouverne le sort d'un bloc nouvellement récupéré
+    /// depuis le réseau : `Seed` le met en cache et le réannonce (le nœud
+    /// devient fournisseur), `Stream` se contente de rendre les octets.
+    ///
+    /// Exception : si le bloc était présent localement mais **corrompu**, la
+    /// réparation stocke et réannonce toujours, indépendamment de `policy` — le
+    /// nœud le détenait déjà légitimement (par `add` ou un `get_with(Seed)`
+    /// antérieur), la réparation restaure cet état plutôt que d'en décider un
+    /// nouveau.
     ///
     /// CHECKPOINT MODÉRATION #2 (réception) : un contenu matché n'est ni récupéré,
-    /// ni mis en cache, ni reseedé — et le refus est **signalé** aux pairs
-    /// (rapport signé sur le topic des signalements, best-effort).
-    pub async fn get(&self, cid: Cid) -> CoreResult<Vec<u8>> {
-        if self.is_blocked(&cid) {
-            self.emit_report(&cid, "denylist").await;
-            return Err(CoreError::Moderated(cid.to_string()));
-        }
-        if self.blockstore.has(&cid) {
-            match self.blockstore.get(&cid) {
-                Ok(bytes) => return Ok(bytes),
-                // Cache local corrompu (ex. crash pendant l'écriture) : on
-                // retombe sur le réseau au lieu de rendre le CID irrécupérable ;
-                // le `put` en fin de fetch réparera le fichier.
-                Err(CoreError::IntegrityMismatch) => {
-                    tracing::warn!("bloc local corrompu, re-téléchargement: {cid}");
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        let providers = self.get_providers(cid).await?;
-        if providers.is_empty() {
-            return Err(CoreError::NoProviders(cid.to_string()));
-        }
-
-        // Requêtes concurrentes vers tous les fournisseurs ; première réponse
-        // valide (CID vérifié) gagne, les autres sont abandonnées. On s'exclut
-        // soi-même (on peut être fournisseur annoncé d'un bloc local corrompu).
-        let mut inflight: FuturesUnordered<_> = providers
-            .into_iter()
-            .filter(|peer| *peer != self.peer_id)
-            .map(|peer| self.request_block(peer, cid))
-            .collect();
-        // `request_block` a déjà vérifié le CID : la première réponse OK est bonne.
-        while let Some(result) = inflight.next().await {
-            match result {
-                Ok(bytes) => {
-                    self.blockstore.put(&bytes)?;
-                    // seed-what-you-consume : devient fournisseur (best-effort).
-                    let _ = self.provide(cid).await;
-                    return Ok(bytes);
-                }
-                Err(e) => tracing::debug!("fournisseur rejeté pour {cid}: {e}"),
-            }
-        }
-        Err(CoreError::BlockNotFound(cid.to_string()))
+    /// ni mis en cache, ni fourni — quelle que soit `policy` — et le refus est
+    /// **signalé** aux pairs (rapport signé sur le topic des signalements,
+    /// best-effort).
+    pub(crate) async fn get_with(&self, cid: Cid, policy: StorePolicy) -> CoreResult<Vec<u8>> {
+        get_with_inner(
+            &self.blockstore,
+            &self.moderation,
+            &self.cmd_tx,
+            self.peer_id,
+            &self.keypair,
+            &self.reports,
+            cid,
+            policy,
+        )
+        .await
     }
 
     /// Demande un bloc précis à un pair précis. Les octets reçus sont **vérifiés
     /// contre le CID** avant d'être renvoyés : un pair ne peut pas faire passer un
     /// contenu arbitraire (tout appelant, pas seulement `get`, est protégé).
     pub async fn request_block(&self, peer: PeerId, cid: Cid) -> CoreResult<Vec<u8>> {
-        let (tx, rx) = oneshot::channel();
-        self.send(Command::RequestBlock { peer, cid, tx }).await?;
-        let bytes = rx.await.map_err(|_| CoreError::Shutdown)??;
-        if !verify(&cid, &bytes) {
-            return Err(CoreError::IntegrityMismatch);
-        }
-        Ok(bytes)
-    }
-
-    /// Émet un rapport signé « CID refusé par ma modération » (best-effort :
-    /// un échec de diffusion ne doit jamais faire échouer le refus lui-même).
-    /// Le rapport compte aussi dans l'agrégat local (idempotent par rapporteur).
-    async fn emit_report(&self, cid: &Cid, reason: &str) {
-        let Ok(report) = Report::build_signed(&self.keypair, cid, reason) else {
-            return;
-        };
-        {
-            let mut book = self
-                .reports
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _ = book.apply(&report);
-        }
-        let Ok(json) = report.to_json() else { return };
-        let (tx, _rx) = oneshot::channel();
-        let _ = self
-            .cmd_tx
-            .send(Command::PublishReport {
-                data: json.into_bytes(),
-                tx,
-            })
-            .await;
+        request_block_inner(&self.cmd_tx, peer, cid).await
     }
 
     async fn send(&self, cmd: Command) -> CoreResult<()> {
@@ -1182,6 +1377,564 @@ async fn follow_loop(
             }
         }
         tokio::time::sleep(follow_interval).await;
+    }
+}
+
+// --- Primitives réseau « libres » (paramétrées sur des `Arc` isolés plutôt
+// que sur `self: &Node`) — permettent à `seed_loop` de récupérer des blocs
+// exactement comme `Node::get_with` sans détenir un `Node` fort (ce qui
+// empêcherait la boucle d'évènements de s'arrêter, cf. le commentaire sur
+// `alive`). `Node::get_with`/`get_providers`/`provide`/`request_block`
+// délèguent à ces mêmes fonctions : aucune logique réseau dupliquée.
+
+fn is_blocked_inner(moderation: &Arc<RwLock<Moderation>>, cid: &Cid) -> bool {
+    moderation
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_blocked(cid)
+}
+
+async fn get_providers_inner(
+    cmd_tx: &mpsc::Sender<Command>,
+    cid: Cid,
+) -> CoreResult<HashSet<PeerId>> {
+    let (tx, rx) = oneshot::channel();
+    cmd_tx
+        .send(Command::GetProviders {
+            key: RecordKey::new(&cid.to_bytes()),
+            tx,
+        })
+        .await
+        .map_err(|_| CoreError::Shutdown)?;
+    rx.await.map_err(|_| CoreError::Shutdown)
+}
+
+async fn provide_inner(
+    cmd_tx: &mpsc::Sender<Command>,
+    moderation: &Arc<RwLock<Moderation>>,
+    cid: Cid,
+) -> CoreResult<()> {
+    if is_blocked_inner(moderation, &cid) {
+        return Ok(());
+    }
+    let (tx, rx) = oneshot::channel();
+    cmd_tx
+        .send(Command::Provide {
+            key: RecordKey::new(&cid.to_bytes()),
+            tx,
+        })
+        .await
+        .map_err(|_| CoreError::Shutdown)?;
+    rx.await.map_err(|_| CoreError::Shutdown)?
+}
+
+async fn request_block_inner(
+    cmd_tx: &mpsc::Sender<Command>,
+    peer: PeerId,
+    cid: Cid,
+) -> CoreResult<Vec<u8>> {
+    let (tx, rx) = oneshot::channel();
+    cmd_tx
+        .send(Command::RequestBlock { peer, cid, tx })
+        .await
+        .map_err(|_| CoreError::Shutdown)?;
+    let bytes = rx.await.map_err(|_| CoreError::Shutdown)??;
+    if !verify(&cid, &bytes) {
+        return Err(CoreError::IntegrityMismatch);
+    }
+    Ok(bytes)
+}
+
+async fn emit_report_inner(
+    cmd_tx: &mpsc::Sender<Command>,
+    reports: &Arc<Mutex<ReportBook>>,
+    keypair: &Keypair,
+    cid: &Cid,
+    reason: &str,
+) {
+    let Ok(report) = Report::build_signed(keypair, cid, reason) else {
+        return;
+    };
+    {
+        let mut book = reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = book.apply(&report);
+    }
+    let Ok(json) = report.to_json() else { return };
+    let (tx, _rx) = oneshot::channel();
+    let _ = cmd_tx
+        .send(Command::PublishReport {
+            data: json.into_bytes(),
+            tx,
+        })
+        .await;
+}
+
+/// Cœur de `Node::get_with` (voir sa documentation) — factorisé pour être
+/// appelable depuis `seed_loop` sans détenir un `Node` entier.
+#[allow(clippy::too_many_arguments)]
+async fn get_with_inner(
+    blockstore: &Blockstore,
+    moderation: &Arc<RwLock<Moderation>>,
+    cmd_tx: &mpsc::Sender<Command>,
+    self_peer_id: PeerId,
+    keypair: &Keypair,
+    reports: &Arc<Mutex<ReportBook>>,
+    cid: Cid,
+    policy: StorePolicy,
+) -> CoreResult<Vec<u8>> {
+    if is_blocked_inner(moderation, &cid) {
+        emit_report_inner(cmd_tx, reports, keypair, &cid, "denylist").await;
+        return Err(CoreError::Moderated(cid.to_string()));
+    }
+    let mut repairing_corruption = false;
+    if blockstore.has(&cid) {
+        match blockstore.get(&cid) {
+            Ok(bytes) => return Ok(bytes),
+            Err(CoreError::IntegrityMismatch) => {
+                tracing::warn!("bloc local corrompu, re-téléchargement: {cid}");
+                repairing_corruption = true;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let providers = get_providers_inner(cmd_tx, cid).await?;
+    if providers.is_empty() {
+        return Err(CoreError::NoProviders(cid.to_string()));
+    }
+
+    let mut inflight: FuturesUnordered<_> = providers
+        .into_iter()
+        .filter(|peer| *peer != self_peer_id)
+        .map(|peer| request_block_inner(cmd_tx, peer, cid))
+        .collect();
+    while let Some(result) = inflight.next().await {
+        match result {
+            Ok(bytes) => {
+                if repairing_corruption || policy == StorePolicy::Seed {
+                    blockstore.put(&bytes)?;
+                    let _ = provide_inner(cmd_tx, moderation, cid).await;
+                }
+                return Ok(bytes);
+            }
+            Err(e) => tracing::debug!("fournisseur rejeté pour {cid}: {e}"),
+        }
+    }
+    Err(CoreError::BlockNotFound(cid.to_string()))
+}
+
+/// Supprime du magasin les blocs de `publications` qui ne sont référencés par
+/// AUCUNE publication encore retenue dans `seed_index` (vérifié via
+/// `all_cids` — un segment peut en théorie être partagé entre publications).
+/// Utilisé après une purge/éviction, jamais avant : `seed_index` doit déjà
+/// refléter l'état post-retrait au moment de l'appel.
+fn remove_unshared_blocks(
+    blockstore: &Blockstore,
+    seed_index: &Arc<Mutex<SeedIndex>>,
+    publications: &[SeededPublication],
+) {
+    let remaining: HashSet<String> = {
+        let idx = seed_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        idx.all_cids().into_iter().collect()
+    };
+    for publication in publications {
+        let mut cids = vec![publication.manifest_cid.clone()];
+        cids.extend(publication.segment_cids.iter().cloned());
+        for cid_str in cids {
+            if remaining.contains(&cid_str) {
+                continue;
+            }
+            if let Ok(cid) = cid_str.parse::<Cid>() {
+                let _ = blockstore.remove(&cid);
+            }
+        }
+    }
+}
+
+/// État partagé de la boucle de seed proactif (lot c) : des `Arc`/clones
+/// isolés, jamais un `Node` entier (voir le commentaire sur `alive` /
+/// `follow_loop` — un `Node` fort empêcherait la boucle d'évènements de
+/// jamais s'arrêter).
+struct SeedLoopState {
+    cmd_tx: mpsc::Sender<Command>,
+    blockstore: Blockstore,
+    moderation: Arc<RwLock<Moderation>>,
+    catalog: Arc<Mutex<Catalog>>,
+    subscriptions: Arc<Mutex<BTreeSet<PeerId>>>,
+    seed_index: Arc<Mutex<SeedIndex>>,
+    seed_quota: Arc<Mutex<u64>>,
+    seed_events: tokio::sync::broadcast::Sender<()>,
+    reports: Arc<Mutex<ReportBook>>,
+    keypair: Keypair,
+    peer_id: PeerId,
+    /// Manifestes déjà tentés et sautés faute de place sous le quota courant
+    /// (en mémoire seulement, jamais persisté). Évite de re-tenter — donc de
+    /// re-fetcher-puis-annuler — la même publication doomed à chaque tic :
+    /// gaspillage réseau, et source d'un flake observé en test (le rollback
+    /// laisse une fenêtre où le bloc réapparaît juste avant d'être retiré à
+    /// nouveau). Vidé par `seed_loop` chaque fois qu'un évènement (catalogue
+    /// ou quota) suggère que la situation a pu changer — pas sur un simple
+    /// tic d'intervalle, qui ne change rien à lui seul.
+    quota_blocked: Arc<Mutex<HashSet<String>>>,
+}
+
+/// Fait de la place pour `extra` octets supplémentaires sous le quota
+/// courant, au profit d'un candidat dont la réplication mesurée est
+/// `candidate_replication` : si `total_bytes() + extra` dépasse déjà le
+/// quota, évince (ordre [`eviction_order`], réplication mesurée en DHT pour
+/// chaque candidat évictable) jusqu'à rentrer dans le quota. Renvoie `false`
+/// si, même après avoir épuisé tous les candidats évictables (non épinglés),
+/// ça ne rentre toujours pas — la publication en cours doit alors être
+/// sautée.
+///
+/// **Dampening anti-oscillation** (retour de review) : une éviction n'a lieu
+/// que si la victime potentielle a une réplication STRICTEMENT supérieure à
+/// celle du candidat (`victime > candidat`, jamais `>=`). Sans ce garde-fou,
+/// deux publications à réplication ÉGALE et un quota qui n'en tient qu'une
+/// s'évincent mutuellement à chaque passe (P2 évince P1, la passe suivante
+/// visite les manifestes dans un ordre différent, P1 évince P2, etc. —
+/// re-téléchargement sans fin, `quota_blocked` ne s'engage jamais puisque
+/// chaque tentative individuelle "réussit" en évinçant l'autre). Avec le
+/// garde-fou : à réplication égale (ou si le candidat est LUI-MÊME mieux
+/// répliqué que la victime potentielle, donc moins légitime à la garder),
+/// aucune éviction n'a lieu — le candidat est sauté et mémorisé dans
+/// `quota_blocked` par l'appelant, ce qui fixe le résultat de la passe
+/// (premier arrivé, premier servi) jusqu'au prochain évènement catalogue/quota.
+async fn make_room_for(state: &SeedLoopState, extra: u64, candidate_replication: usize) -> bool {
+    let quota = *state
+        .seed_quota
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    loop {
+        let used = state
+            .seed_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .total_bytes();
+        // Strict : `extra` (déjà engagé par la publication en cours, pas
+        // encore indexé) doit laisser AU MOINS un peu de marge, faute de quoi
+        // le prochain bloc (de taille encore inconnue) ferait dépasser le
+        // quota à coup sûr. `<=` laisserait passer un quota tout juste
+        // consommé par ce qui est déjà en vol.
+        if used.saturating_add(extra) < quota {
+            return true;
+        }
+        let candidates: Vec<String> = {
+            let idx = state
+                .seed_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            eviction_order(&idx, &HashMap::new())
+                .into_iter()
+                .map(|p| p.manifest_cid.clone())
+                .collect()
+        };
+        if candidates.is_empty() {
+            return false;
+        }
+        // Réplication mesurée en DHT pour CHAQUE candidat évictable (spec :
+        // l'éviction préfère faire partir ce qui est déjà bien répliqué
+        // ailleurs) — recalculée à chaque tour puisque l'ensemble change.
+        let mut replication = HashMap::new();
+        for manifest_cid in &candidates {
+            if let Ok(cid) = manifest_cid.parse::<Cid>() {
+                let count = get_providers_inner(&state.cmd_tx, cid)
+                    .await
+                    .map(|peers| peers.len())
+                    .unwrap_or(0);
+                replication.insert(manifest_cid.clone(), count);
+            }
+        }
+        let victim = {
+            let idx = state
+                .seed_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            eviction_order(&idx, &replication)
+                .first()
+                .map(|p| p.manifest_cid.clone())
+        };
+        let Some(victim) = victim else {
+            return false;
+        };
+        let victim_replication = replication.get(&victim).copied().unwrap_or(0);
+        if victim_replication <= candidate_replication {
+            // La victime potentielle n'est pas MOINS légitime à rester
+            // seedée que le candidat (réplication égale ou même inférieure)
+            // — pas d'éviction. Voir le commentaire de dampening ci-dessus.
+            return false;
+        }
+        evict_publication(state, &victim);
+    }
+}
+
+/// Retire une publication du SeedIndex et ses blocs devenus orphelins.
+fn evict_publication(state: &SeedLoopState, manifest_cid: &str) {
+    let removed = {
+        let mut idx = state
+            .seed_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let removed = idx.remove_publication(manifest_cid);
+        if removed.is_some() {
+            if let Err(e) = seeding::save_seed_index(&state.blockstore, &idx) {
+                tracing::warn!("persistance de l'index de seed échouée: {e}");
+            }
+        }
+        removed
+    };
+    if let Some((_, publication)) = removed {
+        remove_unshared_blocks(&state.blockstore, &state.seed_index, &[publication]);
+    }
+}
+
+/// Récupère et retient (SeedIndex) une publication (manifeste + segments)
+/// sous quota : manifeste puis chaque segment manquant, chacun via
+/// `get_with_inner(Seed)` (mise en cache + annonce), en faisant de la place
+/// (`make_room_for`) avant chaque récupération qui ferait grossir le magasin.
+/// Si aucune éviction ne suffit à faire de la place, la publication est
+/// abandonnée : tout bloc déjà récupéré pour elle pendant cette tentative
+/// (jamais indexé, donc jamais compté dans `total_bytes`) est retiré du
+/// magasin — pas d'accumulation silencieuse hors comptabilité.
+async fn seed_publication(
+    state: &SeedLoopState,
+    issuer: PeerId,
+    manifest_cid: Cid,
+) -> CoreResult<()> {
+    // Réplication du candidat lui-même, mesurée UNE fois et réutilisée pour
+    // tout le reste de cette tentative (manifeste + chaque segment) — le
+    // dampening anti-oscillation de `make_room_for` compare la victime
+    // potentielle à CE candidat, pas à un segment particulier.
+    let candidate_replication = get_providers_inner(&state.cmd_tx, manifest_cid)
+        .await
+        .map(|peers| peers.len())
+        .unwrap_or(0);
+    if !make_room_for(state, 0, candidate_replication).await {
+        // Même le manifeste ne rentre pas et rien n'est évictable (ou rien
+        // d'assez répliqué pour justifier une éviction) : on ne tente même
+        // pas la récupération réseau.
+        mark_quota_blocked(state, manifest_cid);
+        return Ok(());
+    }
+    let manifest_bytes = get_with_inner(
+        &state.blockstore,
+        &state.moderation,
+        &state.cmd_tx,
+        state.peer_id,
+        &state.keypair,
+        &state.reports,
+        manifest_cid,
+        StorePolicy::Seed,
+    )
+    .await?;
+    let manifest = HlsManifest::from_json(&manifest_bytes)?;
+    let mut fetched_cids = vec![manifest_cid.to_string()];
+    // Octets déjà engagés par CETTE tentative, pas encore comptés dans
+    // `seed_index.total_bytes()` (l'insertion n'a lieu qu'en fin de fonction,
+    // une fois la publication complète) — passés en `extra` à `make_room_for`
+    // pour que le quota tienne compte de ce qui est déjà en train d'être
+    // récupéré, pas seulement de ce qui est déjà indexé.
+    let mut fetched_bytes = state.blockstore.size_of(&manifest_cid).unwrap_or(0);
+
+    for seg in &manifest.segments {
+        let cid: Cid = match seg.cid.parse() {
+            Ok(c) => c,
+            Err(e) => {
+                remove_unindexed_fetch(state, &fetched_cids);
+                return Err(CoreError::Cid(e));
+            }
+        };
+        if !state.blockstore.has(&cid)
+            && !make_room_for(state, fetched_bytes, candidate_replication).await
+        {
+            // Plus de place et rien à évincer : publication sautée, on
+            // nettoie ce qui a été récupéré pour elle jusqu'ici.
+            remove_unindexed_fetch(state, &fetched_cids);
+            mark_quota_blocked(state, manifest_cid);
+            return Ok(());
+        }
+        match get_with_inner(
+            &state.blockstore,
+            &state.moderation,
+            &state.cmd_tx,
+            state.peer_id,
+            &state.keypair,
+            &state.reports,
+            cid,
+            StorePolicy::Seed,
+        )
+        .await
+        {
+            Ok(_) => {
+                fetched_cids.push(cid.to_string());
+                fetched_bytes += state.blockstore.size_of(&cid).unwrap_or(0);
+            }
+            Err(e) => {
+                remove_unindexed_fetch(state, &fetched_cids);
+                return Err(e);
+            }
+        }
+    }
+
+    let total_bytes = fetched_bytes;
+    let segment_cids = manifest.segments.iter().map(|s| s.cid.clone()).collect();
+    {
+        let mut idx = state
+            .seed_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        idx.insert(
+            issuer.to_string(),
+            SeededPublication {
+                manifest_cid: manifest_cid.to_string(),
+                segment_cids,
+                total_bytes,
+                order: 0, // ignoré par `insert`, réassigné par l'index.
+            },
+        );
+        if let Err(e) = seeding::save_seed_index(&state.blockstore, &idx) {
+            tracing::warn!("persistance de l'index de seed échouée: {e}");
+        }
+    }
+    let _ = state.seed_events.send(());
+    Ok(())
+}
+
+/// Mémorise qu'une publication a été sautée faute de place évictable, pour
+/// éviter de la retenter à chaque tic tant que rien n'a changé (cf. le
+/// commentaire sur `SeedLoopState::quota_blocked`).
+fn mark_quota_blocked(state: &SeedLoopState, manifest_cid: Cid) {
+    state
+        .quota_blocked
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(manifest_cid.to_string());
+}
+
+/// Retire du magasin les blocs récupérés pour une tentative de publication
+/// abandonnée — ils ne sont jamais entrés dans `seed_index` (l'insertion n'a
+/// lieu qu'en fin de `seed_publication`), donc `remove_unshared_blocks`
+/// (qui vérifie contre `seed_index.all_cids()`) les retire tous, sauf ceux
+/// qu'une AUTRE publication déjà indexée référencerait par ailleurs.
+fn remove_unindexed_fetch(state: &SeedLoopState, fetched_cids: &[String]) {
+    let placeholder = SeededPublication {
+        manifest_cid: fetched_cids.first().cloned().unwrap_or_default(),
+        segment_cids: fetched_cids.iter().skip(1).cloned().collect(),
+        total_bytes: 0,
+        order: 0,
+    };
+    remove_unshared_blocks(&state.blockstore, &state.seed_index, &[placeholder]);
+}
+
+/// Seed (au sens `seed_publication`) les publications non encore retenues du
+/// feed courant d'un émetteur, en itérant `entry.cids` en ordre INVERSE.
+///
+/// **Pas de garantie temporelle** (correction post-review) : `entry.cids`
+/// vient de `feed.entries`, dans l'ordre où l'émetteur les a passées à
+/// `publish_feed`/`publish_feed_with` — rien dans `feed.rs`/`catalog.rs` ne
+/// contraint cet ordre à être chronologique. En pratique, le chemin
+/// « publier tout » de `champinium-cli` (`publish`/`republish`) construit ses
+/// CIDs depuis `Blockstore::list()`, qui énumère `std::fs::read_dir` SANS
+/// tri — un ordre de système de fichiers, sans rapport avec l'ordre
+/// d'ingestion. L'inversion ici est donc une heuristique (« si quelqu'un
+/// republie systématiquement en ajoutant en fin de liste, ça favorise le
+/// contenu récent ») et PAS une garantie « le plus récent d'abord ». Un vrai
+/// ordre de récence nécessiterait un horodatage porté par `FeedEntry` — hors
+/// périmètre de cette tâche, noté comme suite possible dans le rapport.
+async fn seed_channel(state: &SeedLoopState, issuer: PeerId) {
+    let entry = {
+        let cat = state
+            .catalog
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cat.entries().into_iter().find(|e| e.issuer == issuer)
+    };
+    let Some(entry) = entry else { return };
+    for manifest_cid in entry.cids.into_iter().rev() {
+        let manifest_cid_str = manifest_cid.to_string();
+        let already_seeded = state
+            .seed_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_manifest(&manifest_cid_str);
+        if already_seeded {
+            continue;
+        }
+        let known_blocked = state
+            .quota_blocked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&manifest_cid_str);
+        if known_blocked {
+            continue;
+        }
+        if let Err(e) = seed_publication(state, issuer, manifest_cid).await {
+            tracing::debug!("seed proactif: échec pour {manifest_cid} ({issuer}): {e}");
+        }
+    }
+}
+
+/// Une passe complète : round-robin sur les channels souscrits (démarre à un
+/// index différent à chaque appel — `round_robin`, renvoyé mis à jour — pour
+/// qu'un channel gourmand en publications manquantes ne prive pas
+/// systématiquement les autres d'un tour).
+async fn seed_pass(state: &SeedLoopState, round_robin: usize) -> usize {
+    let issuers: Vec<PeerId> = {
+        let subs = state
+            .subscriptions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        subs.iter().copied().collect()
+    };
+    if issuers.is_empty() {
+        return 0;
+    }
+    let start = round_robin % issuers.len();
+    for offset in 0..issuers.len() {
+        let issuer = issuers[(start + offset) % issuers.len()];
+        seed_channel(state, issuer).await;
+    }
+    round_robin.wrapping_add(1)
+}
+
+/// Boucle de seed proactif des channels souscrits (spec channels lot c) : une
+/// passe (`seed_pass`) à chaque itération, puis attend soit `seed_interval`,
+/// soit un évènement catalogue (nouvelle publication à seeder promptement),
+/// soit un réveil explicite (`seed_wake`, ex. changement de quota via
+/// `Node::set_seed_quota`). Comme `follow_loop` : la toute première passe a
+/// lieu AVANT toute attente (rattrapage au démarrage), et la boucle ne tient
+/// qu'un [`Weak`] marqueur de vivacité — jamais un `Node` fort.
+async fn seed_loop(
+    alive: Weak<()>,
+    state: SeedLoopState,
+    mut catalog_events: tokio::sync::broadcast::Receiver<()>,
+    mut seed_wake: tokio::sync::broadcast::Receiver<()>,
+    seed_interval: Duration,
+) {
+    let mut round_robin: usize = 0;
+    loop {
+        if alive.upgrade().is_none() {
+            return;
+        }
+        round_robin = seed_pass(&state, round_robin).await;
+        tokio::select! {
+            _ = tokio::time::sleep(seed_interval) => {}
+            // Catalogue ou quota ont pu changer ce qui tenait avant du quota
+            // dépassé (nouvelle éviction possible, quota relevé…) — un
+            // simple tic d'intervalle, lui, ne change rien à lui seul : on ne
+            // vide `quota_blocked` que sur ces deux branches, pas sur le
+            // sleep (évite de re-fetcher-puis-annuler la même publication
+            // doomed à chaque tic).
+            _ = catalog_events.recv() => {
+                state.quota_blocked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+            }
+            _ = seed_wake.recv() => {
+                state.quota_blocked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+            }
+        }
     }
 }
 
@@ -1863,5 +2616,162 @@ mod tests {
         .await
         .expect("le feed légitime doit survivre à la tentative d'écrasement");
         assert_eq!(feed.cids().unwrap(), published);
+    }
+
+    /// Nouveau contrat (retrait de seed-what-you-consume) : `get` par défaut
+    /// (`StorePolicy::Stream`) rend les octets mais n'engage plus le nœud à
+    /// seeder — ni cache local, ni provider record.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_default_does_not_store_or_provide() {
+        let dir = tempfile::tempdir().unwrap();
+        let node_a = spawn_node(dir.path(), "sa").await;
+        let node_b = spawn_node(dir.path(), "sb").await;
+
+        let addr_a = node_a
+            .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        node_b
+            .add_address(node_a.peer_id(), addr_a.clone())
+            .await
+            .unwrap();
+        node_b.dial(addr_a).await.unwrap();
+
+        let payload = b"contenu simplement streame".to_vec();
+        let cid = node_a.add(&payload).await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Ok(b) = node_b.get(cid).await {
+                    return b;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+        .await
+        .expect("le transfert doit aboutir");
+        assert_eq!(received, payload);
+
+        assert!(
+            !node_b.blockstore().has(&cid),
+            "Stream ne doit pas mettre le bloc en cache"
+        );
+        // Laisse le temps à une éventuelle (mauvaise) réannonce de se produire.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let providers = node_a.get_providers(cid).await.unwrap();
+        assert!(
+            !providers.contains(&node_b.peer_id()),
+            "Stream ne doit pas faire de B un fournisseur"
+        );
+    }
+
+    /// `get_with(Seed)` reproduit l'ancien comportement : cache local ET
+    /// annonce (le nœud devient fournisseur découvrable).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_with_seed_stores_and_provides() {
+        let dir = tempfile::tempdir().unwrap();
+        let node_a = spawn_node(dir.path(), "sda").await;
+        let node_b = spawn_node(dir.path(), "sdb").await;
+
+        let addr_a = node_a
+            .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        node_b
+            .add_address(node_a.peer_id(), addr_a.clone())
+            .await
+            .unwrap();
+        node_b.dial(addr_a).await.unwrap();
+
+        let payload = b"contenu explicitement seede".to_vec();
+        let cid = node_a.add(&payload).await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Ok(b) = node_b.get_with(cid, StorePolicy::Seed).await {
+                    return b;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+        .await
+        .expect("le transfert doit aboutir");
+        assert_eq!(received, payload);
+        assert!(
+            node_b.blockstore().has(&cid),
+            "Seed doit mettre le bloc en cache"
+        );
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let providers = node_a.get_providers(cid).await.unwrap();
+                if providers.contains(&node_b.peer_id()) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+        .await
+        .expect("Seed doit faire de B un fournisseur découvrable");
+    }
+
+    /// Le checkpoint modération #2 s'applique dans les deux politiques : un
+    /// CID matché est refusé sans jamais être stocké, que la politique
+    /// demandée soit `Stream` ou `Seed`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn moderation_checkpoint_applies_in_both_policies() {
+        let dir = tempfile::tempdir().unwrap();
+        let forbidden = b"contenu interdit, seed ou stream".to_vec();
+        let bad_cid = cid_for(&forbidden);
+
+        let kp_a = Keypair::generate_ed25519();
+        let bs_a = Blockstore::open(dir.path().join("ma")).unwrap();
+        let node_a = Node::new(kp_a, bs_a).await.unwrap();
+        let addr_a = node_a
+            .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        node_a.add(&forbidden).await.unwrap();
+
+        let issuer = identity::load_or_generate(dir.path().join("issuer.key")).unwrap();
+        let dl =
+            Denylist::build_signed("test", "2026-06-24T00:00:00Z", &issuer, &[bad_cid]).unwrap();
+        let mut moderation = Moderation::empty();
+        moderation.subscribe(&dl).unwrap();
+
+        for (name, policy) in [
+            ("mb-stream", StorePolicy::Stream),
+            ("mb-seed", StorePolicy::Seed),
+        ] {
+            let kp_b = Keypair::generate_ed25519();
+            let bs_b = Blockstore::open(dir.path().join(name)).unwrap();
+            let node_b = Node::with_moderation(kp_b, bs_b, moderation.clone())
+                .await
+                .unwrap();
+            node_b
+                .add_address(node_a.peer_id(), addr_a.clone())
+                .await
+                .unwrap();
+            node_b.dial(addr_a.clone()).await.unwrap();
+
+            let err = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match node_b.get_with(bad_cid, policy).await {
+                        Err(CoreError::Moderated(_)) => return true,
+                        Err(CoreError::NoProviders(_)) | Err(CoreError::BlockNotFound(_)) => {
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                        }
+                        other => panic!("résultat inattendu: {other:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("le refus doit survenir");
+            assert!(err, "le checkpoint #2 doit refuser {policy:?}");
+            assert!(
+                !node_b.blockstore().has(&bad_cid),
+                "aucun stockage sous {policy:?}"
+            );
+        }
     }
 }

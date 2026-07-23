@@ -38,6 +38,7 @@
         <Grid.Resources>
             <local:EmptyStringToVisibilityConverter x:Key="EmptyStringToVisibility" />
             <local:NonEmptyStringToVisibilityConverter x:Key="NonEmptyStringToVisibility" />
+            <local:BooleanToVisibilityConverter x:Key="BooleanToVisibility" />
 
             <!-- Gabarit partagé : un groupe (créateur/channel) = en-tête (nom, seq,
                  bouton abonnement) + ses contenus. Le bouton d'abonnement est au
@@ -63,9 +64,15 @@
                         <StackPanel Grid.Column="0" Spacing="0">
                             <TextBlock Text="{Binding DisplayName}"
                                        Style="{StaticResource BodyStrongTextBlockStyle}" />
-                            <TextBlock Text="{Binding SeqText}"
-                                       Style="{StaticResource CaptionTextBlockStyle}"
-                                       Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <TextBlock Text="{Binding SeqText}"
+                                           Style="{StaticResource CaptionTextBlockStyle}"
+                                           Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                                <!-- État du seed proactif (lot c) — vide pour un feed sans publication. -->
+                                <TextBlock Text="{Binding SeedStatusText}"
+                                           Style="{StaticResource CaptionTextBlockStyle}"
+                                           Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                            </StackPanel>
                         </StackPanel>
                         <Button Grid.Column="1" Content="{Binding SubscribeLabel}"
                                 Click="OnToggleSubscriptionClick" />
@@ -77,6 +84,7 @@
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="*" />
                                         <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
                                     </Grid.ColumnDefinitions>
                                     <StackPanel Grid.Column="0">
                                         <TextBlock Text="{Binding Display}"
@@ -87,7 +95,12 @@
                                                    Foreground="{ThemeResource TextFillColorTertiaryBrush}"
                                                    TextWrapping="NoWrap" />
                                     </StackPanel>
-                                    <Button Grid.Column="1" Content="Lire"
+                                    <!-- Pin par publication (lot c) — masqué côté Explorer,
+                                         voir CatalogCid.CanPin. -->
+                                    <Button Grid.Column="1" Content="{Binding PinLabel}"
+                                            Visibility="{Binding CanPin, Converter={StaticResource BooleanToVisibility}}"
+                                            Click="OnTogglePinClick" />
+                                    <Button Grid.Column="2" Content="Lire"
                                             Tag="{Binding Cid}" Click="OnPlayClick" />
                                 </Grid>
                             </DataTemplate>
@@ -106,18 +119,49 @@
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
-        <!-- En-tête : titre, statut, PeerId -->
-        <StackPanel Grid.Row="0" Spacing="2">
-            <TextBlock Text="Champinium" Style="{StaticResource TitleTextBlockStyle}" />
-            <TextBlock Text="{Binding Status, Mode=OneWay}"
-                       Style="{StaticResource CaptionTextBlockStyle}"
-                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-            <!-- PeerId du nœud (vide tant que le nœud n'est pas ouvert). -->
-            <TextBlock Text="{Binding PeerId, Mode=OneWay}"
-                       Style="{StaticResource CaptionTextBlockStyle}"
-                       Foreground="{ThemeResource TextFillColorTertiaryBrush}"
-                       TextWrapping="NoWrap" />
-        </StackPanel>
+        <!-- En-tête : titre, statut, PeerId, réglages de seed -->
+        <Grid Grid.Row="0" ColumnSpacing="8">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <StackPanel Grid.Column="0" Spacing="2">
+                <TextBlock Text="Champinium" Style="{StaticResource TitleTextBlockStyle}" />
+                <TextBlock Text="{Binding Status, Mode=OneWay}"
+                           Style="{StaticResource CaptionTextBlockStyle}"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                <!-- PeerId du nœud (vide tant que le nœud n'est pas ouvert). -->
+                <TextBlock Text="{Binding PeerId, Mode=OneWay}"
+                           Style="{StaticResource CaptionTextBlockStyle}"
+                           Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                           TextWrapping="NoWrap" />
+            </StackPanel>
+            <!-- Réglages de seed (lot c) : quota en Go + usage courant, en Flyout
+                 pour rester cohérent avec la vue unique existante (pas de fenêtre
+                 de réglages séparée). -->
+            <Button Grid.Column="1" VerticalAlignment="Top" Content="Réglages de seed">
+                <Button.Flyout>
+                    <Flyout>
+                        <StackPanel Spacing="10" Width="240">
+                            <TextBlock Text="Quota de seeding" Style="{StaticResource BaseTextBlockStyle}" />
+                            <Grid ColumnSpacing="8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBox Grid.Column="0"
+                                         PlaceholderText="Go"
+                                         Text="{Binding QuotaField, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                                <Button Grid.Column="1" Content="Enregistrer" Click="OnSaveSeedQuotaClick" />
+                            </Grid>
+                            <TextBlock Text="{Binding StorageStatsText, Mode=OneWay}"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        </StackPanel>
+                    </Flyout>
+                </Button.Flyout>
+            </Button>
+        </Grid>
 
         <!-- Barre de connexion : multiaddr du pair + Connecter / Rafraîchir -->
         <Grid Grid.Row="1" ColumnSpacing="8">

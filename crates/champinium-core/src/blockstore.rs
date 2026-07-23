@@ -91,6 +91,27 @@ impl Blockstore {
         }
         Ok(out)
     }
+
+    /// Taille en octets d'un bloc stocké (métadonnées fs, pas de lecture
+    /// complète). Utile au calcul de quota de seed sans charger les blocs.
+    pub fn size_of(&self, cid: &Cid) -> Result<u64> {
+        let path = self.path_for(cid);
+        let meta = std::fs::metadata(&path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => CoreError::BlockNotFound(cid.to_string()),
+            _ => CoreError::Io(e),
+        })?;
+        Ok(meta.len())
+    }
+
+    /// Somme des tailles de tous les blocs listés (taille totale occupée par
+    /// ce magasin, hors dotfiles d'état adjacents).
+    pub fn total_size(&self) -> Result<u64> {
+        let mut total = 0u64;
+        for cid in self.list()? {
+            total += self.size_of(&cid)?;
+        }
+        Ok(total)
+    }
 }
 
 #[cfg(test)]
@@ -167,5 +188,30 @@ mod tests {
         let mut want = vec![c1, c2];
         want.sort();
         assert_eq!(listed, want);
+    }
+
+    #[test]
+    fn size_of_matches_stored_bytes() {
+        let (bs, _d) = store();
+        let cid = bs.put(b"hello champinium").unwrap();
+        assert_eq!(bs.size_of(&cid).unwrap(), b"hello champinium".len() as u64);
+    }
+
+    #[test]
+    fn size_of_missing_errors() {
+        let (bs, _d) = store();
+        let cid = crate::content::cid_for(b"absent");
+        assert!(matches!(bs.size_of(&cid), Err(CoreError::BlockNotFound(_))));
+    }
+
+    #[test]
+    fn total_size_sums_and_shrinks_on_remove() {
+        let (bs, _d) = store();
+        let c1 = bs.put(b"one").unwrap();
+        let c2 = bs.put(b"twotwo").unwrap();
+        assert_eq!(bs.total_size().unwrap(), 3 + 6);
+        bs.remove(&c1).unwrap();
+        assert_eq!(bs.total_size().unwrap(), 6);
+        let _ = c2;
     }
 }

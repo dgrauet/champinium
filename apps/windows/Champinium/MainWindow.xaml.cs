@@ -120,6 +120,24 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private async void OnSaveSeedQuotaClick(object sender, RoutedEventArgs e)
+    {
+        await Model.SetSeedQuotaAsync();
+    }
+
+    /// <summary>
+    /// Bascule l'épinglage d'une publication. Même patron que
+    /// <see cref="OnToggleSubscriptionClick"/> : le conteneur d'item du gabarit
+    /// partagé pose le <see cref="CatalogCid"/> comme DataContext.
+    /// </summary>
+    private async void OnTogglePinClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement { DataContext: CatalogCid cid })
+        {
+            await Model.TogglePinAsync(cid.Cid, cid.IsPinned);
+        }
+    }
+
     private void OnCopyMyLinkClick(object sender, RoutedEventArgs e)
     {
         var link = Model.MyChannelLink();

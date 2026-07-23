@@ -144,6 +144,22 @@ enum Cmd {
     },
     /// Liste les créateurs souscrits avec leurs liens.
     Subscriptions,
+    /// Affiche (et éventuellement définit) le quota de seed proactif.
+    Quota {
+        /// Nouveau quota en octets (sinon: affiche seulement l'état courant).
+        #[arg(long)]
+        set: Option<u64>,
+    },
+    /// Épingle un manifeste (exempté d'éviction par le seed proactif).
+    Pin {
+        /// CID du manifeste.
+        manifest_cid: String,
+    },
+    /// Retire l'épinglage d'un manifeste (redevient évictable sous quota).
+    Unpin {
+        /// CID du manifeste.
+        manifest_cid: String,
+    },
 }
 
 #[tokio::main]
@@ -359,6 +375,26 @@ async fn main() -> Result<()> {
                     println!("{}", channel_link::format(&issuer));
                 }
             }
+        }
+        Cmd::Quota { set } => {
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            if let Some(bytes) = set {
+                node.set_seed_quota(bytes)?;
+            }
+            let (used, quota) = node.storage_stats();
+            println!("utilisé: {used} octet(s) / quota: {quota} octet(s)");
+        }
+        Cmd::Pin { manifest_cid } => {
+            let manifest_cid: Cid = manifest_cid.parse().context("CID de manifeste invalide")?;
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            node.pin(manifest_cid)?;
+            println!("épinglé: {manifest_cid}");
+        }
+        Cmd::Unpin { manifest_cid } => {
+            let manifest_cid: Cid = manifest_cid.parse().context("CID de manifeste invalide")?;
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            node.unpin(manifest_cid)?;
+            println!("épinglage retiré: {manifest_cid}");
         }
     }
     Ok(())

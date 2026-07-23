@@ -68,6 +68,15 @@ fn build_ui(app: &Application) {
 
     let status = Label::new(Some("démarrage…"));
     status.set_xalign(0.0);
+    status.set_hexpand(true);
+    // Réglages de seed (lot c) : quota (Go) + usage courant — popup dédiée
+    // pour rester cohérente avec la vue unique existante (pas de fenêtre de
+    // préférences séparée).
+    let seed_settings_btn = Button::with_label("Réglages de seed");
+    let header_bar = GtkBox::new(Orientation::Horizontal, 8);
+    header_bar.append(&status);
+    header_bar.append(&seed_settings_btn);
+
     let peer_entry = Entry::builder()
         .placeholder_text("/ip4/…/tcp/…/p2p/<peerid>")
         .hexpand(true)
@@ -132,7 +141,7 @@ fn build_ui(app: &Application) {
     root.set_margin_bottom(12);
     root.set_margin_start(12);
     root.set_margin_end(12);
-    root.append(&status);
+    root.append(&header_bar);
     root.append(&bar);
     root.append(&search_entry);
     root.append(&switcher);
@@ -179,18 +188,53 @@ fn build_ui(app: &Application) {
                 Ok(node) => {
                     status.set_text(&format!("nœud en ligne — {}", node.peer_id()));
                     let mut events = node.subscribe_catalog();
+                    let mut seed_events = node.subscribe_seed();
                     *ui.node.borrow_mut() = Some(node);
                     // Les primitives tokio::sync fonctionnent sur l'exécuteur
                     // glib : la boucle vit sur le thread GTK et peut toucher
                     // les widgets directement. Un abonné en retard (Lagged) a
                     // seulement raté des tics : on rafraîchit quand même.
                     use tokio::sync::broadcast::error::RecvError;
+
+                    // Boucle de seed proactif (lot c) : même patron que la
+                    // boucle catalogue ci-dessous, sur un canal séparé (une
+                    // publication seedée/purgée n'implique pas un changement
+                    // de catalogue, et réciproquement).
+                    {
+                        let ui = ui.clone();
+                        let status = status.clone();
+                        let subs_list = subs_list.clone();
+                        let explorer_list = explorer_list.clone();
+                        let search_entry = search_entry.clone();
+                        glib::spawn_future_local(async move {
+                            while let Ok(()) | Err(RecvError::Lagged(_)) = seed_events.recv().await
+                            {
+                                refresh_lists(
+                                    &ui,
+                                    &status,
+                                    &subs_list,
+                                    &explorer_list,
+                                    &search_entry,
+                                );
+                            }
+                        });
+                    }
+
                     while let Ok(()) | Err(RecvError::Lagged(_)) = events.recv().await {
                         refresh_lists(&ui, &status, &subs_list, &explorer_list, &search_entry);
                     }
                 }
                 Err(e) => status.set_text(&format!("erreur d'ouverture : {e}")),
             }
+        });
+    }
+
+    // Réglages de seed : ouvre une popup dédiée (quota + usage courant).
+    {
+        let ui = ui.clone();
+        let window = window.clone();
+        seed_settings_btn.connect_clicked(move |_| {
+            open_seed_settings(&ui, &window);
         });
     }
 
@@ -350,20 +394,30 @@ fn refresh_lists(
         let hits = node.search(query);
         status.set_text(&format!("recherche : {} résultat(s)", hits.len()));
         for hit in &hits {
+            // Pas de pin dans les résultats de recherche (même choix que le
+            // catalogue Explorer) : pas de contexte d'abonnement fiable ici.
             explorer_list.append(&content_row(
                 ui,
                 status,
+                subs_list,
+                explorer_list,
+                search_entry,
                 &hit.title,
                 &hit.tags,
                 &hit.cid.to_string(),
+                None,
             ));
             if subs.contains(&hit.issuer) {
                 subs_list.append(&content_row(
                     ui,
                     status,
+                    subs_list,
+                    explorer_list,
+                    search_entry,
                     &hit.title,
                     &hit.tags,
                     &hit.cid.to_string(),
+                    None,
                 ));
             }
         }
@@ -372,6 +426,7 @@ fn refresh_lists(
     let entries = node.catalog_entries();
     status.set_text(&format!("catalogue : {} créateur(s)", entries.len()));
     for entry in &entries {
+        let (seeded, total, _pinned) = node.seed_coverage(&entry.cids);
         explorer_list.append(&channel_header_row(
             ui,
             status,
@@ -380,19 +435,29 @@ fn refresh_lists(
             search_entry,
             entry,
             subs.contains(&entry.issuer),
+            seeded,
+            total,
         ));
         for item in &entry.items {
+            // Pas de bouton de pin côté Explorer — épingler un contenu hors
+            // abonnement n'a pas de sens dans cette UI (même décision que les
+            // jumeaux macOS/Windows).
             explorer_list.append(&content_row(
                 ui,
                 status,
+                subs_list,
+                explorer_list,
+                search_entry,
                 &item.title,
                 &item.tags,
                 &item.cid.to_string(),
+                None,
             ));
         }
     }
     let subscribed_entries = node.catalog_subscribed();
     for entry in &subscribed_entries {
+        let (seeded, total, pinned) = node.seed_coverage(&entry.cids);
         subs_list.append(&channel_header_row(
             ui,
             status,
@@ -401,14 +466,20 @@ fn refresh_lists(
             search_entry,
             entry,
             true,
+            seeded,
+            total,
         ));
         for item in &entry.items {
             subs_list.append(&content_row(
                 ui,
                 status,
+                subs_list,
+                explorer_list,
+                search_entry,
                 &item.title,
                 &item.tags,
                 &item.cid.to_string(),
+                Some(pinned.contains(&item.cid)),
             ));
         }
     }
@@ -417,6 +488,7 @@ fn refresh_lists(
 /// En-tête d'un émetteur : nom du channel (ou PeerId tronqué) + seq + bouton
 /// s'abonner/se désabonner (disponible dans les deux vues, au niveau
 /// en-tête — pas par ligne de contenu).
+#[allow(clippy::too_many_arguments)]
 fn channel_header_row(
     ui: &Rc<Ui>,
     status: &Label,
@@ -425,6 +497,8 @@ fn channel_header_row(
     search_entry: &Entry,
     entry: &CatalogEntry,
     subscribed: bool,
+    seeded: u64,
+    total: u64,
 ) -> GtkBox {
     let row = GtkBox::new(Orientation::Horizontal, 8);
     let text = GtkBox::new(Orientation::Vertical, 2);
@@ -433,7 +507,16 @@ fn channel_header_row(
     } else {
         entry.channel.name.clone()
     };
-    let header = Label::new(Some(&format!("{name} — seq {}", entry.seq)));
+    let mut header_text = format!("{name} — seq {}", entry.seq);
+    // État du seed proactif (lot c) — rien à afficher pour un feed vide.
+    if total > 0 {
+        if seeded == total {
+            header_text.push_str(" · à jour");
+        } else {
+            header_text.push_str(&format!(" · seed en cours ({seeded}/{total})"));
+        }
+    }
+    let header = Label::new(Some(&header_text));
     header.set_xalign(0.0);
     header.add_css_class("heading");
     text.append(&header);
@@ -504,8 +587,20 @@ fn describe_core_error(e: &CoreError, context: &str) -> String {
     }
 }
 
-/// Une ligne de contenu : titre (ou CID si sans titre) + tags + bouton « Lire ».
-fn content_row(ui: &Rc<Ui>, status: &Label, title: &str, tags: &[String], cid: &str) -> GtkBox {
+/// Une ligne de contenu : titre (ou CID si sans titre) + tags + bouton de pin
+/// (Abonnements uniquement, quand `pinned` est fourni) + bouton « Lire ».
+#[allow(clippy::too_many_arguments)]
+fn content_row(
+    ui: &Rc<Ui>,
+    status: &Label,
+    subs_list: &ListBox,
+    explorer_list: &ListBox,
+    search_entry: &Entry,
+    title: &str,
+    tags: &[String],
+    cid: &str,
+    pinned: Option<bool>,
+) -> GtkBox {
     let row = GtkBox::new(Orientation::Horizontal, 8);
     let text = GtkBox::new(Orientation::Vertical, 2);
     let label = Label::new(Some(if title.is_empty() { cid } else { title }));
@@ -518,8 +613,54 @@ fn content_row(ui: &Rc<Ui>, status: &Label, title: &str, tags: &[String], cid: &
         text.append(&tags_label);
     }
     text.set_hexpand(true);
-    let play = Button::with_label("Lire");
     row.append(&text);
+
+    if let Some(is_pinned) = pinned {
+        let pin_btn = Button::with_label(if is_pinned { "Oublier" } else { "Garder" });
+        let ui = ui.clone();
+        let status = status.clone();
+        let subs_list = subs_list.clone();
+        let explorer_list = explorer_list.clone();
+        let search_entry = search_entry.clone();
+        let cid_text = cid.to_string();
+        pin_btn.connect_clicked(move |_| {
+            let Some(node) = ui.node.borrow().clone() else {
+                status.set_text("nœud pas encore prêt");
+                return;
+            };
+            let Ok(manifest) = cid_text.parse::<Cid>() else {
+                status.set_text("CID invalide");
+                return;
+            };
+            let rt = ui.rt.clone();
+            let ui = ui.clone();
+            let status = status.clone();
+            let subs_list = subs_list.clone();
+            let explorer_list = explorer_list.clone();
+            let search_entry = search_entry.clone();
+            glib::spawn_future_local(async move {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                rt.spawn(async move {
+                    let res = if is_pinned {
+                        unpin_inner(&node, manifest).await
+                    } else {
+                        pin_inner(&node, manifest).await
+                    };
+                    let _ = tx.send(res);
+                });
+                match rx.await {
+                    Ok(Ok(())) => {
+                        refresh_lists(&ui, &status, &subs_list, &explorer_list, &search_entry);
+                    }
+                    Ok(Err(e)) => status.set_text(&describe_core_error(&e, "épinglage")),
+                    Err(_) => status.set_text("tâche annulée"),
+                }
+            });
+        });
+        row.append(&pin_btn);
+    }
+
+    let play = Button::with_label("Lire");
     row.append(&play);
 
     let ui = ui.clone();
@@ -568,6 +709,99 @@ fn content_row(ui: &Rc<Ui>, status: &Label, title: &str, tags: &[String], cid: &
         });
     });
     row
+}
+
+/// Popup de réglages de seed (lot c) : quota (Go) + usage courant. Fenêtre
+/// dédiée plutôt qu'un dialogue de la fenêtre principale — reste cohérente
+/// avec la vue unique existante sans y ajouter de complexité permanente.
+fn open_seed_settings(ui: &Rc<Ui>, parent: &ApplicationWindow) {
+    let Some(node) = ui.node.borrow().clone() else {
+        return;
+    };
+    let (used, quota) = node.storage_stats();
+
+    let win = gtk::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .title("Réglages de seed")
+        .default_width(320)
+        .build();
+
+    let content = GtkBox::new(Orientation::Vertical, 8);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+
+    let title = Label::new(Some("Quota de seeding"));
+    title.set_xalign(0.0);
+    title.add_css_class("heading");
+
+    let quota_row = GtkBox::new(Orientation::Horizontal, 8);
+    let quota_entry = Entry::builder()
+        .placeholder_text("Go")
+        .text(format!("{:.1}", quota as f64 / 1_000_000_000.0))
+        .build();
+    let save_btn = Button::with_label("Enregistrer");
+    quota_row.append(&quota_entry);
+    quota_row.append(&save_btn);
+
+    let stats_label = Label::new(Some(&storage_stats_text(used, quota)));
+    stats_label.set_xalign(0.0);
+    stats_label.add_css_class("dim-label");
+
+    let msg_label = Label::new(None);
+    msg_label.set_xalign(0.0);
+
+    content.append(&title);
+    content.append(&quota_row);
+    content.append(&stats_label);
+    content.append(&msg_label);
+    win.set_child(Some(&content));
+
+    let ui = ui.clone();
+    save_btn.connect_clicked(move |_| {
+        let Ok(gb) = quota_entry.text().replace(',', ".").parse::<f64>() else {
+            msg_label.set_text("valeur invalide");
+            return;
+        };
+        let bytes = (gb.max(0.0) * 1_000_000_000.0) as u64;
+        let Some(node) = ui.node.borrow().clone() else {
+            return;
+        };
+        let rt = ui.rt.clone();
+        let ui = ui.clone();
+        let stats_label = stats_label.clone();
+        let msg_label = msg_label.clone();
+        glib::spawn_future_local(async move {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            rt.spawn(async move {
+                let _ = tx.send(set_seed_quota_inner(&node, bytes).await);
+            });
+            match rx.await {
+                Ok(Ok(())) => {
+                    msg_label.set_text("quota mis à jour");
+                    if let Some(node) = ui.node.borrow().clone() {
+                        let (used, quota) = node.storage_stats();
+                        stats_label.set_text(&storage_stats_text(used, quota));
+                    }
+                }
+                Ok(Err(e)) => msg_label.set_text(&format!("quota : {e}")),
+                Err(_) => msg_label.set_text("tâche annulée"),
+            }
+        });
+    });
+
+    win.present();
+}
+
+/// Affichage humain de `(octets_utilisés, quota_octets)`.
+fn storage_stats_text(used: u64, quota: u64) -> String {
+    format!(
+        "Utilisé : {:.1} Go / {:.1} Go",
+        used as f64 / 1_000_000_000.0,
+        quota as f64 / 1_000_000_000.0
+    )
 }
 
 /// Démarre une lecture GStreamer (playbin + fenêtre vidéo par défaut).
@@ -630,4 +864,21 @@ async fn subscribe_inner(node: &Node, issuer: PeerId) -> Result<(), CoreError> {
 /// Se désabonne d'un émetteur — même contrainte que `subscribe_inner`.
 async fn unsubscribe_inner(node: &Node, issuer: PeerId) -> Result<(), CoreError> {
     node.unsubscribe(issuer)
+}
+
+/// Épingle un manifeste (écriture disque du `SeedIndex`) — même contrainte
+/// que `subscribe_inner` : jamais sur le thread principal GTK.
+async fn pin_inner(node: &Node, manifest_cid: Cid) -> Result<(), CoreError> {
+    node.pin(manifest_cid)
+}
+
+/// Retire l'épinglage d'un manifeste — même contrainte que `pin_inner`.
+async fn unpin_inner(node: &Node, manifest_cid: Cid) -> Result<(), CoreError> {
+    node.unpin(manifest_cid)
+}
+
+/// Définit le quota de seed (persiste sur disque) — même contrainte que
+/// `subscribe_inner`.
+async fn set_seed_quota_inner(node: &Node, bytes: u64) -> Result<(), CoreError> {
+    node.set_seed_quota(bytes)
 }

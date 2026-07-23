@@ -26,3 +26,14 @@ public sealed class NonEmptyStringToVisibilityConverter : IValueConverter
     public object ConvertBack(object value, Type targetType, object parameter, string language) =>
         throw new NotImplementedException();
 }
+
+/// <summary>Booléen → Visibility (utilisé pour masquer le bouton de pin sur les
+/// lignes d'Explorer — le gabarit d'item est partagé avec Abonnements).</summary>
+public sealed class BooleanToVisibilityConverter : IValueConverter
+{
+    public object Convert(object value, Type targetType, object parameter, string language) =>
+        value is true ? Visibility.Visible : Visibility.Collapsed;
+
+    public object ConvertBack(object value, Type targetType, object parameter, string language) =>
+        throw new NotImplementedException();
+}

@@ -2,7 +2,9 @@
 //!
 //! Preuve attendue : le nœud A publie un bloc (CID + provider record), le nœud B
 //! le **découvre via la DHT** puis le **télécharge** et vérifie son intégrité —
-//! transfert P2P brut de bout en bout entre deux nœuds.
+//! transfert P2P brut de bout en bout entre deux nœuds. `get` (politique par
+//! défaut `Stream`, depuis le retrait de seed-what-you-consume) ne met PAS le
+//! bloc en cache chez B.
 
 use champinium_core::identity::load_or_generate;
 use champinium_core::{Blockstore, Node};
@@ -51,7 +53,7 @@ async fn two_nodes_provide_discover_and_transfer() {
 
     assert_eq!(received, payload, "le bloc reçu doit être identique");
     assert!(
-        node_b.blockstore().has(&cid),
-        "B doit avoir mis en cache le bloc (seed-what-you-consume)"
+        !node_b.blockstore().has(&cid),
+        "retrait de seed-what-you-consume : `get` (Stream) ne met plus le bloc en cache"
     );
 }
