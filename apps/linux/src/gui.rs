@@ -353,9 +353,14 @@ fn build_ui(app: &Application) {
                 rt.spawn(async move {
                     let _ = tx.send(resolve_channel_inner(&node, peer).await);
                 });
+                // `rt.spawn` ne fait que PLANIFIER la tâche — le bouton doit
+                // rester désactivé et le spinner tourner jusqu'à ce que
+                // `rx.await` résolve réellement la réponse réseau, pas juste
+                // après l'avoir programmée.
+                let result = rx.await;
                 preview_link_btn.set_sensitive(true);
                 preview_spinner.set_spinning(false);
-                match rx.await {
+                match result {
                     Ok(Ok(preview)) => {
                         channel_entry.set_text("");
                         open_channel_preview(

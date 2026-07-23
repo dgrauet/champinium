@@ -130,11 +130,6 @@ public sealed partial class MainWindow : Window
     {
         var content = new StackPanel { Spacing = 8, Width = 320 };
 
-        if (preview.Blocked)
-        {
-            content.Children.Add(new TextBlock { Text = "Channel bloqué", FontWeight = FontWeights.SemiBold });
-        }
-
         content.Children.Add(new TextBlock { Text = preview.DisplayName, FontWeight = FontWeights.Bold, FontSize = 18 });
 
         if (preview.Description.Length > 0)
@@ -170,6 +165,19 @@ public sealed partial class MainWindow : Window
                 }
             }
             content.Children.Add(new ScrollViewer { Content = list, MaxHeight = 220 });
+        }
+
+        // Pied de la feuille : libellé "Channel bloqué" (aucun bouton) ou
+        // bouton principal S'abonner/Se désabonner — même position que les
+        // jumeaux macOS/GTK (après la liste des publications, pas avant le nom).
+        if (preview.Blocked)
+        {
+            content.Children.Add(new TextBlock
+            {
+                Text = "Channel bloqué",
+                FontWeight = FontWeights.SemiBold,
+                Margin = new Thickness(0, 8, 0, 0),
+            });
         }
 
         var dialog = new ContentDialog
