@@ -2183,6 +2183,17 @@ fn evict_publication(state: &SeedLoopState, manifest_cid: &str) {
 /// abandonnée : tout bloc déjà récupéré pour elle pendant cette tentative
 /// (jamais indexé, donc jamais compté dans `total_bytes`) est retiré du
 /// magasin — pas d'accumulation silencieuse hors comptabilité.
+/// Décision du point de commit du seed proactif, isolée en fonction PURE pour
+/// être testable sans simuler la course TOCTOU (finding revue finale lot d) :
+/// une publication fraîchement seedée n'est committée à l'index QUE si son
+/// émetteur est toujours abonné ET n'est pas banni par denylist. Le ban prime
+/// sur l'abonnement (`subscribe_denylist` ne désabonne pas — sans ce «&& !banni»
+/// une publication d'une clé bannie en cours de seed survivrait à la purge) ;
+/// le blocage local est déjà couvert par l'abonnement (`block_channel` désabonne).
+fn seed_still_wanted(subscribed: bool, key_banned: bool) -> bool {
+    subscribed && !key_banned
+}
+
 async fn seed_publication(
     state: &SeedLoopState,
     issuer: PeerId,
@@ -2287,7 +2298,7 @@ async fn seed_publication(
             .subscriptions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if key_banned || !subs.contains(&issuer) {
+        if !seed_still_wanted(subs.contains(&issuer), key_banned) {
             false
         } else {
             let mut idx = state
@@ -3028,6 +3039,26 @@ mod tests {
     use super::*;
     use crate::blockstore::Blockstore;
     use crate::content::cid_for;
+
+    /// Le point de commit du seed ne retient une publication que si l'émetteur
+    /// est toujours abonné ET non banni ; le ban prime sur l'abonnement (garde
+    /// déterministe du TOCTOU purge/seed, non forçable en test d'intégration).
+    #[test]
+    fn seed_commit_requires_subscribed_and_not_banned() {
+        assert!(seed_still_wanted(true, false), "abonné, non banni → commit");
+        assert!(
+            !seed_still_wanted(true, true),
+            "abonné MAIS banni par denylist → jamais committé (le ban prime)"
+        );
+        assert!(
+            !seed_still_wanted(false, false),
+            "plus abonné (désabonnement / blocage local) → abandon"
+        );
+        assert!(
+            !seed_still_wanted(false, true),
+            "ni abonné ni autorisé → abandon"
+        );
+    }
 
     async fn spawn_node(dir: &Path, name: &str) -> Node {
         let bs = Blockstore::open(dir.join(name)).unwrap();
