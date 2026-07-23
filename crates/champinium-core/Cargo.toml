@@ -19,6 +19,13 @@ name = "champinium_core"
 name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
 
+[features]
+# Stockage froid optionnel (Arweave, ADR 0008) — aucune dep supplémentaire
+# tirée par défaut. Décision supply-chain : voir
+# .superpowers/sdd/coldstore-decision.md (hand-roll de la signature Arweave,
+# reqwest = seul ajout, pour l'upload/GraphQL de découverte).
+cold-storage = ["dep:reqwest"]
+
 [dependencies]
 uniffi = { workspace = true, features = ["cli", "tokio"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "macros", "fs", "io-util", "process"] }
@@ -33,6 +40,7 @@ serde_json = "1"
 base64 = "0.22"
 thiserror = "2"
 tracing = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
