@@ -149,6 +149,13 @@ final class NodeModel: ObservableObject {
         refreshCatalog()
     }
 
+    /// Résout un aperçu de channel par lien ou PeerId nu, sans s'abonner —
+    /// alimente la feuille d'aperçu (voir `ContentView`).
+    func resolveChannel(_ linkOrPeerId: String) async throws -> FfiChannelPreview {
+        guard let node else { throw FfiError.Internal(msg: "nœud non initialisé") }
+        return try await node.resolveChannel(linkOrPeerId: linkOrPeerId)
+    }
+
     /// Se désabonne d'un émetteur. Rafraîchit le catalogue en cas de succès.
     func unsubscribeChannel(_ peerId: String) async throws {
         guard let node else { return }

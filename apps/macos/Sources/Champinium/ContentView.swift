@@ -26,6 +26,9 @@ struct ContentView: View {
     @State private var showBlockedChannels = false
     @State private var blockTarget: FfiCatalogEntry?
     @State private var showBlockConfirm = false
+    @State private var channelPreview: FfiChannelPreview?
+    @State private var showChannelPreview = false
+    @State private var previewLoading = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -70,6 +73,96 @@ struct ContentView: View {
             Text(
                 "« \(displayName(for: entry)) » disparaîtra du catalogue. Réversible depuis les réglages."
             )
+        }
+        .sheet(isPresented: $showChannelPreview) {
+            if let channelPreview {
+                channelPreviewSheet(channelPreview)
+            }
+        }
+    }
+
+    /// Feuille d'aperçu d'un channel résolu par lien/PeerId (pas encore
+    /// abonné le cas échéant) — en-tête, publications, action selon
+    /// abonnement/blocage. Ferme la feuille après une action réussie ; le
+    /// `CatalogListener` existant rafraîchit les vues.
+    private func channelPreviewSheet(_ preview: FfiChannelPreview) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(preview.name.isEmpty ? truncated(preview.peerId) : preview.name)
+                    .font(.title3).bold()
+                if !preview.description.isEmpty {
+                    Text(preview.description).font(.body).foregroundStyle(.secondary)
+                }
+                if let avatarCid = preview.avatarCid, !avatarCid.isEmpty {
+                    Text("avatar : \(avatarCid)")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                }
+            }
+            Divider()
+            Text("Publications").font(.headline)
+            if preview.items.isEmpty {
+                Text("aucune publication").font(.caption).foregroundStyle(.secondary)
+            } else {
+                List(preview.items, id: \.cid) { item in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(item.title.isEmpty ? item.cid : item.title)
+                            .font(item.title
+                                .isEmpty ? .system(.caption, design: .monospaced) : .body)
+                        if !item.tags.isEmpty {
+                            Text(item.tags.joined(separator: " · "))
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .frame(minHeight: 160)
+            }
+            Divider()
+            HStack {
+                Spacer()
+                channelPreviewFooter(preview)
+            }
+            if let subscriptionStatus {
+                Text(subscriptionStatus).font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+        .padding()
+        .frame(width: 380)
+    }
+
+    /// Pied de la feuille d'aperçu : bouton selon `subscribed`/`blocked` —
+    /// présentation pure, aucun état recalculé côté front.
+    @ViewBuilder
+    private func channelPreviewFooter(_ preview: FfiChannelPreview) -> some View {
+        if preview.blocked {
+            Text("Channel bloqué").font(.caption).foregroundStyle(.secondary)
+        } else if preview.subscribed {
+            Button("Se désabonner") {
+                Task { await unsubscribeFromPreview(preview.peerId) }
+            }
+        } else {
+            Button("S'abonner") {
+                Task { await subscribeFromPreview(preview.peerId) }
+            }
+        }
+    }
+
+    private func subscribeFromPreview(_ peerId: String) async {
+        do {
+            try await model.subscribeChannel(peerId)
+            subscriptionStatus = "abonné"
+            showChannelPreview = false
+        } catch {
+            subscriptionStatus = describeSubscriptionError(error)
+        }
+    }
+
+    private func unsubscribeFromPreview(_ peerId: String) async {
+        do {
+            try await model.unsubscribeChannel(peerId)
+            subscriptionStatus = "désabonné"
+            showChannelPreview = false
+        } catch {
+            subscriptionStatus = describeSubscriptionError(error)
         }
     }
 
@@ -198,9 +291,12 @@ struct ContentView: View {
             HStack {
                 TextField("Coller un lien de channel…", text: $channelLinkField)
                     .textFieldStyle(.roundedBorder)
-                Button("S'abonner") { Task { await subscribeByLink() } }
-                    .disabled(channelLinkField.trimmingCharacters(in: .whitespacesAndNewlines)
-                        .isEmpty)
+                if previewLoading {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Aperçu") { Task { await previewByLink() } }
+                    .disabled(previewLoading || channelLinkField
+                        .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
             Button("Copier le lien de mon channel") { copyMyChannelLink() }
             if let subscriptionStatus {
@@ -367,15 +463,34 @@ struct ContentView: View {
         }
     }
 
-    private func subscribeByLink() async {
+    /// Résout l'aperçu du lien/PeerId collé (état de chargement pendant le
+    /// fetch) et ouvre la feuille en cas de succès. Ne s'abonne JAMAIS
+    /// directement — l'abonnement passe désormais par la feuille d'aperçu.
+    private func previewByLink() async {
         let link = channelLinkField.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !link.isEmpty else { return }
+        previewLoading = true
+        defer { previewLoading = false }
         do {
-            try await model.subscribeChannel(link)
+            let preview = try await model.resolveChannel(link)
+            channelPreview = preview
+            showChannelPreview = true
             channelLinkField = ""
-            subscriptionStatus = "abonné"
+            subscriptionStatus = nil
         } catch {
-            subscriptionStatus = describeSubscriptionError(error)
+            subscriptionStatus = describePreviewError(error)
+        }
+    }
+
+    private func describePreviewError(_ error: Error) -> String {
+        guard let ffiError = error as? FfiError else { return "erreur réseau" }
+        switch ffiError {
+        case .NotFound:
+            return "channel introuvable pour l'instant"
+        case .InvalidInput:
+            return "lien ou PeerId invalide"
+        default:
+            return "erreur réseau"
         }
     }
 
