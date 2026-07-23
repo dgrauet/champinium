@@ -44,6 +44,7 @@ final class NodeModel: ObservableObject {
     @Published var entries: [FfiCatalogEntry] = []
     @Published var subscribedEntries: [FfiCatalogEntry] = []
     @Published var subscriptions: Set<String> = []
+    @Published var blockedChannels: [String] = []
     @Published var searchHits: [FfiSearchHit] = []
     @Published var storageStats = FfiStorageStats(usedBytes: 0, quotaBytes: 0)
     @Published var player: AVPlayer?
@@ -107,6 +108,7 @@ final class NodeModel: ObservableObject {
         entries = node?.catalog() ?? []
         subscribedEntries = node?.catalogSubscribed() ?? []
         subscriptions = Set(node?.subscriptions() ?? [])
+        blockedChannels = node?.blockedChannels() ?? []
         storageStats = node?.storageStats() ?? FfiStorageStats(usedBytes: 0, quotaBytes: 0)
         status = "catalogue: \(entries.count) créateur(s)"
     }
@@ -151,6 +153,22 @@ final class NodeModel: ObservableObject {
     func unsubscribeChannel(_ peerId: String) async throws {
         guard let node else { return }
         try await node.unsubscribeChannel(peerId: peerId)
+        refreshCatalog()
+    }
+
+    /// Bloque un channel localement (lien ou PeerId nu). Le channel disparaît
+    /// du catalogue via le rafraîchissement réactif du `CatalogListener`
+    /// (`refreshCatalog()` explicite ici en plus, pour un retour immédiat).
+    func blockChannel(_ linkOrPeerId: String) async throws {
+        guard let node else { return }
+        try await node.blockChannel(linkOrPeerId: linkOrPeerId)
+        refreshCatalog()
+    }
+
+    /// Débloque un channel bloqué localement.
+    func unblockChannel(_ peerId: String) async throws {
+        guard let node else { return }
+        try await node.unblockChannel(peerId: peerId)
         refreshCatalog()
     }
 
