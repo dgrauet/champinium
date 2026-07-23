@@ -508,3 +508,36 @@ async fn fallback_still_enforces_moderation_checkpoint_two() {
         "un contenu refusé ne doit jamais entrer au blockstore"
     );
 }
+
+/// (5) Défense en profondeur : un backend froid menteur (les octets rendus
+/// ne correspondent pas au CID demandé) ne doit JAMAIS voir ses octets
+/// renvoyés — même sous `Stream`, qui ne repasse pas par `blockstore.put`
+/// (content-addressed) pour une vérification gratuite. Traité comme un
+/// fournisseur absent (`NoProviders`), rien n'entre au blockstore.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallback_rejects_cid_mismatch_from_cold_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let requested = b"contenu authentique demande par CID".to_vec();
+    let cid = cid_for(&requested);
+    let tampered = b"octets differents rendus par un cold store menteur ou bogue".to_vec();
+
+    let node = solo_node(dir.path(), "solo").await;
+    let cold = Arc::new(MockColdStore {
+        cid,
+        bytes: tampered,
+    });
+    let node = node.with_cold_for_tests(cold);
+
+    let err = node
+        .get_with_policy_for_tests(cid, false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CoreError::NoProviders(_)),
+        "un CID ne correspondant pas doit être traité comme un fournisseur absent, jamais servi"
+    );
+    assert!(
+        !node.blockstore().has(&cid),
+        "des octets non vérifiés ne doivent jamais entrer au blockstore"
+    );
+}

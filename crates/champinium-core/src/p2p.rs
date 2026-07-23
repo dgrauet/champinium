@@ -2372,6 +2372,16 @@ async fn cold_fallback_inner(
         emit_report_inner(cmd_tx, reports, keypair, &cid, "denylist").await;
         return Err(CoreError::Moderated(cid.to_string()));
     }
+    // Défense en profondeur : `cold` est un `dyn ColdStore` — la vérification
+    // du CID ne doit pas dépendre de la discipline interne d'une implémentation
+    // tierce. `retrieve` est censé l'avoir déjà fait (spec), mais le point de
+    // service (surtout `Stream`, qui ne repasse PAS par `blockstore.put`,
+    // content-addressed) ne doit JAMAIS rendre des octets non vérifiés — un
+    // backend froid menteur ou bogué est traité comme un fournisseur absent.
+    if !verify(&cid, &bytes) {
+        tracing::warn!("backend froid: octets ne correspondant pas au CID {cid}, rejetés");
+        return Err(CoreError::NoProviders(cid.to_string()));
+    }
     if policy == StorePolicy::Seed {
         blockstore.put(&bytes)?;
         let _ = provide_inner(cmd_tx, moderation, cid).await;
