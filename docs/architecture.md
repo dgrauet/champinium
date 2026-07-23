@@ -2,7 +2,7 @@
 
 > Public : quiconque veut comprendre comment le projet fonctionne de bout en
 > bout. Les renvois pointent vers le code (chemins cliquables) et les ADRs
-> (`docs/adr/`) pour les décisions. État au contrat FFI **v7** (voir
+> (`docs/adr/`) pour les décisions. État au contrat FFI **v8** (voir
 > `.release-please-manifest.json` / `CHANGELOG.md` pour la version de release
 > — elle dérive, pas de version en dur ici, cf. `CLAUDE.md`).
 
@@ -59,7 +59,7 @@ un front est un bug). Carte des modules :
 | [`identity`](../crates/champinium-core/src/identity.rs) | paire Ed25519 persistée (`node.key`, mode 0600) → PeerId |
 | [`feed`](../crates/champinium-core/src/feed.rs) | feed signé d'un créateur, versionné par `seq` (LWW) ; **v3** = métadonnées titre/tags par entrée + identité de channel (nom/description/avatar) signées, v1/v2 supprimés |
 | [`catalog`](../crates/champinium-core/src/catalog.rs) | CRDT maison : map last-writer-wins par émetteur, bornée (1024 émetteurs, sauf émetteurs souscrits — §6) ; recherche locale |
-| [`moderation`](../crates/champinium-core/src/moderation.rs) | denylist compilée (non désactivable) + denylists signées souscrites (fédéré) |
+| [`moderation`](../crates/champinium-core/src/moderation.rs) | denylist compilée (non désactivable) + denylists signées souscrites (fédéré), **v2** = CIDs **et** clés (`key_entries`, ban d'émetteur entier) ; blocage local privé de channel côté `Node` (§7) |
 | [`report`](../crates/champinium-core/src/report.rs) | signalement P2P : rapport signé + agrégateur borné de rapporteurs distincts |
 | [`ingest`](../crates/champinium-core/src/ingest.rs) | orchestration ffmpeg → segments HLS alignés keyframes → manifeste `champinium-hls/v1` |
 | [`p2p`](../crates/champinium-core/src/p2p.rs) | le cœur : `Node`, la boucle d'évènements libp2p, tous les flux (§4, §6), le suivi actif des abonnements |
@@ -142,8 +142,13 @@ déplacer du contenu d'un champ à l'autre à signature constante
   supprimés** (zéro utilisateur en usage réel au moment du retrait) : un feed
   v1/v2 reçu est rejeté au parsing plutôt que toléré en compatibilité
   descendante.
-- **Denylist** (`champinium-denylist/v1`, JSON signé) : liste de CIDs bloqués,
-  signée par son éditeur. Voir [`deny/README.md`](../deny/README.md).
+- **Denylist** (`champinium-denylist/v2`, JSON signé) : liste signée par son
+  éditeur, portant des **CIDs** bloqués (`entries`) **et** des **clés**
+  bloquées (`key_entries` — PeerIds d'émetteurs bannis en entier ; tout contenu
+  de cette clé est refusé quel que soit son CID). Les deux collections sont
+  couvertes indépendamment par la signature préfixée-longueur. Le format **v1
+  (CIDs seuls) a été supprimé** (zéro-compat, comme le feed v3). Voir
+  [`deny/README.md`](../deny/README.md) et §7.
 - **Rapport** (`champinium-report/v1`, JSON signé) : « ce CID a été refusé par
   ma modération » — voir §7.
 
@@ -286,7 +291,9 @@ channels **auxquels il est abonné**.
   ci-dessus **dépend de ce choix** : mesurer la réplication en incluant un
   provider record qu'on vient soi-même de retirer changerait le calcul
   d'éligibilité à la volée et réintroduirait le risque de thrashing que le
-  dampener cherche à éviter.
+  dampener cherche à éviter. (Ce choix est **propre à l'éviction de quota** : la
+  purge de **modération**, elle, appelle bien `stop_providing` pour cesser
+  d'annoncer un contenu banni — voir §7.)
 - **Réplication toutes-directions supprimée à dessein** : le lot (c) retire
   aussi `replicate_under_provided` et les flags de démon associés
   (`--replication-target`/`--replicate-max`) — un nœud ne réplique plus
@@ -329,17 +336,104 @@ Sources de blocage : la denylist **compilée dans le binaire**
 souscrites** (modèle fédéré : chaque nœud choisit qui suivre ; signature
 vérifiée ; souscription à chaud possible avec **purge rétroactive** du cache).
 
-Autour, deux mécanismes d'écosystème :
+### Modération par clé (denylist v2)
 
-- **Signalement** : les pairs agrègent les rapports par CID (rapporteurs
+Une denylist v2 ([`moderation`](../crates/champinium-core/src/moderation.rs))
+peut bannir des **émetteurs entiers** (`key_entries`, PeerIds) en plus de CIDs
+isolés (`entries`). Une clé bannie voit **tout** son contenu refusé, quel que
+soit son CID, aux mêmes checkpoints — c'est la réponse au créateur récidiviste
+qui republie sous de nouveaux CIDs. Bannir une clé est un acte **fédéré et
+assumé** : un éditeur de denylist désigne nommément une identité (vérifiée par
+sa clé) et signe ce choix ; ses abonnés en héritent explicitement.
+
+**Absence délibérée d'un ensemble de CIDs bloqués dérivé des feeds.** Bannir
+une clé bloque le contenu **attribué localement** à cette clé (via le catalogue
+reconstruit et l'index de seed), pas une liste de CIDs *extraite des feeds* de
+cette clé. La distinction est le cœur du design anti-censure : un feed ne
+**prouve pas la propriété** d'un CID — n'importe qui peut lister le CID d'un
+tiers dans son propre feed. Si bannir une clé purgeait tous les CIDs qu'elle
+*mentionne*, un émetteur banni (ou un attaquant qui se fait bannir exprès)
+pourrait faire **censurer le contenu légitime d'un tiers** en le listant dans
+son feed avant le ban — une censure par injection. L'enforcement par clé se
+limite donc strictement à ce que **ce nœud** a lui-même attribué à l'émetteur ;
+aucun blocage n'est propagé vers des CIDs sur la seule foi d'un feed. C'est un
+invariant à préserver : ne jamais dériver un blocklist de CIDs à partir du
+contenu des feeds.
+
+Enforcement d'une clé bannie, aux mêmes points que par CID :
+- **catalogue** : un feed d'un émetteur banni est rejeté à l'ingestion
+  (`fetch_feed_inner`/`handle_feed_message`), jamais appliqué ;
+- **purge rétroactive à la souscription** : souscrire une denylist v2 purge
+  immédiatement toute entrée de catalogue **déjà présente** dont l'émetteur est
+  désormais banni (pas seulement les clés de *cette* liste — une clé a pu être
+  bannie avant que son feed n'arrive) ;
+- **abonnement refusé** : `subscribe_channel` sur une clé bannie échoue en
+  `Moderated` (refus délibéré, pas erreur de saisie) — sinon un abonné
+  exempterait l'émetteur de la borne du catalogue tout en le rejetant par
+  ailleurs, et ferait tourner le suivi actif en pure perte.
+
+### Blocage local de channel (strictement privé)
+
+Distinct de la denylist fédérée : un utilisateur peut **bloquer localement** un
+channel (`block_channel`, dotfile privé `.blocked_channels` à côté des blocs).
+C'est une préférence **strictement locale et privée** — **aucun effet réseau** :
+pas de rapport, pas de record signé, rien de publié (à l'inverse d'un ban de
+denylist, qui est un choix fédéré partagé). Le channel disparaît des deux vues
+(Abonnements et Explorer), n'est plus jamais retéléchargé, et l'abonnement
+éventuel est retiré. La **purge locale outrepasse les pins** : contrairement à
+l'éviction de quota (lot c), la modération locale supprime aussi les manifestes
+épinglés de cet émetteur — un utilisateur qui bloque veut tout effacer, pins
+compris. `unblock_channel` retire seulement la préférence ; rien n'est
+retéléchargé automatiquement, le contenu revient naturellement au prochain feed
+reçu de cet émetteur. `blocked_channels()` liste les PeerIds bloqués (le nom
+n'est plus au catalogue après purge, d'où l'affichage par PeerId dans les
+fronts).
+
+### Purge rétroactive étendue (SeedIndex + `stop_providing`)
+
+La purge de modération par émetteur (`purge_blocked_issuer`, partagée entre le
+ban de denylist par clé et le blocage local) va au-delà du catalogue :
+
+- retire l'entrée du **catalogue** local ;
+- purge du **`SeedIndex`** les publications attribuées à l'émetteur (blocage
+  local : **pins compris** ; ban denylist : idem via le même chemin) et
+  **supprime les blocs devenus orphelins** du blockstore (un bloc encore
+  référencé par la publication d'un autre émetteur non bloqué est préservé) ;
+- **arrête d'annoncer ce nœud comme fournisseur** de chaque CID purgé
+  (`stop_providing`). `libp2p-kad` 0.48 (via libp2p 0.56) expose
+  `Behaviour::stop_providing`, qui retire **immédiatement le provider record
+  local** — pas de repli sur la seule expiration TTL. Limite assumée : les
+  copies du provider record déjà propagées chez des pairs distants ne sont pas
+  rappelées et s'éteignent à leur propre TTL (best-effort, comme `provide`).
+  `stop_providing` n'émet aucun rapport ni signal aux pairs — cohérent avec le
+  caractère strictement local du blocage.
+
+> Nuance vs l'éviction de quota (§6 bis) : l'éviction, elle, **n'appelle pas**
+> `stop_providing` (elle retire du SeedIndex et supprime les orphelins, mais
+> laisse le provider record expirer par TTL) — c'est voulu, la stabilité de
+> l'amortisseur anti-oscillation en dépend. La purge de **modération** est le
+> seul chemin qui retire activement le provider record local, parce qu'un
+> contenu banni ne doit pas continuer à être annoncé.
+
+Autour, trois mécanismes d'écosystème :
+
+- **Signalement par CID** : les pairs agrègent les rapports par CID (rapporteurs
   **distincts**, agrégat borné) — matière première pour les éditeurs de
   denylists, **aucun effet automatique** sur le contenu.
+- **Signalement par channel** (`report_counts_by_channel`, lot d) : jointure
+  **locale, lecture seule** entre l'agrégat de rapports par CID et le mapping
+  CID→émetteur du catalogue reconstruit — pour chaque émetteur, `(rapporteurs
+  distincts cumulés, nombre de CIDs distincts signalés qui lui sont attribués)`.
+  Aide un éditeur de denylist à repérer un émetteur globalement problématique
+  (candidat à un `key_entries`). **Aucun effet automatique**, et limite assumée :
+  un CID signalé absent du catalogue local (émetteur jamais vu) n'est pas
+  attribué et reste compté au seul agrégat global. CLI : `reports --by-channel`.
 - **Peer scoring gossipsub** : émettre des feeds/rapports invalides dégrade le
   score du pair → ses messages ne sont plus relayés → graylist. Avec le
   catalogue borné à 1024 émetteurs (refus-quand-plein, pas d'éviction), c'est
   la défense contre l'inondation par clés jetables.
 
-## 8. La frontière FFI : le contrat v7
+## 8. La frontière FFI : le contrat v8
 
 La surface UniFFI de [`ffi.rs`](../crates/champinium-core/src/ffi.rs) est
 **le contrat** entre le noyau et les fronts (tableau exhaustif et protocole de
@@ -359,7 +453,7 @@ changement dans [`AGENTS.md`](../AGENTS.md)). Ce qui la caractérise :
 - **Bindings générés au build, jamais commités** : Swift via
   UniFFI/XCFramework (`just macos-prepare`), C# via `uniffi-bindgen-cs`
   (`just gen-csharp`). Le front Linux consomme le crate **directement** (pas
-  de FFI). `CONTRACT_VERSION` (=7) permet aux fronts de détecter une
+  de FFI). `CONTRACT_VERSION` (=8) permet aux fronts de détecter une
   incompatibilité au démarrage.
 - **Abonnements (v6)** : `subscribe_channel`/`unsubscribe_channel` (lien
   `champinium://channel/<peerid>` ou PeerId nu), `subscriptions` (liste
@@ -378,6 +472,16 @@ changement dans [`AGENTS.md`](../AGENTS.md)). Ce qui la caractérise :
   `CatalogListener` : notifie toute publication nouvellement seedée, éviction
   ou purge au désabonnement ; le front re-dispatche puis relit
   `storage_stats()`/`catalog()`.
+- **Blocage local de channel (v8)** : `block_channel(lien-ou-peerid)` (async :
+  persiste puis purge catalogue + SeedIndex + blocs + `stop_providing`, §7),
+  `unblock_channel(peer_id)`, `blocked_channels() -> Vec<String>` (liste locale
+  des PeerIds bloqués). Un lien `champinium://channel/…` ou un PeerId nu sont
+  acceptés ; une entrée illisible → `InvalidInput`, une clé déjà bannie par
+  denylist ou une opération de modération → `Moderated`. Le blocage est
+  **strictement local** : aucune de ces méthodes n'émet quoi que ce soit sur le
+  réseau. Côté fronts, l'action « Bloquer » vit dans la vue **Explorer** (on ne
+  bloque pas un abonné sans se désabonner) et les channels bloqués se gèrent
+  depuis un volet dédié **« Channels bloqués »** (déblocage par PeerId).
 
 Les trois fronts ([`apps/macos`](../apps/macos),
 [`apps/windows`](../apps/windows), [`apps/linux`](../apps/linux)) font tous la
@@ -434,12 +538,12 @@ qui compte vit dans le réseau, chaque nœud n'en garde qu'une vue.
 | Signature payante | palier gratuit livré ; notarisation/Authenticode différés | `packaging.md` |
 | Windows/C# | validé par CI ; pas de stack intendant | `.intendant.toml` |
 | Channels lot (c) | seed proactif des channels souscrits + quota + éviction + pins + retrait de seed-what-you-consume — **implémenté** (contrat FFI v7) | §6 bis |
-| Channels lot (d) | blocage local de channel, denylists par clé, agrégation des signalements par channel — pas encore implémenté | §7 |
+| Channels lot (d) | denylist par clé (v2), blocage local privé de channel, purge rétroactive étendue (SeedIndex + `stop_providing`), signalements par channel — **implémenté** (contrat FFI v8) ; clôt la refonte channels (lots a–d) | §7 |
 
 ## 12. Carte des documents
 
 - [`CLAUDE.md`](../CLAUDE.md) — principes + état d'avancement (source de vérité).
-- [`AGENTS.md`](../AGENTS.md) — contrat FFI (tableau v7) + garde-fous d'équipe.
+- [`AGENTS.md`](../AGENTS.md) — contrat FFI (tableau v8) + garde-fous d'équipe.
 - [`docs/adr/`](adr/) — décisions : libp2p vs iroh (0001), modération côté
   nœud (0002), feeds signés (0003), transport de blocs (0006), IPNS (0007)…
 - [`docs/mvp-demo.md`](mvp-demo.md) / [`docs/gui-demo.md`](gui-demo.md) —

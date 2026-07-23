@@ -154,6 +154,31 @@ async fn fetch_hls_stores_content_for_subscribed_channel() {
         node_consumer.blockstore().has(&seg_cid),
         "channel souscrit : le segment doit être en cache"
     );
+
+    // M1 (revue finale lot c) : `get_with(Seed)` mettait déjà en cache, mais
+    // sans jamais entrer au SeedIndex — le quota ne bougeait pas et un
+    // désabonnement ultérieur ne purgeait rien. Les deux doivent maintenant
+    // suivre le fetch.
+    let (used, _quota) = node_consumer.storage_stats();
+    assert!(
+        used > 0,
+        "storage_stats().used doit croître après un fetch_hls seedé"
+    );
+
+    node_consumer.unsubscribe(node_creator.peer_id()).unwrap();
+    assert!(
+        !node_consumer.blockstore().has(&manifest_cid),
+        "le désabonnement doit purger le manifeste seedé par fetch_hls"
+    );
+    assert!(
+        !node_consumer.blockstore().has(&seg_cid),
+        "le désabonnement doit purger le segment seedé par fetch_hls"
+    );
+    let (used_after, _) = node_consumer.storage_stats();
+    assert_eq!(
+        used_after, 0,
+        "le désabonnement doit ramener storage_stats().used à 0 (rien d'épinglé)"
+    );
 }
 
 /// Channel NON souscrit (ex. consultation depuis Explorer) : `fetch_hls`

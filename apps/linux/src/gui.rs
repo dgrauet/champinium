@@ -51,6 +51,10 @@ struct Ui {
     /// Avertissement Explorer déjà accepté cette session (mémoire de session
     /// uniquement — pas de GSettings, YAGNI, voir brief tâche 7).
     explorer_warned: Cell<bool>,
+    /// Fenêtre principale — posée juste après sa construction (elle n'existe
+    /// pas encore quand `Ui` est créé). Sert de `transient_for` aux dialogues
+    /// ouverts depuis un en-tête de channel (confirmation de blocage).
+    window: RefCell<Option<ApplicationWindow>>,
 }
 
 fn build_ui(app: &Application) {
@@ -64,6 +68,7 @@ fn build_ui(app: &Application) {
         player: RefCell::new(None),
         current_play_dir: RefCell::new(None),
         explorer_warned: Cell::new(false),
+        window: RefCell::new(None),
     });
 
     let status = Label::new(Some("démarrage…"));
@@ -73,9 +78,13 @@ fn build_ui(app: &Application) {
     // pour rester cohérente avec la vue unique existante (pas de fenêtre de
     // préférences séparée).
     let seed_settings_btn = Button::with_label("Réglages de seed");
+    // Réglages : liste des channels bloqués localement (tâche d/6) — même
+    // patron de popup dédiée que "Réglages de seed".
+    let blocked_channels_btn = Button::with_label("Channels bloqués");
     let header_bar = GtkBox::new(Orientation::Horizontal, 8);
     header_bar.append(&status);
     header_bar.append(&seed_settings_btn);
+    header_bar.append(&blocked_channels_btn);
 
     let peer_entry = Entry::builder()
         .placeholder_text("/ip4/…/tcp/…/p2p/<peerid>")
@@ -154,6 +163,10 @@ fn build_ui(app: &Application) {
         .default_height(520)
         .child(&root)
         .build();
+
+    // Posée une fois construite — sert de `transient_for` aux dialogues
+    // ouverts depuis un en-tête de channel (voir `Ui::window`).
+    *ui.window.borrow_mut() = Some(window.clone());
 
     // Premier passage sur Explorer : avertissement bloquant, mémorisé pour la
     // session (voir `Ui::explorer_warned`). Le passage est annulé (retour sur
@@ -235,6 +248,16 @@ fn build_ui(app: &Application) {
         let window = window.clone();
         seed_settings_btn.connect_clicked(move |_| {
             open_seed_settings(&ui, &window);
+        });
+    }
+
+    // Réglages : liste des channels bloqués localement (tâche d/6) — popup
+    // dédiée listant les PeerIds bloqués (tronqués) + bouton Débloquer.
+    {
+        let ui = ui.clone();
+        let window = window.clone();
+        blocked_channels_btn.connect_clicked(move |_| {
+            open_blocked_channels(&ui, &window);
         });
     }
 
@@ -437,6 +460,7 @@ fn refresh_lists(
             subs.contains(&entry.issuer),
             seeded,
             total,
+            true, // can_block : Explorer uniquement, voir la doc de la fonction
         ));
         for item in &entry.items {
             // Pas de bouton de pin côté Explorer — épingler un contenu hors
@@ -468,6 +492,7 @@ fn refresh_lists(
             true,
             seeded,
             total,
+            false, // can_block : un bloqué ne peut être souscrit, donc absent d'ici de toute façon
         ));
         for item in &entry.items {
             subs_list.append(&content_row(
@@ -499,6 +524,7 @@ fn channel_header_row(
     subscribed: bool,
     seeded: u64,
     total: u64,
+    can_block: bool,
 ) -> GtkBox {
     let row = GtkBox::new(Orientation::Horizontal, 8);
     let text = GtkBox::new(Orientation::Vertical, 2);
@@ -523,49 +549,118 @@ fn channel_header_row(
     text.set_hexpand(true);
     row.append(&text);
 
-    let btn = Button::with_label(if subscribed {
-        "Se désabonner"
-    } else {
-        "S'abonner"
-    });
-    let issuer = entry.issuer;
-    let ui = ui.clone();
-    let status = status.clone();
-    let subs_list = subs_list.clone();
-    let explorer_list = explorer_list.clone();
-    let search_entry = search_entry.clone();
-    btn.connect_clicked(move |_| {
-        let Some(node) = ui.node.borrow().clone() else {
-            status.set_text("nœud pas encore prêt");
-            return;
-        };
-        let rt = ui.rt.clone();
+    {
+        let btn = Button::with_label(if subscribed {
+            "Se désabonner"
+        } else {
+            "S'abonner"
+        });
+        let issuer = entry.issuer;
         let ui = ui.clone();
         let status = status.clone();
         let subs_list = subs_list.clone();
         let explorer_list = explorer_list.clone();
         let search_entry = search_entry.clone();
-        glib::spawn_future_local(async move {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            rt.spawn(async move {
-                let res = if subscribed {
-                    unsubscribe_inner(&node, issuer).await
-                } else {
-                    subscribe_inner(&node, issuer).await
-                };
-                let _ = tx.send(res);
-            });
-            match rx.await {
-                Ok(Ok(())) => {
-                    status.set_text(if subscribed { "désabonné" } else { "abonné" });
-                    refresh_lists(&ui, &status, &subs_list, &explorer_list, &search_entry);
+        btn.connect_clicked(move |_| {
+            let Some(node) = ui.node.borrow().clone() else {
+                status.set_text("nœud pas encore prêt");
+                return;
+            };
+            let rt = ui.rt.clone();
+            let ui = ui.clone();
+            let status = status.clone();
+            let subs_list = subs_list.clone();
+            let explorer_list = explorer_list.clone();
+            let search_entry = search_entry.clone();
+            glib::spawn_future_local(async move {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                rt.spawn(async move {
+                    let res = if subscribed {
+                        unsubscribe_inner(&node, issuer).await
+                    } else {
+                        subscribe_inner(&node, issuer).await
+                    };
+                    let _ = tx.send(res);
+                });
+                match rx.await {
+                    Ok(Ok(())) => {
+                        status.set_text(if subscribed { "désabonné" } else { "abonné" });
+                        refresh_lists(&ui, &status, &subs_list, &explorer_list, &search_entry);
+                    }
+                    Ok(Err(e)) => status.set_text(&describe_core_error(&e, "abonnement")),
+                    Err(_) => status.set_text("tâche annulée"),
                 }
-                Ok(Err(e)) => status.set_text(&describe_core_error(&e, "abonnement")),
-                Err(_) => status.set_text("tâche annulée"),
-            }
+            });
         });
-    });
-    row.append(&btn);
+        row.append(&btn);
+    }
+
+    // Blocage local de channel (tâche d/6) — Explorer uniquement (un channel
+    // souscrit ne peut pas être bloqué sans se désabonner d'abord, et un
+    // bloqué ne peut de toute façon pas apparaître dans Abonnements).
+    if can_block {
+        let block_btn = Button::with_label("Bloquer");
+        let issuer = entry.issuer;
+        let name = name.clone();
+        let ui = ui.clone();
+        let status = status.clone();
+        let subs_list = subs_list.clone();
+        let explorer_list = explorer_list.clone();
+        let search_entry = search_entry.clone();
+        block_btn.connect_clicked(move |_| {
+            let dialog = MessageDialog::builder()
+                .modal(true)
+                .text("Bloquer ce channel ?")
+                .secondary_text(format!(
+                    "« {name} » disparaîtra du catalogue. Réversible depuis « Channels bloqués »."
+                ))
+                .buttons(ButtonsType::None)
+                .build();
+            if let Some(window) = ui.window.borrow().as_ref() {
+                dialog.set_transient_for(Some(window));
+            }
+            dialog.add_button("Annuler", ResponseType::Cancel);
+            dialog.add_button("Bloquer", ResponseType::Accept);
+            let ui = ui.clone();
+            let status = status.clone();
+            let subs_list = subs_list.clone();
+            let explorer_list = explorer_list.clone();
+            let search_entry = search_entry.clone();
+            dialog.connect_response(move |dialog, resp| {
+                dialog.close();
+                if resp != ResponseType::Accept {
+                    return;
+                }
+                let Some(node) = ui.node.borrow().clone() else {
+                    status.set_text("nœud pas encore prêt");
+                    return;
+                };
+                let rt = ui.rt.clone();
+                let ui = ui.clone();
+                let status = status.clone();
+                let subs_list = subs_list.clone();
+                let explorer_list = explorer_list.clone();
+                let search_entry = search_entry.clone();
+                glib::spawn_future_local(async move {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    rt.spawn(async move {
+                        let _ = tx.send(block_channel_inner(&node, issuer).await);
+                    });
+                    match rx.await {
+                        Ok(Ok(())) => {
+                            status.set_text("channel bloqué");
+                            refresh_lists(&ui, &status, &subs_list, &explorer_list, &search_entry);
+                        }
+                        Ok(Err(e)) => status.set_text(&describe_core_error(&e, "blocage")),
+                        Err(_) => status.set_text("tâche annulée"),
+                    }
+                });
+            });
+            dialog.present();
+        });
+        row.append(&block_btn);
+    }
+
     row
 }
 
@@ -795,6 +890,97 @@ fn open_seed_settings(ui: &Rc<Ui>, parent: &ApplicationWindow) {
     win.present();
 }
 
+/// Popup des channels bloqués localement (tâche d/6) : liste (PeerId tronqué
+/// — le nom n'est plus au catalogue après purge) + bouton Débloquer par
+/// ligne. Même patron de fenêtre dédiée que `open_seed_settings`.
+fn open_blocked_channels(ui: &Rc<Ui>, parent: &ApplicationWindow) {
+    if ui.node.borrow().is_none() {
+        return;
+    }
+
+    let win = gtk::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .title("Channels bloqués")
+        .default_width(320)
+        .build();
+
+    let content = GtkBox::new(Orientation::Vertical, 8);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+
+    let title = Label::new(Some("Channels bloqués"));
+    title.set_xalign(0.0);
+    title.add_css_class("heading");
+
+    let list = ListBox::new();
+    let scroller = ScrolledWindow::builder()
+        .child(&list)
+        .min_content_height(160)
+        .build();
+
+    content.append(&title);
+    content.append(&scroller);
+    win.set_child(Some(&content));
+
+    populate_blocked_channels(ui, &win, &list);
+
+    win.present();
+}
+
+/// (Re)construit la liste des channels bloqués dans la popup — appelée à
+/// l'ouverture et après chaque déblocage réussi.
+fn populate_blocked_channels(ui: &Rc<Ui>, win: &gtk::Window, list: &ListBox) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+    let Some(node) = ui.node.borrow().clone() else {
+        return;
+    };
+    let blocked = node.blocked_channels();
+    if blocked.is_empty() {
+        let empty = Label::new(Some("aucun channel bloqué"));
+        empty.set_xalign(0.0);
+        empty.add_css_class("dim-label");
+        list.append(&empty);
+        return;
+    }
+    for issuer in blocked {
+        let row = GtkBox::new(Orientation::Horizontal, 8);
+        let label = Label::new(Some(&truncate_peer_id(&issuer.to_string())));
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        row.append(&label);
+
+        let unblock_btn = Button::with_label("Débloquer");
+        let ui = ui.clone();
+        let win = win.clone();
+        let list_for_closure = list.clone();
+        unblock_btn.connect_clicked(move |_| {
+            let Some(node) = ui.node.borrow().clone() else {
+                return;
+            };
+            let rt = ui.rt.clone();
+            let ui = ui.clone();
+            let win = win.clone();
+            let list = list_for_closure.clone();
+            glib::spawn_future_local(async move {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                rt.spawn(async move {
+                    let _ = tx.send(unblock_channel_inner(&node, issuer).await);
+                });
+                if let Ok(Ok(())) = rx.await {
+                    populate_blocked_channels(&ui, &win, &list);
+                }
+            });
+        });
+        row.append(&unblock_btn);
+        list.append(&row);
+    }
+}
+
 /// Affichage humain de `(octets_utilisés, quota_octets)`.
 fn storage_stats_text(used: u64, quota: u64) -> String {
     format!(
@@ -864,6 +1050,18 @@ async fn subscribe_inner(node: &Node, issuer: PeerId) -> Result<(), CoreError> {
 /// Se désabonne d'un émetteur — même contrainte que `subscribe_inner`.
 async fn unsubscribe_inner(node: &Node, issuer: PeerId) -> Result<(), CoreError> {
     node.unsubscribe(issuer)
+}
+
+/// Bloque un channel localement (tâche d/6) — appel réellement async côté
+/// core (désabonne + purge le catalogue), exécuté sur le runtime tokio.
+async fn block_channel_inner(node: &Node, issuer: PeerId) -> Result<(), CoreError> {
+    node.block_channel(issuer).await
+}
+
+/// Débloque un channel bloqué localement — appel sync du core, même
+/// contrainte que `unsubscribe_inner`.
+async fn unblock_channel_inner(node: &Node, issuer: PeerId) -> Result<(), CoreError> {
+    node.unblock_channel(issuer)
 }
 
 /// Épingle un manifeste (écriture disque du `SeedIndex`) — même contrainte

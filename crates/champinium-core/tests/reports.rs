@@ -60,7 +60,7 @@ async fn blocked_get_emits_report_that_peers_aggregate() {
     // La victime souscrit une denylist qui bloque `bad`.
     let issuer = Keypair::generate_ed25519();
     let bad = cid_for(b"contenu signale");
-    let dl = Denylist::build_signed("t", "2026-07-04T00:00:00Z", &issuer, &[bad]).unwrap();
+    let dl = Denylist::build_signed("t", "2026-07-04T00:00:00Z", &issuer, &[bad], &[]).unwrap();
     victim.subscribe_denylist(&dl).await.unwrap();
 
     assert_eq!(observer.report_count(&bad), 0);

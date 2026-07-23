@@ -92,6 +92,13 @@ impl Catalog {
         Ok(newer)
     }
 
+    /// Retire l'entrée d'un émetteur du catalogue (purge de modération : clé
+    /// bannie par denylist ou bloquée localement, voir `crate::p2p::Node`).
+    /// Renvoie `true` si une entrée a effectivement été retirée.
+    pub fn remove_issuer(&mut self, issuer: &PeerId) -> bool {
+        self.feeds.remove(issuer).is_some()
+    }
+
     /// Entrées du catalogue (un feed courant par émetteur).
     pub fn entries(&self) -> Vec<CatalogEntry> {
         self.feeds
@@ -187,6 +194,30 @@ mod tests {
         assert!(!apply0(&mut cat, v1).unwrap());
         assert_eq!(cat.all_cids().len(), 2);
         assert_eq!(cat.issuer_count(), 1);
+    }
+
+    #[test]
+    fn remove_issuer_drops_entry_and_is_idempotent() {
+        let issuer = Keypair::generate_ed25519();
+        let other = Keypair::generate_ed25519();
+        let mut cat = Catalog::new();
+        apply0(
+            &mut cat,
+            Feed::build_signed(&issuer, 1, &[cid_for(b"a")]).unwrap(),
+        )
+        .unwrap();
+        apply0(
+            &mut cat,
+            Feed::build_signed(&other, 1, &[cid_for(b"b")]).unwrap(),
+        )
+        .unwrap();
+
+        assert!(cat.remove_issuer(&issuer.public().to_peer_id()));
+        assert_eq!(cat.issuer_count(), 1);
+        assert!(
+            !cat.remove_issuer(&issuer.public().to_peer_id()),
+            "retirer deux fois ne doit pas être une erreur (idempotent)"
+        );
     }
 
     #[test]

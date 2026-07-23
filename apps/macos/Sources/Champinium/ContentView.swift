@@ -23,6 +23,9 @@ struct ContentView: View {
     @State private var subscriptionStatus: String?
     @State private var showSeedSettings = false
     @State private var quotaField: String = ""
+    @State private var showBlockedChannels = false
+    @State private var blockTarget: FfiCatalogEntry?
+    @State private var showBlockConfirm = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -56,6 +59,18 @@ struct ContentView: View {
         } message: {
             Text("Contenu non curé venant du réseau ouvert, filtré uniquement par les denylists.")
         }
+        .alert("Bloquer ce channel ?", isPresented: $showBlockConfirm,
+               presenting: blockTarget)
+        { entry in
+            Button("Annuler", role: .cancel) {}
+            Button("Bloquer", role: .destructive) {
+                Task { await blockChannel(entry.issuer) }
+            }
+        } message: { entry in
+            Text(
+                "« \(displayName(for: entry)) » disparaîtra du catalogue. Réversible depuis les réglages."
+            )
+        }
     }
 
     private var header: some View {
@@ -76,7 +91,37 @@ struct ContentView: View {
             .popover(isPresented: $showSeedSettings) {
                 seedSettingsPopover
             }
+            Button("Channels bloqués") { showBlockedChannels = true }
+                .font(.caption)
+                .popover(isPresented: $showBlockedChannels) {
+                    blockedChannelsPopover
+                }
         }
+    }
+
+    /// Réglages : liste des channels bloqués localement (PeerId tronqué — le
+    /// nom n'est plus au catalogue après purge) avec bouton Débloquer.
+    private var blockedChannelsPopover: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Channels bloqués").font(.headline)
+            if model.blockedChannels.isEmpty {
+                Text("aucun channel bloqué").font(.caption).foregroundStyle(.secondary)
+            } else {
+                List(model.blockedChannels, id: \.self) { peerId in
+                    HStack {
+                        Text(truncated(peerId))
+                            .font(.system(.caption, design: .monospaced))
+                        Spacer()
+                        Button("Débloquer") { Task { await unblockChannel(peerId) } }
+                            .font(.caption)
+                            .buttonStyle(.bordered)
+                    }
+                }
+                .frame(minHeight: 120)
+            }
+        }
+        .padding()
+        .frame(width: 320)
     }
 
     /// Réglage du quota de seeding (GB) + affichage de l'usage courant. Vue
@@ -204,6 +249,15 @@ struct ContentView: View {
             }
             Spacer()
             subscribeButton(for: entry)
+            if tab == .explorer {
+                Button("Bloquer") {
+                    blockTarget = entry
+                    showBlockConfirm = true
+                }
+                .font(.caption)
+                .buttonStyle(.bordered)
+                .tint(.red)
+            }
         }
     }
 
@@ -334,6 +388,24 @@ struct ContentView: View {
             return "contenu bloqué par la modération"
         default:
             return "erreur réseau"
+        }
+    }
+
+    private func blockChannel(_ peerId: String) async {
+        do {
+            try await model.blockChannel(peerId)
+            subscriptionStatus = "channel bloqué"
+        } catch {
+            subscriptionStatus = describeSubscriptionError(error)
+        }
+    }
+
+    private func unblockChannel(_ peerId: String) async {
+        do {
+            try await model.unblockChannel(peerId)
+            subscriptionStatus = "channel débloqué"
+        } catch {
+            subscriptionStatus = describeSubscriptionError(error)
         }
     }
 

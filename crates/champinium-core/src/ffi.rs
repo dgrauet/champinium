@@ -206,6 +206,16 @@ impl ChampiniumNode {
             .collect()
     }
 
+    /// Channels bloqués localement (PeerIds triés) — préférence privée de ce
+    /// nœud, jamais publiée (contrat v8, tâche 3).
+    pub fn blocked_channels(&self) -> Vec<String> {
+        self.inner
+            .blocked_channels()
+            .into_iter()
+            .map(|p| p.to_string())
+            .collect()
+    }
+
     /// Lien partageable du channel de `peer_id` (bouton « copier le lien de
     /// mon channel »).
     pub fn channel_link(&self, peer_id: String) -> Result<String, FfiError> {
@@ -359,6 +369,24 @@ impl ChampiniumNode {
     pub async fn unsubscribe_channel(&self, peer_id: String) -> Result<(), FfiError> {
         let peer = parse_peer_id(&peer_id)?;
         self.inner.unsubscribe(peer)?;
+        Ok(())
+    }
+
+    /// Bloque un channel **localement** (lien `champinium://channel/<peerid>`
+    /// ou PeerId nu, même tolérance que `subscribe_channel`) : préférence
+    /// strictement privée de ce nœud, jamais publiée. Désabonne si souscrit,
+    /// purge catalogue/SeedIndex/blockstore de ce qui lui était attribué.
+    pub async fn block_channel(&self, link_or_peer_id: String) -> Result<(), FfiError> {
+        let peer = crate::channel_link::parse(&link_or_peer_id)
+            .map_err(|e| FfiError::InvalidInput { msg: e.to_string() })?;
+        self.inner.block_channel(peer).await?;
+        Ok(())
+    }
+
+    /// Débloque un channel bloqué localement.
+    pub async fn unblock_channel(&self, peer_id: String) -> Result<(), FfiError> {
+        let peer = parse_peer_id(&peer_id)?;
+        self.inner.unblock_channel(peer)?;
         Ok(())
     }
 
@@ -851,6 +879,81 @@ mod tests {
             "le catalogue doit contenir l'entrée du nœud lui-même après ingest_file + publish",
         );
         assert!(own.pinned.contains(&manifest_cid));
+    }
+
+    /// Contrat v8 : `block_channel` accepte un lien `champinium://channel/…`
+    /// et fait apparaître le PeerId dans `blocked_channels()`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn block_channel_with_link_appears_in_blocked_channels() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let a = open_node(dir_a.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        let b = open_node(dir_b.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+
+        let link = a.channel_link(a.peer_id()).unwrap();
+        b.block_channel(link).await.unwrap();
+
+        assert_eq!(b.blocked_channels(), vec![a.peer_id()]);
+    }
+
+    /// `subscribe_channel` visant un émetteur bloqué localement doit remonter
+    /// `FfiError::Moderated` (UX « refus volontaire »), PAS `InvalidInput`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_channel_of_blocked_peer_is_moderated() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let a = open_node(dir_a.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        let b = open_node(dir_b.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+
+        b.block_channel(a.peer_id()).await.unwrap();
+
+        let err = b.subscribe_channel(a.peer_id()).await.unwrap_err();
+        assert!(matches!(err, FfiError::Moderated { .. }), "{err}");
+    }
+
+    /// Une entrée invalide (ni lien, ni PeerId nu) est une InvalidInput.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn block_channel_with_garbage_is_invalid_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = open_node(dir.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+
+        let err = node
+            .block_channel("nimporte quoi".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FfiError::InvalidInput { .. }), "{err}");
+    }
+
+    /// `unblock_channel` fait le chemin inverse de `block_channel`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unblock_channel_roundtrips() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let a = open_node(dir_a.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        let b = open_node(dir_b.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+
+        b.block_channel(a.peer_id()).await.unwrap();
+        assert_eq!(b.blocked_channels(), vec![a.peer_id()]);
+
+        b.unblock_channel(a.peer_id()).await.unwrap();
+        assert!(b.blocked_channels().is_empty());
+
+        // Débloqué : `subscribe_channel` doit maintenant réussir.
+        b.subscribe_channel(a.peer_id()).await.unwrap();
     }
 
     async fn ffmpeg_available() -> bool {

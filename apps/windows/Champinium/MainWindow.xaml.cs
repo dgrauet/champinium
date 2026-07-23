@@ -126,6 +126,50 @@ public sealed partial class MainWindow : Window
     }
 
     /// <summary>
+    /// Bloque un channel (bouton d'en-tête, Explorer uniquement — voir
+    /// <see cref="ChannelGroup.CanBlock"/>). Confirmation simple, même patron
+    /// que l'avertissement Explorer (<see cref="OnPivotSelectionChanged"/>) :
+    /// action irréversible visuellement (le channel disparaît du catalogue),
+    /// même si le blocage reste réversible depuis « Channels bloqués ».
+    /// </summary>
+    private async void OnBlockClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is not FrameworkElement { DataContext: ChannelGroup group })
+        {
+            return;
+        }
+
+        var dialog = new ContentDialog
+        {
+            Title = "Bloquer ce channel ?",
+            Content = $"« {group.DisplayName} » disparaîtra du catalogue. Réversible depuis « Channels bloqués ».",
+            PrimaryButtonText = "Bloquer",
+            CloseButtonText = "Annuler",
+            DefaultButton = ContentDialogButton.Close,
+            XamlRoot = Content.XamlRoot,
+        };
+
+        var result = await dialog.ShowAsync();
+        if (result == ContentDialogResult.Primary)
+        {
+            await Model.BlockChannelAsync(group.Issuer);
+        }
+    }
+
+    /// <summary>
+    /// Débloque un channel (bouton de la liste « Channels bloqués », voir
+    /// <see cref="NodeViewModel.BlockedChannels"/>). Même patron d'accès au
+    /// DataContext que <see cref="OnBlockClick"/>.
+    /// </summary>
+    private async void OnUnblockClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement { DataContext: BlockedChannel blocked })
+        {
+            await Model.UnblockChannelAsync(blocked.PeerId);
+        }
+    }
+
+    /// <summary>
     /// Bascule l'épinglage d'une publication. Même patron que
     /// <see cref="OnToggleSubscriptionClick"/> : le conteneur d'item du gabarit
     /// partagé pose le <see cref="CatalogCid"/> comme DataContext.

@@ -1,8 +1,9 @@
 {
-  "schema": "champinium-denylist/v1",
+  "schema": "champinium-denylist/v2",
   "name": "exemple-denylist-tierce",
   "issuer_pubkey": "REMPLACER_PAR_LA_CLE_PUBLIQUE_ED25519_BASE64",
   "updated": "2026-06-24T00:00:00Z",
   "entries": [],
+  "key_entries": [],
   "signature": null
 }

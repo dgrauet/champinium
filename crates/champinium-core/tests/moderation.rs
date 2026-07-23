@@ -14,7 +14,7 @@ const UPDATED: &str = "2026-06-24T00:00:00Z";
 /// Construit un moteur de modération bloquant `cids`, via une denylist signée.
 fn moderation_blocking(issuer_key: &std::path::Path, cids: &[cid::Cid]) -> Moderation {
     let issuer = load_or_generate(issuer_key).unwrap();
-    let dl = Denylist::build_signed("test", UPDATED, &issuer, cids).unwrap();
+    let dl = Denylist::build_signed("test", UPDATED, &issuer, cids, &[]).unwrap();
     let mut m = Moderation::empty();
     m.subscribe(&dl).unwrap();
     m
@@ -113,7 +113,7 @@ async fn runtime_subscription_blocks_and_purges_existing_block() {
 
     // Souscription à chaud d'une denylist qui couvre ce CID.
     let issuer = load_or_generate(dir.path().join("issuer.key")).unwrap();
-    let dl = Denylist::build_signed("test", UPDATED, &issuer, &[bad_cid]).unwrap();
+    let dl = Denylist::build_signed("test", UPDATED, &issuer, &[bad_cid], &[]).unwrap();
     let purged = node.subscribe_denylist(&dl).await.unwrap();
 
     assert_eq!(purged, 1, "le bloc désormais interdit doit être purgé");

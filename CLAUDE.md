@@ -278,21 +278,56 @@ sur deux machines physiques.
   l'état de seed par channel (« à jour » / « seed en cours (x/y) ») et des
   actions pin/unpin. Spec :
   `~/Work/.superpowers/champinium/specs/2026-07-22-channels-subscriptions-design.md`.
-- **Restent** (issues) : IPNS durable (#21), channels lot (d) — blocage local
-  de channel, denylists par clé, agrégation des signalements par channel.
+- **Channels lot (d) ✔** — clôt la refonte channels. **Modération par clé
+  (denylist v2)** : `champinium-denylist/v2` gagne `key_entries` (PeerIds bannis
+  en entier — tout contenu de la clé refusé, quel que soit le CID), v1 (CIDs
+  seuls) **supprimé** (zéro-compat, comme le feed v3) ; les deux collections
+  signées indépendamment (préfixe-longueur), borne cumulée 65 536. Enforcement
+  par clé aux mêmes points : rejet du feed au catalogue, purge rétroactive à la
+  souscription (toute entrée déjà présente d'un émetteur banni, pas seulement
+  les clés de la liste souscrite), refus de `subscribe_channel` sur une clé
+  bannie (`Moderated`). **Nuance anti-censure fondatrice** : bannir une clé
+  bloque le contenu que **ce nœud a lui-même attribué** à l'émetteur — **aucune
+  liste de CIDs dérivée des feeds** n'est construite, car lister un CID ne
+  prouve pas sa propriété ; dériver un blocklist des feeds laisserait un émetteur
+  censurer le contenu d'un tiers en le listant avant de se faire bannir (censure
+  par injection). Invariant à préserver. **Blocage local de channel**
+  (`block_channel`/`unblock_channel`/`blocked_channels`, dotfile privé
+  `.blocked_channels`) : préférence **strictement locale et privée, aucun effet
+  réseau** (pas de rapport, pas de record) ; le channel disparaît des deux vues,
+  désabonnement inclus, et la **purge locale outrepasse les pins** (l'utilisateur
+  qui bloque efface tout, pins compris — contrairement à l'éviction de quota).
+  **Purge rétroactive étendue** (`purge_blocked_issuer`, partagée ban-clé +
+  blocage local) : catalogue + SeedIndex + blocs orphelins **+ `stop_providing`**
+  (retrait immédiat du provider record local — `libp2p-kad` 0.48 l'expose, pas
+  de repli TTL nécessaire ; les copies distantes déjà propagées expirent par leur
+  propre TTL). L'éviction de quota (lot c) n'appelle **pas** `stop_providing`
+  (stabilité de l'amortisseur) — la modération, si. **Signalements par channel**
+  (`report_counts_by_channel`, lecture seule) : jointure locale rapports×catalogue
+  → `(rapporteurs distincts cumulés, CIDs distincts signalés)` par émetteur, aide
+  les éditeurs de denylists à repérer un candidat `key_entries`, **aucun effet
+  automatique**. `fetch_hls(Seed)` entre désormais au SeedIndex. **Contrat FFI
+  v8** (`block_channel`/`unblock_channel`/`blocked_channels`). CLI : `block
+  <lien-ou-peerid>` / `unblock <peerid>` / `blocked` / `reports --by-channel`.
+  Les trois fronts ont l'action « Bloquer » (vue Explorer) + un volet « Channels
+  bloqués ». Spec :
+  `~/Work/.superpowers/champinium/specs/2026-07-22-channels-subscriptions-design.md`.
+- **Restent** (issues) : IPNS durable (#21). **La refonte channels (lots a–d)
+  est intégralement livrée.**
 
 Phasing : 0 (spike async FFI ✔ contrat) → **1 (P2P nu CLI ✔)** → **2 (modération ✔,
 feeds/gossipsub/catalogue ✔, ingestion ffmpeg ✔)** → **3 (contrat UniFFI v3 ✔,
 UI macOS compile ✔, critère MVP déroulé ✔)** → **4 (close : 3 fronts ✔, relay
 NAT ✔, seeding ✔, feed DHT ✔, fetch concurrent ✔, déploiement tiers documenté ✔ ;
 bitswap différé)** → 5 (en cours : peer scoring ✔, signalement P2P ✔, réplication
-mesurée ✔, recherche ✔ (#20), channels lot (a) identité ✔, lot (b) abonnements
-✔ et lot (c) seed proactif/quota/pins ✔ ; IPNS #21, channels lot (d) blocage
-local à venir). Voir le spec.
+mesurée ✔, recherche ✔ (#20) ; **refonte channels COMPLÈTE** — lot (a) identité
+✔, lot (b) abonnements ✔, lot (c) seed proactif/quota/pins ✔, lot (d) modération
+par clé + blocage local + signalements par channel ✔ ; reste IPNS #21). Voir le
+spec.
 
 **Dernière release : voir `.release-please-manifest.json` / CHANGELOG** —
 pas de version en dur ici, elle dérive (règle intendant DG006). Release-please
 gère le versionnement (`bump-minor-pre-major` actif :
 un breaking change bumpe la mineure tant qu'on est < 1.0.0 — la 1.0 sera un
 choix délibéré de stabilisation d'API). Versionnement du contrat FFI distinct :
-`CONTRACT_VERSION = 7` (voir `AGENTS.md`).
+`CONTRACT_VERSION = 8` (voir `AGENTS.md`).

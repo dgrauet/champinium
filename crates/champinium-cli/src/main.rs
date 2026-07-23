@@ -144,6 +144,19 @@ enum Cmd {
     },
     /// Liste les créateurs souscrits avec leurs liens.
     Subscriptions,
+    /// Bloque un créateur localement (par lien ou PeerId nu) — préférence
+    /// privée, jamais publiée.
+    Block {
+        /// Lien `champinium://channel/<peerid>` ou PeerId nu.
+        link_or_peerid: String,
+    },
+    /// Débloque un créateur bloqué localement.
+    Unblock {
+        /// PeerId du créateur.
+        peerid: String,
+    },
+    /// Liste les créateurs bloqués localement avec leurs liens.
+    Blocked,
     /// Affiche (et éventuellement définit) le quota de seed proactif.
     Quota {
         /// Nouveau quota en octets (sinon: affiche seulement l'état courant).
@@ -159,6 +172,14 @@ enum Cmd {
     Unpin {
         /// CID du manifeste.
         manifest_cid: String,
+    },
+    /// Affiche les signalements agrégés localement (matière première pour un
+    /// éditeur de denylist — aucun effet automatique).
+    Reports {
+        /// Regroupe par émetteur (jointure locale rapports × catalogue)
+        /// au lieu des compteurs globaux par CID.
+        #[arg(long)]
+        by_channel: bool,
     },
 }
 
@@ -376,6 +397,30 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Cmd::Block { link_or_peerid } => {
+            let issuer: PeerId =
+                channel_link::parse(&link_or_peerid).context("lien ou PeerId invalide")?;
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            node.block_channel(issuer).await?;
+            println!("bloqué: {}", channel_link::format(&issuer));
+        }
+        Cmd::Unblock { peerid } => {
+            let issuer: PeerId = peerid.parse().context("PeerId invalide")?;
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            node.unblock_channel(issuer)?;
+            println!("débloqué: {}", channel_link::format(&issuer));
+        }
+        Cmd::Blocked => {
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let blocked = node.blocked_channels();
+            if blocked.is_empty() {
+                println!("aucun channel bloqué");
+            } else {
+                for issuer in blocked {
+                    println!("{}", channel_link::format(&issuer));
+                }
+            }
+        }
         Cmd::Quota { set } => {
             let node = build_node(&cli.data_dir, &cli.denylist).await?;
             if let Some(bytes) = set {
@@ -395,6 +440,28 @@ async fn main() -> Result<()> {
             let node = build_node(&cli.data_dir, &cli.denylist).await?;
             node.unpin(manifest_cid)?;
             println!("épinglage retiré: {manifest_cid}");
+        }
+        Cmd::Reports { by_channel } => {
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            if by_channel {
+                let by_channel = node.report_counts_by_channel();
+                if by_channel.is_empty() {
+                    println!("aucun signalement attribuable à un émetteur connu");
+                } else {
+                    for (issuer, reporters, cids) in by_channel {
+                        println!("{issuer}: {reporters} rapporteur(s) distinct(s) / {cids} CID(s) signalé(s)");
+                    }
+                }
+            } else {
+                let counts = node.report_counts();
+                if counts.is_empty() {
+                    println!("aucun signalement");
+                } else {
+                    for (cid, reporters) in counts {
+                        println!("{cid}: {reporters} rapporteur(s) distinct(s)");
+                    }
+                }
+            }
         }
     }
     Ok(())

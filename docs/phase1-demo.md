@@ -33,6 +33,9 @@ cmp /tmp/media.bin /tmp/out.bin && echo "transfert P2P OK"
 
 `get` vérifie le CID du bloc reçu et le **remet en cache** (seed-what-you-consume) :
 B devient à son tour fournisseur.
+> Historique : jusqu'au lot (c) channels, `get` remettait systématiquement en
+> cache le bloc reçu (seed-what-you-consume) ; ce n'est plus le comportement
+> par défaut, voir [`docs/architecture.md`](architecture.md) §6.
 
 ## Lancer son propre nœud bootstrap (stateless)
 
