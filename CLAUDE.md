@@ -69,7 +69,7 @@ La suppression centrale est impossible par construction → modération côté n
 1. **Persistance** — contenu sans seeder disparaît. Mitigation : seed proactif
    des abonnés (chaque abonné retient et resert ce qu'il suit, sous quota) +
    pins (contenu propre auto-épinglé, plus tout manifeste épinglé manuellement) ;
-   cold storage (Filecoin/Arweave) documenté, non implémenté au pilot.
+   cold storage optionnel décidé (Arweave, payé par le créateur — ADR 0008), non implémenté au pilot.
 2. **Async FFI** — async/streams tokio → Swift ET C#. Mitigé par le spike Phase 0.
 3. **Modération décentralisée** — deux checkpoints, denylists signées.
 4. **Recherche décentralisée non résolue** — tags DHT + index local ; limites assumées.

@@ -576,7 +576,7 @@ qui compte vit dans le réseau, chaque nœud n'en garde qu'une vue.
 | bitswap | différé (amont cassé ; le fetch multi-fournisseurs couvre le bénéfice pratique) — débloquable par un bump `multihash-codetable` côté beetswap | ADR 0006 |
 | IPNS | différé, adossé à bitswap (sa valeur = interop IPFS public) ; durabilité déjà couverte par le seed proactif des abonnés + les pins | ADR 0007 |
 | Recherche | locale (ce que le nœud a vu) + tags DHT ; pas d'index global — assumé | risque #4, §6 |
-| Persistance | seed proactif des abonnés (quota + éviction par réplication) + pins ; cold storage (Filecoin/Arweave) documenté non implémenté | risque #1 |
+| Persistance | seed proactif des abonnés (quota + éviction par réplication) + pins ; cold storage optionnel décidé ([ADR 0008](adr/0008-cold-storage-arweave.md)), non implémenté | risque #1 |
 | NAT | relay v2 + DCUtR testés ; relays multipliables | risque #6 |
 | Signature payante | palier gratuit livré ; notarisation/Authenticode différés | `packaging.md` |
 | Windows/C# | validé par CI ; pas de stack intendant | `.intendant.toml` |
