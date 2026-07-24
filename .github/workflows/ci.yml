@@ -73,6 +73,29 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  cold-storage:
+    name: cold storage (feature opt-in)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c  # stable branch
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
+      - name: Build core (--features cold-storage)
+        run: cargo build -p champinium-core --features cold-storage
+      - name: Build CLI (--features cold-storage)
+        run: cargo build -p champinium-cli --features cold-storage
+      - name: Clippy (--features cold-storage)
+        run: cargo clippy -p champinium-core -p champinium-cli --features cold-storage --all-targets -- -D warnings
+      # Le test d'archivage Arweave réel est `#[ignore]` (coûte de vrais AR) et
+      # gaté par CHAMPINIUM_ARWEAVE_IT — un `cargo test` normal ne le lance pas ;
+      # on n'exporte donc AUCUNE variable réseau ici. Le suite complète du core
+      # sous la feature couvre le fichier de test `coldstore` (mocks).
+      - name: Test core (--features cold-storage, mocks — pas de réseau)
+        run: cargo test -p champinium-core --features cold-storage
+
   linux-gui:
     name: linux front (GTK4/GStreamer)
     runs-on: ubuntu-latest

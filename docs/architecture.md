@@ -355,6 +355,59 @@ le seed proactif des abonnés et les pins, pas sur la lecture.
   détecte l'incohérence d'intégrité et re-télécharge du réseau, ce qui répare
   le fichier.
 
+### Stockage froid : filet de dernier recours opt-in (ADR 0008, lot CS-a)
+
+Depuis le retrait de seed-what-you-consume, un contenu sans abonné disparaît
+quand son créateur s'éteint (choix assumé). Le **stockage froid** offre à un
+créateur qui tient à la pérennité de son contenu un filet **optionnel**, sans
+imposer de coût à personne ni composant central. Tout vit **derrière la feature
+cargo `cold-storage`**, absente des builds par défaut : aucune dépendance
+supplémentaire (`rsa`, `reqwest`) n'entre dans le graphe par défaut — la surface
+crypto reste hors de portée de `cargo deny` tant que la feature n'est pas
+activée, d'où l'absence d'ignore CVE.
+
+- **Trait `ColdStore`** (`retrieve`/`archive`/`price`/`balance`) — isole le
+  backend ; Filecoin pourra s'ajouter sans toucher au repli ni à l'archivage.
+  Seul backend aujourd'hui : `ArweaveColdStore` (module
+  [`coldstore/`](../crates/champinium-core/src/coldstore)).
+- **Signature de transaction hand-roll** (aucune lib Arweave, décision
+  supply-chain) : **deep-hash** (accumulateur SHA-384, transaction format 2)
+  produit les octets à signer ; signature **RSA-PSS** (SHA-256, longueur de sel
+  32, `BlindedSigningKey` *aveuglé* — mitigation Marvin) via `rsa` **0.10-rc**
+  (pré-release, contenue par le feature-gating, à repasser stable une fois
+  publiée) ; l'id de transaction est `SHA-256(signature)`. Le portefeuille JWK
+  est apporté par le créateur (chemin, permissions 0600) — champinium ne crée,
+  ne gère ni ne finance rien.
+- **Récupération = repli, jamais chemin principal.** Le seul point d'entrée est
+  `Node::get_with`, **uniquement quand le P2P conclut à `NoProviders`**. Tout
+  octet récupéré est **vérifié contre son CID** avant tout usage (une gateway
+  peut servir du silence, jamais du faux). Ensuite le flux normal reprend : la
+  politique `Seed`/`Stream` est inchangée (souscrit → le contenu ré-entre au
+  SeedIndex et **réamorce le réseau P2P** ; sinon lecture sans trace), et le
+  **checkpoint de modération #2 est inchangé** — l'archive ne contourne aucune
+  modération. Le repli est **débrayable** (dotfile `.cold_enabled`, actif par
+  défaut) : interroger une gateway par CID révèle à cette gateway l'intérêt de
+  l'IP pour ce CID — surface d'observation différente du P2P pur, documentée avec
+  la même franchise que l'observabilité DHT du suivi actif (§6).
+- **Archivage en deux temps, payé par le créateur.** `archive_publication`
+  calcule un **devis** (taille, coût estimé en AR, solde du portefeuille) ;
+  `confirm_archive` seul déclenche l'envoi — jamais automatique, jamais
+  silencieusement payant. Reçus locaux (`.archives`, purement informatifs).
+  **Forme par item-tx** : **une transaction Arweave par item** (manifeste HLS +
+  chaque segment), imposée par la récupération par CID (chaque CID doit être
+  adressable et vérifiable seul). Cela **s'écarte du §Archivage de la spec (« une
+  transaction/bundle ») à dessein** — le bundle empêcherait la vérification
+  d'un CID isolé au repli.
+- **Test d'intégration Arweave réel** : `#[ignore]` **et** gaté par
+  `CHAMPINIUM_ARWEAVE_IT=1` (+ `CHAMPINIUM_ARWEAVE_JWK`, JWK financé 0600) — il
+  coûte de vrais AR ; un `cargo test --features cold-storage` normal ne le lance
+  jamais. Le reste de la couverture (repli, deep-hash, RSA-PSS, devis) tourne
+  contre des mocks, sans réseau. Le job CI `cold-storage` build+clippy+teste la
+  feature **sans** aucune variable réseau (§10).
+- **CLI** (gatée par la feature `cold-storage` du CLI) : `archive`, `archives`,
+  `cold-retrieval`. Les fronts ×3 (bouton « Archiver », liste « mes archives »,
+  réglage du repli, contrat FFI v10) sont **hors périmètre CS-a** (lot CS-b).
+
 ## 7. Modération : le garde-fou obligatoire
 
 La suppression centrale est impossible par construction → la modération est
@@ -560,8 +613,11 @@ qui compte vit dans le réseau, chaque nœud n'en garde qu'une vue.
   (fmt+clippy strict+tests), `gen-swift`/`gen-csharp`, `macos-build`,
   `macos-app`.
 - **CI** ([`ci.yml`](../.github/workflows/ci.yml)) : commits conventionnels,
-  fmt, tests sur les 3 OS, + trois jobs de fronts (`linux-gui`, `macos-app`,
-  `windows-app`) — les fronts non compilables en local sont validés là.
+  fmt, `cargo-deny`, tests sur les 3 OS, + trois jobs de fronts (`linux-gui`,
+  `macos-app`, `windows-app`) — les fronts non compilables en local sont validés
+  là. Job `cold-storage` : build+clippy+test de la feature opt-in
+  `cold-storage` (cœur **et** CLI), **sans** variable réseau — l'IT Arweave réel
+  reste `#[ignore]`+env-gaté et n'y tourne jamais (§6, ADR 0008).
 - **Releases** : release-please (pré-1.0 : un breaking change bumpe la
   **mineure**) ; à chaque release publiée, le workflow
   [`release-artifacts.yml`](../.github/workflows/release-artifacts.yml)
@@ -576,7 +632,7 @@ qui compte vit dans le réseau, chaque nœud n'en garde qu'une vue.
 | bitswap | différé (amont cassé ; le fetch multi-fournisseurs couvre le bénéfice pratique) — débloquable par un bump `multihash-codetable` côté beetswap | ADR 0006 |
 | IPNS | différé, adossé à bitswap (sa valeur = interop IPFS public) ; durabilité déjà couverte par le seed proactif des abonnés + les pins | ADR 0007 |
 | Recherche | locale (ce que le nœud a vu) + tags DHT ; pas d'index global — assumé | risque #4, §6 |
-| Persistance | seed proactif des abonnés (quota + éviction par réplication) + pins ; cold storage optionnel décidé ([ADR 0008](adr/0008-cold-storage-arweave.md)), non implémenté | risque #1 |
+| Persistance | seed proactif des abonnés (quota + éviction par réplication) + pins ; cold storage Arweave opt-in **livré** cœur+CLI (CS-a, feature `cold-storage`) — repli de dernier recours CID-vérifié ([ADR 0008](adr/0008-cold-storage-arweave.md)) ; fronts (CS-b) à faire | risque #1, §6 |
 | NAT | relay v2 + DCUtR testés ; relays multipliables | risque #6 |
 | Signature payante | palier gratuit livré ; notarisation/Authenticode différés | `packaging.md` |
 | Windows/C# | validé par CI ; pas de stack intendant | `.intendant.toml` |
@@ -588,7 +644,8 @@ qui compte vit dans le réseau, chaque nœud n'en garde qu'une vue.
 - [`CLAUDE.md`](../CLAUDE.md) — principes + état d'avancement (source de vérité).
 - [`AGENTS.md`](../AGENTS.md) — contrat FFI (tableau v8) + garde-fous d'équipe.
 - [`docs/adr/`](adr/) — décisions : libp2p vs iroh (0001), modération côté
-  nœud (0002), feeds signés (0003), transport de blocs (0006), IPNS (0007)…
+  nœud (0002), feeds signés (0003), transport de blocs (0006), IPNS (0007),
+  stockage froid Arweave (0008)…
 - [`docs/mvp-demo.md`](mvp-demo.md) / [`docs/gui-demo.md`](gui-demo.md) —
   démos de bout en bout (CLI validée ; GUI deux machines à dérouler).
 - [`docs/deploy-bootstrap-relay.md`](deploy-bootstrap-relay.md) — opérer

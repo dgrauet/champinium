@@ -1,8 +1,29 @@
 # 0008 — Stockage froid optionnel : Arweave, payé par le créateur, découverte par tags CID
 
-- Statut : accepté (design validé — **implémentation différée**, lots CS-a/CS-b
-  non lancés)
-- Date : 2026-07-23
+- Statut : accepté — **lot CS-a implémenté** (voir note de statut ci-dessous) ;
+  lot CS-b (fronts, contrat FFI v10) non lancé
+- Date : 2026-07-23 (note de statut : 2026-07-24)
+
+> **Note de statut — CS-a implémenté (2026-07-24).** Le cœur et la CLI livrent
+> le stockage froid derrière la feature cargo opt-in **`cold-storage`** (absente
+> des builds par défaut ; aucune dépendance crypto/HTTP dans le graphe par
+> défaut, d'où l'absence d'ignore CVE dans `deny.toml`) : trait `ColdStore` +
+> backend `ArweaveColdStore` (signature hand-roll deep-hash + RSA-PSS), repli
+> CID-vérifié dans `Node::get_with` (débrayable), archivage devis→confirmation
+> payé par le créateur, CLI `archive`/`archives`/`cold-retrieval`, test
+> d'intégration Arweave réel `#[ignore]`+env-gaté (`CHAMPINIUM_ARWEAVE_IT`).
+> Réserves à reprendre :
+> - **`rsa` 0.10-rc** : dépendance de signature en **pré-release** (contenue par
+>   le feature-gating) — à repasser sur une version stable dès sa publication.
+> - **Upload inline** : la transaction est POSTée en une fois (`POST /tx`, data
+>   inline dans la transaction format 2) — suffisant pour manifeste et petits
+>   segments, mais **l'upload chunké (`/chunk`) reste à faire pour la vidéo**
+>   (segments au-delà de la limite inline d'Arweave).
+> - **Forme par item-tx** : **une transaction par item** (manifeste + chaque
+>   segment), et non « une transaction/bundle » comme l'écrit la décision §3
+>   ci-dessous. C'est **imposé par la récupération par CID** (§5 : chaque octet
+>   récupéré est vérifié seul contre son CID) — écart délibéré et correct ; la
+>   décision §3 est à lire à travers cette note.
 
 ## Contexte
 
