@@ -79,6 +79,9 @@ struct ContentView: View {
                 channelPreviewSheet(channelPreview)
             }
         }
+        .onOpenURL { url in
+            Task { await openChannelLink(url) }
+        }
     }
 
     /// Feuille d'aperçu d'un channel résolu par lien/PeerId (pas encore
@@ -487,6 +490,14 @@ struct ContentView: View {
         } catch {
             subscriptionStatus = describeSubscriptionError(error)
         }
+    }
+
+    /// Lien `champinium://` reçu de l'OS (clic hors de l'app). Réutilise
+    /// exactement le chemin du coller-lien — donc mêmes états de chargement,
+    /// même feuille d'aperçu, mêmes messages d'erreur. Ne s'abonne JAMAIS.
+    private func openChannelLink(_ url: URL) async {
+        channelLinkField = url.absoluteString
+        await previewByLink()
     }
 
     /// Résout l'aperçu du lien/PeerId collé (état de chargement pendant le
