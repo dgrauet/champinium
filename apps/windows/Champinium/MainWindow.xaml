@@ -165,6 +165,17 @@
                             <TextBlock Text="{Binding StorageStatsText, Mode=OneWay}"
                                        Style="{StaticResource CaptionTextBlockStyle}"
                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                            <!-- Récupération d'archive froide (CS-b, contrat v10) : repli
+                                 vers une gateway d'archive quand aucun pair ne fournit le
+                                 contenu, actif par défaut côté core. Setter du VM écrit vers
+                                 la FFI de manière SYNC (SetColdRetrieval, contrairement à
+                                 SetSeedQuota) sur bascule utilisateur uniquement. -->
+                            <ToggleSwitch Header="Récupération d'archive froide"
+                                          IsOn="{Binding ColdRetrievalEnabled, Mode=TwoWay}" />
+                            <TextBlock Text="Interroge une gateway d'archive par CID en dernier recours quand aucun pair ne fournit le contenu — révèle à la gateway l'intérêt de votre IP pour ce CID."
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                       TextWrapping="Wrap" />
                         </StackPanel>
                     </Flyout>
                 </Button.Flyout>
