@@ -30,11 +30,53 @@ const APP_ID: &str = "org.champinium.Linux";
 const EXPLORER_WARNING: &str =
     "Contenu non curé venant du réseau ouvert, filtré uniquement par les denylists.";
 
+/// Déclencheur d'aperçu enregistré par `build_ui` — rejoue le chemin du
+/// bouton « Aperçu » (spinner + résolution + feuille + erreurs compris).
+type LinkHandler = Box<dyn Fn(&str)>;
+
+thread_local! {
+    /// Déclencheur d'aperçu enregistré par `build_ui` — rejoue le chemin du
+    /// bouton « Aperçu » (spinner + résolution + feuille + erreurs compris).
+    static LINK_HANDLER: RefCell<Option<LinkHandler>> = const { RefCell::new(None) };
+    /// Lien reçu avant que l'UI/le nœud soient prêts (démarrage à froid).
+    static PENDING_LINK: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Envoie un lien au déclencheur d'aperçu s'il est prêt, sinon le met en
+/// attente (le nœud n'est pas encore ouvert au démarrage à froid).
+fn dispatch_link(uri: &str) {
+    let handled = LINK_HANDLER.with(|h| {
+        if let Some(handler) = h.borrow().as_ref() {
+            handler(uri);
+            true
+        } else {
+            false
+        }
+    });
+    if !handled {
+        PENDING_LINK.with(|p| *p.borrow_mut() = Some(uri.to_string()));
+    }
+}
+
 /// Point d'entrée de l'interface.
 pub fn run() {
     gstreamer::init().expect("initialisation GStreamer");
-    let app = Application::builder().application_id(APP_ID).build();
+    let app = Application::builder()
+        .application_id(APP_ID)
+        .flags(gtk::gio::ApplicationFlags::HANDLES_OPEN)
+        .build();
     app.connect_activate(build_ui);
+    // `open` remplace `activate` quand l'app est lancée avec des URI (lien
+    // champinium:// cliqué hors de l'app) : la fenêtre n'existe donc pas
+    // encore dans ce cas, il faut la construire avant de router le lien.
+    app.connect_open(|app, files, _hint| {
+        if app.windows().is_empty() {
+            build_ui(app);
+        }
+        if let Some(uri) = files.first().map(|f| f.uri().to_string()) {
+            dispatch_link(&uri);
+        }
+    });
     let _ = app.run();
 }
 
@@ -203,6 +245,8 @@ fn build_ui(app: &Application) {
         let subs_list = subs_list.clone();
         let explorer_list = explorer_list.clone();
         let search_entry = search_entry.clone();
+        let channel_entry = channel_entry.clone();
+        let preview_link_btn = preview_link_btn.clone();
         glib::spawn_future_local(async move {
             match open_node(&ui.rt).await {
                 Ok(node) => {
@@ -210,6 +254,20 @@ fn build_ui(app: &Application) {
                     let mut events = node.subscribe_catalog();
                     let mut seed_events = node.subscribe_seed();
                     *ui.node.borrow_mut() = Some(node);
+                    // Le nœud est prêt : router les liens champinium:// vers
+                    // le chemin du bouton « Aperçu » (rejoue spinner +
+                    // résolution + feuille + erreurs, aucune duplication),
+                    // puis consommer un éventuel lien reçu avant ce point
+                    // (démarrage à froid via `connect_open`).
+                    LINK_HANDLER.with(|h| {
+                        *h.borrow_mut() = Some(Box::new(move |uri: &str| {
+                            channel_entry.set_text(uri);
+                            preview_link_btn.emit_clicked();
+                        }));
+                    });
+                    if let Some(uri) = PENDING_LINK.with(|p| p.borrow_mut().take()) {
+                        dispatch_link(&uri);
+                    }
                     // Les primitives tokio::sync fonctionnent sur l'exécuteur
                     // glib : la boucle vit sur le thread GTK et peut toucher
                     // les widgets directement. Un abonné en retard (Lagged) a

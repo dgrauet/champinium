@@ -19,9 +19,10 @@ cat > "$PKG/champinium.desktop" <<DESKTOP
 Type=Application
 Name=Champinium
 Comment=Partage P2P décentralisé de contenu généré par IA
-Exec=champinium
+Exec=champinium %u
 Terminal=false
 Categories=AudioVideo;Network;
+MimeType=x-scheme-handler/champinium;
 DESKTOP
 
 cat > "$PKG/README" <<README
