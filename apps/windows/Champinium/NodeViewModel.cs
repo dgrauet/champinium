@@ -277,6 +277,14 @@ public sealed class NodeViewModel : INotifyPropertyChanged
             catch (Exception)
             {
                 SubscriptionStatus = "récupération d'archive froide: erreur";
+                // L'écriture core a échoué : `_coldRetrievalEnabled` n'a pas
+                // bougé, mais le ToggleSwitch affiche la valeur tentée par
+                // l'utilisateur. On re-notifie pour qu'il reprenne l'état réel
+                // (parité GTK/macOS ; sinon le désync est collant — la garde
+                // d'égalité de SetColdRetrievalState empêche RefreshCatalog de
+                // le corriger). Compte surtout côté vie privée : un OFF tenté
+                // ne doit pas s'afficher OFF si le repli reste actif.
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ColdRetrievalEnabled)));
             }
         }
     }
