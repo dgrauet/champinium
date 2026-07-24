@@ -20,7 +20,7 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
   capacité absente, ils **ouvrent une demande de changement de contrat** (voir
   protocole plus bas) — ils ne contournent pas via du code natif ad hoc.
 
-### Contrat actuel — v9 (`CONTRACT_VERSION = 9`)
+### Contrat actuel — v10 (`CONTRACT_VERSION = 10`)
 
 > v1 → v2 : ajout de `subscribe_denylist(json) -> u64` sur `ChampiniumNode`
 > (modération fédérée activable depuis les fronts). Purement additif.
@@ -97,6 +97,16 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
 > `blocked = true`). Record `FfiChannelPreview { peer_id, name, description,
 > avatar_cid, items, subscribed, blocked }` (identité de channel aplatie,
 > comme `FfiCatalogEntry`). Purement additif.
+>
+> v9 → v10 : **débrayage du repli de récupération froide** (lot CS-b).
+> `cold_retrieval_enabled() -> bool` (sync — le repli froid est-il actif ?
+> défaut vrai) et `set_cold_retrieval(enabled)` (sync — persiste le choix dans
+> le dotfile `.cold_enabled`). **Exposées inconditionnellement** : la surface
+> est identique que le binaire soit compilé avec la feature cargo
+> `cold-storage` ou non (le réglage est un booléen persisté ; seul l'effet
+> réseau réel — l'appel à une gateway d'archive — dépend de la feature). Les
+> fronts affichent une case « Récupération d'archive froide » dans les réglages
+> de seed. Purement additif.
 
 Fonctions libres (smoke test async, conservées de v0) :
 
@@ -140,6 +150,8 @@ Objet **`ChampiniumNode`** (méthodes) :
 | `unblock_channel(peer_id) -> ()` | **async** | débloque un émetteur ; rien de retéléchargé automatiquement |
 | `blocked_channels() -> Vec<String>` | sync | channels bloqués localement (PeerIds triés) |
 | `resolve_channel(link_or_peer_id) -> FfiChannelPreview` | **async** | aperçu d'un channel par lien ou PeerId nu (catalogue d'abord, sinon DHT) |
+| `cold_retrieval_enabled() -> bool` | sync | le repli de récupération froide est-il actif ? (défaut vrai, persisté) |
+| `set_cold_retrieval(enabled) -> ()` | sync | débraye le repli froid, persiste (`.cold_enabled`) ; surface identique avec ou sans la feature `cold-storage` |
 
 Records `FfiCatalogEntry { issuer, seq, cids, items, channel, seeded_count,
 total_count, pinned }`, `FfiContentItem { cid, title, tags }`,
