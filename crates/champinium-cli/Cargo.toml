@@ -7,8 +7,13 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+# Archivage Arweave (ADR 0008) — opt-in : garde `rsa`/`reqwest` hors du build
+# et de la résolution de dépendances par défaut (cf. Tâche 1, champinium-core).
+cold-storage = ["champinium-core/cold-storage"]
+
 [dependencies]
-champinium-core = { workspace = true, features = ["cold-storage"] }
+champinium-core.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "fs"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"

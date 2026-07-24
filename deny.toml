@@ -11,13 +11,6 @@ ignore = [
     # paste n'est plus maintenu ; dépendance transitive (uniffi, gtk4-rs macros),
     # aucun remplacement possible de notre côté.
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained — transitif via uniffi/gtk4-rs" },
-    # rsa (attaque Marvin) : l'avis amont a `patched = []` (jamais mis à jour)
-    # bien que la ligne 0.10.0-rc utilisée ici porte la mitigation
-    # (BlindedSigningKey) — voir .superpowers/sdd/coldstore-decision.md
-    # (addendum Tâche 4). Dépendance de `champinium-core` (feature
-    # `cold-storage`, signature de transaction Arweave), désormais résolue par
-    # défaut via `champinium-cli` (Tâche 5, CS-a).
-    { id = "RUSTSEC-2023-0071", reason = "rsa 0.10.0-rc porte déjà la mitigation Marvin (BlindedSigningKey) ; avis amont non mis à jour, cf. coldstore-decision.md" },
 ]
 
 [licenses]

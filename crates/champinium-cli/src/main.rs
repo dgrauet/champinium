@@ -183,6 +183,7 @@ enum Cmd {
     },
     /// Archive une publication sur Arweave (devis puis confirmation) — repli
     /// froid, ADR 0008. Nécessite un portefeuille Arweave (JWK, 0600).
+    #[cfg(feature = "cold-storage")]
     Archive {
         /// CID du manifeste HLS à archiver.
         manifest_cid: String,
@@ -197,9 +198,11 @@ enum Cmd {
         yes: bool,
     },
     /// Liste les reçus d'archivage locaux (purement informatifs).
+    #[cfg(feature = "cold-storage")]
     Archives,
     /// Affiche (et éventuellement définit) le débrayage du repli de
     /// récupération froid.
+    #[cfg(feature = "cold-storage")]
     ColdRetrieval {
         /// `on` ou `off`.
         #[arg(long)]
@@ -487,6 +490,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        #[cfg(feature = "cold-storage")]
         Cmd::Archive {
             manifest_cid,
             wallet,
@@ -501,7 +505,7 @@ async fn main() -> Result<()> {
                 std::sync::Arc::new(champinium_core::coldstore::arweave::ArweaveColdStore::new(
                     gateway,
                 ));
-            let node = node.with_cold_and_wallet_for_tests(cold, wallet);
+            let node = node.with_cold_store(cold, wallet);
 
             let quote = node.archive_publication(manifest_cid).await?;
             println!("manifeste: {}", quote.manifest_cid);
@@ -525,6 +529,7 @@ async fn main() -> Result<()> {
             let receipt = node.confirm_archive(&quote).await?;
             println!("archivé — tx: {}", receipt.tx_id);
         }
+        #[cfg(feature = "cold-storage")]
         Cmd::Archives => {
             let receipts =
                 champinium_core::coldstore::receipts::load_receipts(&cli.data_dir.join("blocks"));
@@ -539,6 +544,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        #[cfg(feature = "cold-storage")]
         Cmd::ColdRetrieval { set } => {
             let node = build_node(&cli.data_dir, &cli.denylist).await?;
             if let Some(value) = set {
@@ -562,6 +568,7 @@ async fn main() -> Result<()> {
 
 /// Demande une confirmation interactive (ligne lue sur stdin) ; `o`/`oui`/`y`
 /// (insensible à la casse) valent confirmation, tout le reste = refus.
+#[cfg(feature = "cold-storage")]
 fn prompt_confirm(prompt: &str) -> Result<bool> {
     use std::io::Write as _;
     print!("{prompt}");

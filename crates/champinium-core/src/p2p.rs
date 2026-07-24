@@ -1896,13 +1896,14 @@ impl Node {
         self.get_with(cid, policy).await
     }
 
-    /// Injecte un backend [`ColdStore`] **et** un portefeuille Arweave
-    /// (tests/configuration) : comme `with_cold_for_tests`, le câblage de
-    /// production (config utilisateur) est un suivi ultérieur (lot CS-b) — cette
-    /// tâche prouve le devis + l'archivage avec des dépendances injectées.
+    /// Configure un backend [`ColdStore`] **et** un portefeuille Arweave —
+    /// point d'entrée public pour l'archivage (`archive_publication` /
+    /// `confirm_archive`), utilisé par la CLI (`archive`) et tout appelant de
+    /// production. Le choix du backend concret (`ArweaveColdStore` + config
+    /// de gateways) reste à la charge de l'appelant (lot CS-b pour une
+    /// config utilisateur persistée).
     #[cfg(feature = "cold-storage")]
-    #[doc(hidden)]
-    pub fn with_cold_and_wallet_for_tests(
+    pub fn with_cold_store(
         &self,
         cold: Arc<dyn ColdStore>,
         wallet: crate::coldstore::ArweaveWallet,
@@ -1911,6 +1912,18 @@ impl Node {
         node.cold = Some(cold);
         node.wallet = Some(wallet);
         node
+    }
+
+    /// Alias de test historique de [`Node::with_cold_store`] — conservé pour
+    /// ne pas toucher aux tests d'intégration (tâche 4) qui l'appellent déjà.
+    #[cfg(feature = "cold-storage")]
+    #[doc(hidden)]
+    pub fn with_cold_and_wallet_for_tests(
+        &self,
+        cold: Arc<dyn ColdStore>,
+        wallet: crate::coldstore::ArweaveWallet,
+    ) -> Self {
+        self.with_cold_store(cold, wallet)
     }
 
     /// Rassemble les octets d'une publication (manifeste + tous ses segments)
