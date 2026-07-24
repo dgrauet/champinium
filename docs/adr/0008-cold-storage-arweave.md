@@ -1,9 +1,10 @@
 # 0008 — Stockage froid optionnel : Arweave, payé par le créateur, découverte par tags CID
 
 - Statut : accepté — **lot CS-a livré en récupération/repli seule** ;
-  **archivage différé d'implémentation** (voir note de statut) ; lot CS-b
-  (fronts, contrat FFI v10) non lancé
-- Date : 2026-07-23 (note de statut : 2026-07-24)
+  **archivage différé d'implémentation** (voir note de statut) ; **lot CS-b —
+  réglage de repli livré sur les 3 fronts (contrat FFI v10)**, UI d'archivage
+  différée avec l'archivage
+- Date : 2026-07-23 (notes de statut : 2026-07-24)
 
 > **Note de statut — CS-a livré : récupération/repli uniquement, archivage
 > différé (2026-07-24).** Le cœur et la CLI livrent le **repli de récupération**
@@ -111,9 +112,16 @@ position.
   faute de crate `rsa` sans CVE (voir la note de statut) ; à reprendre quand la
   voie de signature sans CVE existe, en tranchant alors : lib Rust Arweave
   maintenue vs implémentation directe du format de transaction.
-- **CS-b — fronts** : bouton « Archiver » (dialogue de devis), liste « mes
-  archives » (reçus locaux `.archives`, statut de confirmation re-interrogé à
-  la demande — pas de démon), réglage du repli. Contrat FFI v10.
+- **CS-b — fronts** : **réglage du repli livré** (2026-07-24) — case
+  « Récupération d'archive froide » dans les réglages de seed des 3 fronts,
+  adossée aux méthodes FFI `cold_retrieval_enabled()` / `set_cold_retrieval
+  (enabled)` (**contrat v10**, exposées inconditionnellement : même surface avec
+  ou sans la feature `cold-storage`, seul l'effet réseau dépend de la feature ;
+  `open_node` câble un `ArweaveColdStore` par défaut sous la feature). **Reste
+  différé avec l'archivage** : bouton « Archiver » (dialogue de devis), liste
+  « mes archives » (reçus locaux `.archives`, statut re-interrogé à la demande —
+  pas de démon). Config UI des gateways non retenue (YAGNI — gateways par défaut
+  en dur).
 
 ## Références
 

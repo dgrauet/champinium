@@ -385,7 +385,15 @@ préexistants bincode/paste). Livré :
   est vulnérable (0.9 stable sans mitigation, 0.10 en pré-release). Aucune API
   d'archivage, aucun reçu, aucun portefeuille dans le code. À reprendre dès
   `rsa 0.10.0` stable ou une crate Arweave maintenue.
-- **CS-b hors périmètre** (fronts ×3 ; contrat FFI v10 ; Filecoin via le trait).
+- **CS-b — réglage sur les 3 fronts ✔** : le débrayage du repli froid est
+  exposé sur le FFI (`cold_retrieval_enabled()` / `set_cold_retrieval(enabled)`,
+  **contrat v10**, surface identique avec ou sans la feature — seul l'effet
+  réseau dépend de la feature) et affiché en case « Récupération d'archive
+  froide » dans les réglages de seed des 3 fronts (GTK/WinUI/macOS). `open_node`
+  câble un `ArweaveColdStore` par défaut (gateways `arweave.net` + `ar-io.net`)
+  sous la feature. **Reste hors périmètre CS-b** : l'UI d'archivage (bouton,
+  devis, « mes archives ») — différée avec l'archivage ; config UI des gateways ;
+  Filecoin via le trait.
 
 Phasing : 0 (spike async FFI ✔ contrat) → **1 (P2P nu CLI ✔)** → **2 (modération ✔,
 feeds/gossipsub/catalogue ✔, ingestion ffmpeg ✔)** → **3 (contrat UniFFI v3 ✔,
@@ -404,4 +412,4 @@ pas de version en dur ici, elle dérive (règle intendant DG006). Release-please
 gère le versionnement (`bump-minor-pre-major` actif :
 un breaking change bumpe la mineure tant qu'on est < 1.0.0 — la 1.0 sera un
 choix délibéré de stabilisation d'API). Versionnement du contrat FFI distinct :
-`CONTRACT_VERSION = 9` (voir `AGENTS.md`).
+`CONTRACT_VERSION = 10` (voir `AGENTS.md`).

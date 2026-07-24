@@ -250,6 +250,57 @@ public sealed class NodeViewModel : INotifyPropertyChanged
         set => Set(ref _quotaField, value);
     }
 
+    /// <summary>Repli de récupération d'archive froide (contrat v10, lot CS-b) —
+    /// interroge une gateway d'archive par CID en dernier recours quand aucun
+    /// pair ne fournit le contenu. Actif par défaut côté core. La FFI
+    /// <c>SetColdRetrieval</c> est SYNC (contrairement à <c>SetSeedQuota</c>) :
+    /// pas d'<c>await</c>. Le setter public sert exclusivement l'écriture
+    /// utilisateur (liaison <c>ToggleSwitch</c>) ; le peuplement initial passe
+    /// par <see cref="SetColdRetrievalState"/>, qui ne touche jamais la FFI —
+    /// garde-fou anti-ré-entrance (sinon `RefreshCatalog` relisant l'état
+    /// rappellerait `SetColdRetrieval` en boucle).</summary>
+    private bool _coldRetrievalEnabled;
+    public bool ColdRetrievalEnabled
+    {
+        get => _coldRetrievalEnabled;
+        set
+        {
+            if (_node is null || _coldRetrievalEnabled == value)
+            {
+                return;
+            }
+            try
+            {
+                _node.SetColdRetrieval(value);
+                SetColdRetrievalState(value);
+            }
+            catch (Exception)
+            {
+                SubscriptionStatus = "récupération d'archive froide: erreur";
+                // L'écriture core a échoué : `_coldRetrievalEnabled` n'a pas
+                // bougé, mais le ToggleSwitch affiche la valeur tentée par
+                // l'utilisateur. On re-notifie pour qu'il reprenne l'état réel
+                // (parité GTK/macOS ; sinon le désync est collant — la garde
+                // d'égalité de SetColdRetrievalState empêche RefreshCatalog de
+                // le corriger). Compte surtout côté vie privée : un OFF tenté
+                // ne doit pas s'afficher OFF si le repli reste actif.
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ColdRetrievalEnabled)));
+            }
+        }
+    }
+
+    /// <summary>Peuple <see cref="ColdRetrievalEnabled"/> sans écrire vers la FFI —
+    /// utilisé au démarrage/rafraîchissement pour refléter l'état du core.</summary>
+    private void SetColdRetrievalState(bool value)
+    {
+        if (_coldRetrievalEnabled == value)
+        {
+            return;
+        }
+        _coldRetrievalEnabled = value;
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ColdRetrievalEnabled)));
+    }
+
     /// <summary>Affichage humain de l'usage courant (liaison TextBlock du popover de réglages).</summary>
     public string StorageStatsText =>
         $"Utilisé : {GigabytesText(_storageStats.usedBytes)} Go / {GigabytesText(_storageStats.quotaBytes)} Go";
@@ -382,6 +433,7 @@ public sealed class NodeViewModel : INotifyPropertyChanged
         }
 
         SetStorageStats(_node.StorageStats());
+        SetColdRetrievalState(_node.ColdRetrievalEnabled());
         // Abonnements seul montre le pin : épingler un contenu hors abonnement
         // n'a pas de sens dans cette UI (même décision que le jumeau macOS).
         Fill(SubscribedGroups, _node.CatalogSubscribed(), showPin: true, showBlock: false);

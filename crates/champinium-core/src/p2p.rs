@@ -39,7 +39,6 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "cold-storage")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
@@ -301,7 +300,9 @@ pub struct Node {
     /// Débrayage du repli froid, persisté (dotfile `.cold_enabled`) — un
     /// utilisateur peut vouloir désactiver l'appel réseau au froid (coût,
     /// vie privée) sans recompiler. Défaut vrai (absent/corrompu → activé).
-    #[cfg(feature = "cold-storage")]
+    /// Ungaté (tâche CS-b 1, décision A) : le réglage est mémorisé quelle que
+    /// soit la feature de build, seul le repli réseau lui-même reste gaté
+    /// (`cold`, ci-dessus).
     cold_retrieval_enabled: Arc<AtomicBool>,
 }
 
@@ -522,8 +523,10 @@ impl Node {
         // activé si absent/corrompu, même patron que le profil de channel ou
         // l'index de seed — un dotfile illisible ne doit jamais empêcher le
         // démarrage du nœud). Aucun backend réel câblé ici : `cold` reste
-        // `None` tant qu'aucun appelant n'utilise `with_cold_for_tests`.
-        #[cfg(feature = "cold-storage")]
+        // `None` tant qu'aucun appelant n'utilise `with_cold_for_tests`. Le
+        // débrayage lui-même est ungaté (tâche CS-b 1) : le réglage se lit/
+        // s'écrit même dans un build par défaut, sans effet réseau sans la
+        // feature.
         let cold_retrieval_enabled = Arc::new(AtomicBool::new(load_cold_enabled(&blockstore)));
 
         Ok(Self {
@@ -546,7 +549,6 @@ impl Node {
             cmd_tx,
             #[cfg(feature = "cold-storage")]
             cold: None,
-            #[cfg(feature = "cold-storage")]
             cold_retrieval_enabled,
         })
     }
@@ -1846,7 +1848,6 @@ impl Node {
     /// (dotfile `.cold_enabled`, à côté des blocs). Débrayable sans
     /// recompiler : coût réseau/monétaire du froid, ou préférence de vie
     /// privée de l'utilisateur.
-    #[cfg(feature = "cold-storage")]
     pub fn set_cold_retrieval(&self, enabled: bool) -> CoreResult<()> {
         self.cold_retrieval_enabled
             .store(enabled, Ordering::Relaxed);
@@ -1854,7 +1855,6 @@ impl Node {
     }
 
     /// État courant du débrayage de repli froid (vrai par défaut).
-    #[cfg(feature = "cold-storage")]
     pub fn cold_retrieval_enabled(&self) -> bool {
         self.cold_retrieval_enabled.load(Ordering::Relaxed)
     }
@@ -1968,8 +1968,8 @@ fn save_subscriptions(blockstore: &Blockstore, subs: &BTreeSet<PeerId>) -> CoreR
 }
 
 /// Chemin du débrayage de repli froid persisté (CS-a tâche 3), à côté des
-/// blocs — même patron que `.subscriptions`/`.seed_quota`.
-#[cfg(feature = "cold-storage")]
+/// blocs — même patron que `.subscriptions`/`.seed_quota`. Ungaté (tâche
+/// CS-b 1) : le dotfile est lu/écrit quelle que soit la feature de build.
 fn cold_enabled_path(blockstore: &Blockstore) -> PathBuf {
     blockstore.root().join(".cold_enabled")
 }
@@ -1977,7 +1977,6 @@ fn cold_enabled_path(blockstore: &Blockstore) -> PathBuf {
 /// Charge le débrayage persisté (activé par défaut si absent/illisible — un
 /// dotfile corrompu ne doit pas empêcher le démarrage, ni couper silencieusement
 /// un repli que l'utilisateur attend).
-#[cfg(feature = "cold-storage")]
 fn load_cold_enabled(blockstore: &Blockstore) -> bool {
     std::fs::read_to_string(cold_enabled_path(blockstore))
         .ok()
@@ -1986,7 +1985,6 @@ fn load_cold_enabled(blockstore: &Blockstore) -> bool {
 }
 
 /// Persiste le débrayage de repli froid.
-#[cfg(feature = "cold-storage")]
 fn save_cold_enabled(blockstore: &Blockstore, enabled: bool) -> CoreResult<()> {
     std::fs::write(cold_enabled_path(blockstore), enabled.to_string())?;
     Ok(())
@@ -3810,5 +3808,23 @@ mod tests {
                 "aucun stockage sous {policy:?}"
             );
         }
+    }
+
+    /// Le débrayage de repli froid (tâche CS-b 1, décision A) est lisible/
+    /// modifiable et **persisté** même dans un build par défaut (sans la
+    /// feature `cold-storage`) — seul l'effet réseau du repli reste gaté, pas
+    /// le réglage lui-même.
+    #[tokio::test]
+    async fn cold_retrieval_toggle_persists_without_feature() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let node = Node::open(dir.path()).await.unwrap();
+            assert!(node.cold_retrieval_enabled(), "défaut = actif");
+            node.set_cold_retrieval(false).unwrap();
+            assert!(!node.cold_retrieval_enabled());
+        }
+        // Réouverture : le dotfile .cold_enabled doit relire false.
+        let node = Node::open(dir.path()).await.unwrap();
+        assert!(!node.cold_retrieval_enabled(), "persisté à la réouverture");
     }
 }

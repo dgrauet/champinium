@@ -235,6 +235,24 @@ struct ContentView: View {
             )
             .font(.caption)
             .foregroundStyle(.secondary)
+            Divider()
+            // Binding custom : le getter lit l'état peuplé par `refreshCatalog()`
+            // (jamais de write en retour), le setter est le seul chemin déclenchant
+            // `setColdRetrieval` — évite la réentrance write-on-load.
+            Toggle(
+                "Récupération d'archive froide",
+                isOn: Binding(
+                    get: { model.coldRetrievalEnabled },
+                    set: { newValue in Task { await setColdRetrieval(newValue) } }
+                )
+            )
+            Text(
+                "Interroge une gateway d'archive par CID en dernier recours quand aucun "
+                    + "pair ne fournit le contenu — révèle à la gateway l'intérêt de votre "
+                    + "IP pour ce CID."
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
         .padding()
         .frame(width: 260)
@@ -255,6 +273,14 @@ struct ContentView: View {
             subscriptionStatus = "quota mis à jour"
         } catch {
             subscriptionStatus = "quota: erreur"
+        }
+    }
+
+    private func setColdRetrieval(_ enabled: Bool) async {
+        do {
+            try await model.setColdRetrieval(enabled)
+        } catch {
+            subscriptionStatus = "récupération froide: erreur"
         }
     }
 

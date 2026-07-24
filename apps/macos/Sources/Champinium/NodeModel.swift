@@ -47,6 +47,7 @@ final class NodeModel: ObservableObject {
     @Published var blockedChannels: [String] = []
     @Published var searchHits: [FfiSearchHit] = []
     @Published var storageStats = FfiStorageStats(usedBytes: 0, quotaBytes: 0)
+    @Published var coldRetrievalEnabled: Bool = true
     @Published var player: AVPlayer?
 
     private var node: ChampiniumNode?
@@ -110,6 +111,7 @@ final class NodeModel: ObservableObject {
         subscriptions = Set(node?.subscriptions() ?? [])
         blockedChannels = node?.blockedChannels() ?? []
         storageStats = node?.storageStats() ?? FfiStorageStats(usedBytes: 0, quotaBytes: 0)
+        coldRetrievalEnabled = node?.coldRetrievalEnabled() ?? true
         status = "catalogue: \(entries.count) créateur(s)"
     }
 
@@ -118,6 +120,15 @@ final class NodeModel: ObservableObject {
         guard let node else { return }
         let bytes = UInt64(max(0, gigabytes) * 1_000_000_000)
         try await node.setSeedQuota(bytes: bytes)
+        refreshCatalog()
+    }
+
+    /// Active/désactive le repli de récupération en cold storage (Arweave).
+    /// Appel FFI synchrone (`try`, pas d'`await`) ; la méthode reste `async`
+    /// pour homogénéité avec le reste du wiring UI (voir `setSeedQuotaGB`).
+    func setColdRetrieval(_ enabled: Bool) async throws {
+        guard let node else { return }
+        try node.setColdRetrieval(enabled: enabled)
         refreshCatalog()
     }
 

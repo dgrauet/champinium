@@ -19,6 +19,7 @@ use gtk::prelude::*;
 use gtk::{
     Application, ApplicationWindow, Box as GtkBox, Button, ButtonsType, Entry, Label, ListBox,
     MessageDialog, Orientation, ResponseType, ScrolledWindow, Spinner, Stack, StackSwitcher,
+    Switch,
 };
 use tokio::runtime::Runtime;
 
@@ -888,14 +889,47 @@ fn open_seed_settings(ui: &Rc<Ui>, parent: &ApplicationWindow) {
     stats_label.set_xalign(0.0);
     stats_label.add_css_class("dim-label");
 
+    // Récupération d'archive froide (CS-b) : réglage sync, câblé directement
+    // dans le handler GTK (pas de runtime tokio — contrairement au quota
+    // ci-dessus, `cold_retrieval_enabled`/`set_cold_retrieval` sont sync).
+    const COLD_RETRIEVAL_HELP: &str =
+        "Interroge une gateway d'archive par CID en dernier recours quand aucun pair ne \
+         fournit le contenu — révèle à la gateway l'intérêt de votre IP pour ce CID.";
+    let cold_row = GtkBox::new(Orientation::Horizontal, 8);
+    let cold_label = Label::new(Some("Récupération d'archive froide"));
+    cold_label.set_xalign(0.0);
+    cold_label.set_hexpand(true);
+    cold_label.set_tooltip_text(Some(COLD_RETRIEVAL_HELP));
+    let cold_switch = Switch::new();
+    cold_switch.set_active(node.cold_retrieval_enabled());
+    cold_switch.set_tooltip_text(Some(COLD_RETRIEVAL_HELP));
+    cold_row.append(&cold_label);
+    cold_row.append(&cold_switch);
+
     let msg_label = Label::new(None);
     msg_label.set_xalign(0.0);
 
     content.append(&title);
     content.append(&quota_row);
     content.append(&stats_label);
+    content.append(&cold_row);
     content.append(&msg_label);
     win.set_child(Some(&content));
+
+    let cold_ui = ui.clone();
+    let cold_msg_label = msg_label.clone();
+    cold_switch.connect_state_set(move |_, is_active| {
+        let Some(node) = cold_ui.node.borrow().clone() else {
+            return glib::Propagation::Stop;
+        };
+        match node.set_cold_retrieval(is_active) {
+            Ok(()) => glib::Propagation::Proceed,
+            Err(e) => {
+                cold_msg_label.set_text(&describe_core_error(&e, "récupération froide"));
+                glib::Propagation::Stop
+            }
+        }
+    });
 
     let ui = ui.clone();
     save_btn.connect_clicked(move |_| {
