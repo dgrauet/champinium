@@ -6,6 +6,20 @@ versionnage : [SemVer](https://semver.org/lang/fr/). À partir de la 0.2.0, ce
 fichier est maintenu automatiquement par release-please (voir
 [ADR-0005](docs/adr/0005-release-please.md)).
 
+## [0.9.0](https://github.com/dgrauet/champinium/compare/v0.8.0...v0.9.0) (2026-07-24)
+
+
+### ⚠ BREAKING CHANGES
+
+* réglage de récupération froide sur les 3 fronts (contrat v10, lot CS-b) ([#64](https://github.com/dgrauet/champinium/issues/64))
+
+### Features
+
+* ouvrir les liens champinium:// d'un clic (partie B — enregistrement OS du scheme) ([#65](https://github.com/dgrauet/champinium/issues/65)) ([d86cdaf](https://github.com/dgrauet/champinium/commit/d86cdafb8f1254091c1e84f84b3f551d0a1306b0))
+* **packaging:** Flatpak fonctionnel du front Linux (H.264/AAC + icônes, CI verte) ([#58](https://github.com/dgrauet/champinium/issues/58)) ([27acd4a](https://github.com/dgrauet/champinium/commit/27acd4a516c1aa679e787a01f0cfce9997d51020))
+* réglage de récupération froide sur les 3 fronts (contrat v10, lot CS-b) ([#64](https://github.com/dgrauet/champinium/issues/64)) ([4c947a0](https://github.com/dgrauet/champinium/commit/4c947a0c9ab55b4ac194ef0765082d1ff6050f44))
+* stockage froid — récupération/repli Arweave (feature opt-in, archivage différé) ([#62](https://github.com/dgrauet/champinium/issues/62)) ([5e60433](https://github.com/dgrauet/champinium/commit/5e604330c605d3c155a83f8d692ba9d37c87097d))
+
 ## [0.8.0](https://github.com/dgrauet/champinium/compare/v0.7.0...v0.8.0) (2026-07-23)
 
 
