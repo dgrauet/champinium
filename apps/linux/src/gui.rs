@@ -30,11 +30,68 @@ const APP_ID: &str = "org.champinium.Linux";
 const EXPLORER_WARNING: &str =
     "Contenu non curé venant du réseau ouvert, filtré uniquement par les denylists.";
 
+/// Déclencheur d'aperçu enregistré par `build_ui` — rejoue le chemin du
+/// bouton « Aperçu » (spinner + résolution + feuille + erreurs compris).
+type LinkHandler = Box<dyn Fn(&str)>;
+
+thread_local! {
+    /// Déclencheur d'aperçu enregistré par `build_ui` — rejoue le chemin du
+    /// bouton « Aperçu » (spinner + résolution + feuille + erreurs compris).
+    static LINK_HANDLER: RefCell<Option<LinkHandler>> = const { RefCell::new(None) };
+    /// Lien reçu avant que l'UI/le nœud soient prêts (démarrage à froid).
+    static PENDING_LINK: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Envoie un lien au déclencheur d'aperçu s'il est prêt, sinon le met en
+/// attente (le nœud n'est pas encore ouvert au démarrage à froid).
+fn dispatch_link(uri: &str) {
+    let handled = LINK_HANDLER.with(|h| {
+        if let Some(handler) = h.borrow().as_ref() {
+            handler(uri);
+            true
+        } else {
+            false
+        }
+    });
+    if !handled {
+        PENDING_LINK.with(|p| *p.borrow_mut() = Some(uri.to_string()));
+    }
+}
+
+/// Présente la fenêtre existante, ou la construit s'il n'y en a pas encore.
+/// Point de passage unique des deux entrées de lancement (`activate` et
+/// `open`) : jamais deux fenêtres, donc jamais deux nœuds sur le même dossier
+/// de données ; et un lancement à chaud remonte l'app au premier plan.
+fn present_or_build(app: &Application) {
+    match app.windows().first() {
+        Some(window) => window.present(),
+        None => build_ui(app),
+    }
+}
+
 /// Point d'entrée de l'interface.
 pub fn run() {
     gstreamer::init().expect("initialisation GStreamer");
-    let app = Application::builder().application_id(APP_ID).build();
-    app.connect_activate(build_ui);
+    let app = Application::builder()
+        .application_id(APP_ID)
+        .flags(gtk::gio::ApplicationFlags::HANDLES_OPEN)
+        .build();
+    // Instance unique — exigence de CORRECTION, pas de confort : GApplication
+    // transmet tout lancement ultérieur (y compris un simple clic sur l'entrée
+    // `.desktop`, sans URI) à l'instance primaire, qui rejouerait `build_ui`
+    // → deux fenêtres ET deux nœuds sur le MÊME dossier de données dans un
+    // seul process (identité Ed25519, blockstore, `.seed_index`, `seq` du
+    // feed). On présente donc la fenêtre existante au lieu d'en bâtir une 2e.
+    app.connect_activate(present_or_build);
+    // `open` remplace `activate` quand l'app est lancée avec des URI (lien
+    // champinium:// cliqué hors de l'app) : la fenêtre n'existe donc pas
+    // encore dans ce cas, il faut la construire avant de router le lien.
+    app.connect_open(|app, files, _hint| {
+        present_or_build(app);
+        if let Some(uri) = files.first().map(|f| f.uri().to_string()) {
+            dispatch_link(&uri);
+        }
+    });
     let _ = app.run();
 }
 
@@ -203,6 +260,8 @@ fn build_ui(app: &Application) {
         let subs_list = subs_list.clone();
         let explorer_list = explorer_list.clone();
         let search_entry = search_entry.clone();
+        let channel_entry = channel_entry.clone();
+        let preview_link_btn = preview_link_btn.clone();
         glib::spawn_future_local(async move {
             match open_node(&ui.rt).await {
                 Ok(node) => {
@@ -210,6 +269,20 @@ fn build_ui(app: &Application) {
                     let mut events = node.subscribe_catalog();
                     let mut seed_events = node.subscribe_seed();
                     *ui.node.borrow_mut() = Some(node);
+                    // Le nœud est prêt : router les liens champinium:// vers
+                    // le chemin du bouton « Aperçu » (rejoue spinner +
+                    // résolution + feuille + erreurs, aucune duplication),
+                    // puis consommer un éventuel lien reçu avant ce point
+                    // (démarrage à froid via `connect_open`).
+                    LINK_HANDLER.with(|h| {
+                        *h.borrow_mut() = Some(Box::new(move |uri: &str| {
+                            channel_entry.set_text(uri);
+                            preview_link_btn.emit_clicked();
+                        }));
+                    });
+                    if let Some(uri) = PENDING_LINK.with(|p| p.borrow_mut().take()) {
+                        dispatch_link(&uri);
+                    }
                     // Les primitives tokio::sync fonctionnent sur l'exécuteur
                     // glib : la boucle vit sur le thread GTK et peut toucher
                     // les widgets directement. Un abonné en retard (Lagged) a
@@ -244,7 +317,29 @@ fn build_ui(app: &Application) {
                         refresh_lists(&ui, &status, &subs_list, &explorer_list, &search_entry);
                     }
                 }
-                Err(e) => status.set_text(&format!("erreur d'ouverture : {e}")),
+                Err(e) => {
+                    status.set_text(&format!("erreur d'ouverture : {e}"));
+                    // Nœud non ouvert : sans déclencheur, les liens reçus
+                    // s'empileraient dans `PENDING_LINK` sans le moindre
+                    // retour à l'écran (et celui du démarrage à froid serait
+                    // perdu). On installe donc un déclencheur DÉGRADÉ : il
+                    // dépose le lien dans le champ de collage et le dit — le
+                    // bouton « Aperçu » le rejouera si le nœud s'ouvre.
+                    {
+                        let status = status.clone();
+                        LINK_HANDLER.with(|h| {
+                            *h.borrow_mut() = Some(Box::new(move |uri: &str| {
+                                channel_entry.set_text(uri);
+                                status.set_text(
+                                    "nœud non ouvert — lien conservé, réessayez avec « Aperçu »",
+                                );
+                            }));
+                        });
+                    }
+                    if let Some(uri) = PENDING_LINK.with(|p| p.borrow_mut().take()) {
+                        dispatch_link(&uri);
+                    }
+                }
             }
         });
     }

@@ -53,6 +53,12 @@ final class NodeModel: ObservableObject {
     private var node: ChampiniumNode?
     private var listener: CatalogListener?
     private var seedListener: SeedListener?
+
+    /// Résultat de `start()` une fois terminé (vrai = nœud ouvert), `nil` tant
+    /// qu'il tourne. Voir `waitUntilStarted()`.
+    private var startOutcome: Bool?
+    /// Attentes en cours sur la fin de `start()` (voir `waitUntilStarted()`).
+    private var startWaiters: [CheckedContinuation<Bool, Never>] = []
     /// Répertoire de la lecture en cours (supprimé au changement de contenu).
     private var currentPlayDir: String?
 
@@ -64,6 +70,11 @@ final class NodeModel: ObservableObject {
     /// Ouvre le nœud, commence à écouter et s'abonne aux mises à jour du
     /// catalogue (rafraîchissement réactif, pas de délai gossip codé en dur).
     func start() async {
+        // Signale la fin du démarrage, succès COMME échec — un lien reçu au
+        // lancement attend ce signal (voir `waitUntilStarted()`) et ne doit
+        // jamais attendre indéfiniment.
+        defer { finishStart() }
+
         // Purge les répertoires de lecture des exécutions précédentes (ils ne
         // servent qu'à la session en cours et s'accumuleraient sinon).
         try? FileManager.default.removeItem(atPath: playRoot)
@@ -88,6 +99,31 @@ final class NodeModel: ObservableObject {
             status = "nœud en ligne"
         } catch {
             status = "erreur d'ouverture: \(error)"
+        }
+    }
+
+    /// Attend la fin de `start()` et rend vrai si le nœud est ouvert.
+    /// `.onOpenURL` court contre `.task { start() }` (ouverture disque +
+    /// libp2p) : sans cette attente, un lien reçu au démarrage à froid partirait
+    /// sur un nœud nul et serait perdu. Le signal tombe sur les DEUX chemins de
+    /// `start()`, donc l'attente ne peut pas rester bloquée.
+    func waitUntilStarted() async -> Bool {
+        if let startOutcome {
+            return startOutcome
+        }
+        return await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    /// Débloque les attentes de `waitUntilStarted()` à la sortie de `start()`.
+    private func finishStart() {
+        let opened = node != nil
+        startOutcome = opened
+        let waiters = startWaiters
+        startWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume(returning: opened)
         }
     }
 

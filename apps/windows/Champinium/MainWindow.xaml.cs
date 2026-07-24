@@ -29,6 +29,18 @@ public sealed partial class MainWindow : Window
     /// refus de l'avertissement — évite de redéclencher le dialogue en boucle.</summary>
     private bool _revertingPivotSelection;
 
+    /// <summary>Achevé quand la grille racine est dans l'arbre visuel — donc
+    /// quand <c>Content.XamlRoot</c> est posé. Sans cette attente, un dialogue
+    /// ouvert juste après <c>Activate()</c> lèverait (XamlRoot null). Voir
+    /// <see cref="OpenChannelLinkAsync"/>.
+    ///
+    /// Nom à ne PAS reprendre à la légère : le compilateur XAML génère ses
+    /// propres membres dans <c>MainWindow.g.i.cs</c> (dont un champ
+    /// <c>_contentLoaded</c>, le drapeau d'<c>InitializeComponent</c>) sur la
+    /// même classe partielle — toute collision casse le build WinUI (CS0102).</summary>
+    private readonly TaskCompletionSource _xamlRootReady =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
     public MainWindow()
     {
         InitializeComponent();
@@ -37,11 +49,19 @@ public sealed partial class MainWindow : Window
         // `{Binding …}` du XAML (Binding classique intégral, voir plus haut).
         Root.DataContext = Model;
 
+        Root.Loaded += OnRootLoaded;
+
         // Quand un média est prêt, branche son playlist HLS sur le lecteur.
         Model.PlaybackReady += OnPlaybackReady;
 
         // Au lancement : openNode → listen (équivalent du .task macOS).
         DispatcherQueue.TryEnqueue(async () => await Model.StartAsync());
+    }
+
+    private void OnRootLoaded(object sender, RoutedEventArgs e)
+    {
+        Root.Loaded -= OnRootLoaded;
+        _xamlRootReady.TrySetResult();
     }
 
     private async void OnConnectClick(object sender, RoutedEventArgs e)
@@ -114,7 +134,52 @@ public sealed partial class MainWindow : Window
         var preview = await Model.PreviewByLinkAsync();
         if (preview is not null)
         {
-            await ShowChannelPreviewDialogAsync(preview);
+            // Échec d'affichage : le message est déjà posé dans
+            // `SubscriptionStatus` (voir ShowChannelPreviewDialogAsync).
+            _ = await ShowChannelPreviewDialogAsync(preview);
+        }
+    }
+
+    /// <summary>
+    /// Lien `champinium://` reçu de l'OS (clic depuis un navigateur). Réutilise
+    /// exactement le chemin du coller-lien : mêmes états de chargement, même
+    /// feuille d'aperçu, mêmes messages d'erreur. Ne s'abonne JAMAIS —
+    /// l'abonnement se décide depuis la feuille d'aperçu.
+    ///
+    /// Démarrage à froid : l'appel peut arriver avant que la fenêtre soit
+    /// chargée (XamlRoot null → ShowAsync lèverait) et avant que
+    /// <c>StartAsync</c> ait ouvert le nœud (résolution nulle en silence). On
+    /// attend donc les deux. Appelée depuis le thread UI (l'activation « app
+    /// déjà ouverte » y est remise par App.OnActivated) : les `await` sans
+    /// ConfigureAwait y reprennent la main, la suite reste sur le thread UI.
+    /// </summary>
+    public async Task OpenChannelLinkAsync(string uri)
+    {
+        await _xamlRootReady.Task;
+
+        if (!await Model.NodeReady)
+        {
+            // Nœud non ouvert (l'erreur est déjà affichée dans le statut) : on
+            // dépose le lien dans le champ de collage plutôt que de le perdre —
+            // le bouton « Aperçu » le rejouera.
+            Model.ChannelLinkField = uri;
+            return;
+        }
+
+        Model.ChannelLinkField = uri;
+        var preview = await Model.PreviewByLinkAsync();
+        if (preview is null)
+        {
+            return;
+        }
+
+        if (!await ShowChannelPreviewDialogAsync(preview))
+        {
+            // Feuille pas montrable (un ContentDialog est déjà ouvert — un seul
+            // à la fois par XamlRoot). On remet le lien dans le champ de collage
+            // — l'utilisateur rejoue « Aperçu » quand il a refermé le dialogue
+            // en cours.
+            Model.ChannelLinkField = uri;
         }
     }
 
@@ -125,8 +190,14 @@ public sealed partial class MainWindow : Window
     /// désabonner, ou aucun bouton (juste "Channel bloqué") si bloqué. Se
     /// ferme dans tous les cas après l'action — le <c>CatalogListener</c>
     /// existant rafraîchit les vues.
+    ///
+    /// Rend <c>false</c> si la feuille n'a PAS pu être affichée (un
+    /// <c>ContentDialog</c> est déjà ouvert — un seul à la fois par XamlRoot) ;
+    /// l'appelant décide alors quoi faire du lien. Seul <c>ShowAsync</c> est
+    /// gardé : un échec de l'abonnement qui suit doit rester visible (le VM le
+    /// pose dans <c>SubscriptionStatus</c>), pas être avalé ici.
     /// </summary>
-    private async Task ShowChannelPreviewDialogAsync(ChannelPreviewInfo preview)
+    private async Task<bool> ShowChannelPreviewDialogAsync(ChannelPreviewInfo preview)
     {
         var content = new StackPanel { Spacing = 8, Width = 320 };
 
@@ -193,11 +264,24 @@ public sealed partial class MainWindow : Window
             dialog.PrimaryButtonText = preview.Subscribed ? "Se désabonner" : "S'abonner";
         }
 
-        var result = await dialog.ShowAsync();
+        ContentDialogResult result;
+        try
+        {
+            result = await dialog.ShowAsync();
+        }
+        catch (Exception)
+        {
+            Model.ReportSubscriptionStatus(
+                "une autre fenêtre est déjà ouverte — refermez-la puis réessayez");
+            return false;
+        }
+
         if (result == ContentDialogResult.Primary)
         {
             await Model.ToggleSubscriptionAsync(preview.PeerId, preview.Subscribed);
         }
+
+        return true;
     }
 
     /// <summary>
