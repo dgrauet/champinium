@@ -139,9 +139,14 @@ modules:
         appstreamcli validate --no-net /app/share/metainfo/org.champinium.Champinium.metainfo.xml 2>&1 || true
         echo "===== DIAG compose --verbose (reproduit le file-read-error avec fname) ====="
         mkdir -p /tmp/ascr /tmp/ascd /tmp/asci
-        appstreamcli compose --verbose --result-root=/tmp/ascr \
+        appstreamcli compose --verbose --prefix=/ --result-root=/tmp/ascr \
           --data-dir=/tmp/ascd --icons-dir=/tmp/asci \
-          --origin=diag --components=org.champinium.Champinium /app 2>&1 | tail -60 || true
+          --origin=diag /app 2>&1 | tail -40 || true
+        echo "----- ISSUE REPORT FILES (contiennent le fname substitué) -----"
+        find /tmp/ascr /tmp/ascd -type f 2>/dev/null | head -20
+        for f in $(find /tmp/ascr /tmp/ascd -type f \( -name '*.yml' -o -name '*.yaml' -o -name '*.html' -o -name '*.xml' \) 2>/dev/null | head -5); do
+          echo "--- $f ---"; sed 's/<[^>]*>//g' "$f" | grep -viE '^\s*$' | head -40
+        done
         echo "===== DIAG END ====="
         true
     sources:
