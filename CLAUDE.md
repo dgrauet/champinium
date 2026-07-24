@@ -356,9 +356,11 @@ sur deux machines physiques.
 
 **Stockage froid CS-a ✔ (ADR 0008)** — filet de dernier recours contre la perte
 d'un contenu sans abonné, entièrement **derrière une feature cargo opt-in
-`cold-storage`** (absente des builds par défaut : ni `rsa`, ni `reqwest` tirés,
-`cargo deny` reste sans ignore CVE puisque la surface crypto n'entre pas dans le
-graphe par défaut). Livré :
+`cold-storage`** (absente des builds par défaut : ni `rsa`, ni `reqwest` tirés).
+La CI `cargo-deny` scanne toutefois `--all-features` : elle voit donc `rsa` et
+exige **un ignore documenté** pour RUSTSEC-2023-0071 (Marvin) — atténué car la
+signature est aveuglée (`BlindedSigningKey`) et la surface reste opt-in ; à
+repasser stable dès `rsa 0.10.0` (voir `deny.toml` et ADR 0008). Livré :
 - **Trait `ColdStore`** (`retrieve`/`archive`/`price`/`balance`), backend Arweave
   `ArweaveColdStore` (module `coldstore/`). Signature de transaction **hand-roll**
   (aucune lib Arweave) : **deep-hash** (SHA-384 en accumulateur, format 2) pour

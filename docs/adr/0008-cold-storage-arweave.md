@@ -6,15 +6,26 @@
 
 > **Note de statut — CS-a implémenté (2026-07-24).** Le cœur et la CLI livrent
 > le stockage froid derrière la feature cargo opt-in **`cold-storage`** (absente
-> des builds par défaut ; aucune dépendance crypto/HTTP dans le graphe par
-> défaut, d'où l'absence d'ignore CVE dans `deny.toml`) : trait `ColdStore` +
+> des builds par défaut : aucune dépendance crypto/HTTP dans le graphe par
+> défaut). La CI `cargo-deny` scanne `--all-features` : elle voit donc `rsa` et
+> exige **un ignore documenté** pour RUSTSEC-2023-0071 (Marvin), atténué par la
+> signature aveuglée `BlindedSigningKey` (voir `deny.toml`). Livré : trait `ColdStore` +
 > backend `ArweaveColdStore` (signature hand-roll deep-hash + RSA-PSS), repli
 > CID-vérifié dans `Node::get_with` (débrayable), archivage devis→confirmation
 > payé par le créateur, CLI `archive`/`archives`/`cold-retrieval`, test
 > d'intégration Arweave réel `#[ignore]`+env-gaté (`CHAMPINIUM_ARWEAVE_IT`).
 > Réserves à reprendre :
-> - **`rsa` 0.10-rc** : dépendance de signature en **pré-release** (contenue par
->   le feature-gating) — à repasser sur une version stable dès sa publication.
+> - **`rsa` 0.10-rc** : dépendance de signature en **pré-release** — stable 0.9
+>   vulnérable (RUSTSEC-2023-0071 Marvin), 0.10-rc mitigée par la signature
+>   aveuglée `BlindedSigningKey`. La CI `cargo-deny` (`--all-features`) exige un
+>   **ignore documenté** de cette advisory dans `deny.toml` ; à retirer/repasser
+>   stable dès `rsa 0.10.0`.
+> - **Paiement partiel non atomique** : `archive` téléverse une transaction par
+>   item ; si un `POST /tx` échoue au milieu, les items déjà téléversés sont
+>   **payés mais non enregistrés au reçu** (persisté en fin de boucle) — un
+>   ré-essai re-paierait les items déjà stockés (nouvel anchor → nouveaux
+>   tx id). Limitation connue de la forme par item-tx sans bundling ; à traiter
+>   avec le bundling/UX de CS-b.
 > - **Upload inline** : la transaction est POSTée en une fois (`POST /tx`, data
 >   inline dans la transaction format 2) — suffisant pour manifeste et petits
 >   segments, mais **l'upload chunké (`/chunk`) reste à faire pour la vidéo**

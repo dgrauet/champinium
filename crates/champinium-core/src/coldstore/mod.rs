@@ -19,10 +19,10 @@ use std::path::{Path, PathBuf};
 /// Contrat commun à tout backend de stockage froid (Arweave aujourd'hui,
 /// Filecoin envisageable plus tard sans toucher au reste — voir la spec).
 ///
-/// `retrieve`/`price`/`balance` sont pleinement implémentées par
-/// [`arweave::ArweaveColdStore`] dans cette tâche ; `archive` (signature et
-/// upload d'une transaction Arweave) est différée à la Tâche 4 du lot CS-a et
-/// renvoie une erreur explicite en attendant.
+/// `retrieve`/`price`/`balance`/`archive` sont toutes implémentées par
+/// [`arweave::ArweaveColdStore`]. `archive` signe (deep-hash + RSA-PSS aveuglé)
+/// et téléverse une transaction Arweave **par item** (manifeste + chaque
+/// segment), payée par le portefeuille du créateur.
 #[async_trait::async_trait]
 pub trait ColdStore: Send + Sync {
     /// Récupère les octets d'un CID depuis le filet d'archive, si présent.
