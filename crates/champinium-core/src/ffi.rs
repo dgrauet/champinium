@@ -165,6 +165,16 @@ pub struct ChampiniumNode {
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn open_node(data_dir: String) -> Result<Arc<ChampiniumNode>, FfiError> {
     let inner = Node::open(&PathBuf::from(data_dir)).await?;
+    // Backend de repli froid par défaut (ADR 0008, décision B tâche CS-b 1) :
+    // gateways codées en dur, aucune config UI. Aucun effet sans la feature
+    // `cold-storage` (le champ `cold` n'existe même pas dans la struct).
+    #[cfg(feature = "cold-storage")]
+    let inner = inner.with_cold_store(std::sync::Arc::new(
+        crate::coldstore::arweave::ArweaveColdStore::new(vec![
+            "https://arweave.net".to_string(),
+            "https://ar-io.net".to_string(),
+        ]),
+    ));
     Ok(Arc::new(ChampiniumNode { inner }))
 }
 
@@ -261,6 +271,19 @@ impl ChampiniumNode {
             description: m.description,
             avatar_cid: m.avatar_cid,
         }
+    }
+
+    /// Le repli de récupération froide est-il actif ? (persisté, actif par défaut)
+    pub fn cold_retrieval_enabled(&self) -> bool {
+        self.inner.cold_retrieval_enabled()
+    }
+
+    /// Active/désactive le repli de récupération froide (persisté). Sans effet
+    /// tant que le binaire n'est pas compilé avec la feature `cold-storage`,
+    /// mais le choix est mémorisé quoi qu'il arrive.
+    pub fn set_cold_retrieval(&self, enabled: bool) -> Result<(), FfiError> {
+        self.inner.set_cold_retrieval(enabled)?;
+        Ok(())
     }
 }
 
@@ -1117,6 +1140,20 @@ mod tests {
         let unknown = crate::PeerId::random();
         let result = node.resolve_channel(unknown.to_string()).await;
         assert!(matches!(result, Err(FfiError::NotFound { .. })));
+    }
+
+    /// Décision A (tâche CS-b 1) : la surface de bascule du repli froid
+    /// existe et fonctionne dans le build FFI par défaut, SANS la feature
+    /// `cold-storage` — même contrat quel que soit le build.
+    #[tokio::test]
+    async fn ffi_cold_retrieval_toggle_roundtrips_default_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = open_node(dir.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert!(node.cold_retrieval_enabled());
+        node.set_cold_retrieval(false).unwrap();
+        assert!(!node.cold_retrieval_enabled());
     }
 
     async fn ffmpeg_available() -> bool {
