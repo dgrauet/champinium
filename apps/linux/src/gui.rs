@@ -58,6 +58,17 @@ fn dispatch_link(uri: &str) {
     }
 }
 
+/// Présente la fenêtre existante, ou la construit s'il n'y en a pas encore.
+/// Point de passage unique des deux entrées de lancement (`activate` et
+/// `open`) : jamais deux fenêtres, donc jamais deux nœuds sur le même dossier
+/// de données ; et un lancement à chaud remonte l'app au premier plan.
+fn present_or_build(app: &Application) {
+    match app.windows().first() {
+        Some(window) => window.present(),
+        None => build_ui(app),
+    }
+}
+
 /// Point d'entrée de l'interface.
 pub fn run() {
     gstreamer::init().expect("initialisation GStreamer");
@@ -65,14 +76,18 @@ pub fn run() {
         .application_id(APP_ID)
         .flags(gtk::gio::ApplicationFlags::HANDLES_OPEN)
         .build();
-    app.connect_activate(build_ui);
+    // Instance unique — exigence de CORRECTION, pas de confort : GApplication
+    // transmet tout lancement ultérieur (y compris un simple clic sur l'entrée
+    // `.desktop`, sans URI) à l'instance primaire, qui rejouerait `build_ui`
+    // → deux fenêtres ET deux nœuds sur le MÊME dossier de données dans un
+    // seul process (identité Ed25519, blockstore, `.seed_index`, `seq` du
+    // feed). On présente donc la fenêtre existante au lieu d'en bâtir une 2e.
+    app.connect_activate(present_or_build);
     // `open` remplace `activate` quand l'app est lancée avec des URI (lien
     // champinium:// cliqué hors de l'app) : la fenêtre n'existe donc pas
     // encore dans ce cas, il faut la construire avant de router le lien.
     app.connect_open(|app, files, _hint| {
-        if app.windows().is_empty() {
-            build_ui(app);
-        }
+        present_or_build(app);
         if let Some(uri) = files.first().map(|f| f.uri().to_string()) {
             dispatch_link(&uri);
         }
@@ -302,7 +317,29 @@ fn build_ui(app: &Application) {
                         refresh_lists(&ui, &status, &subs_list, &explorer_list, &search_entry);
                     }
                 }
-                Err(e) => status.set_text(&format!("erreur d'ouverture : {e}")),
+                Err(e) => {
+                    status.set_text(&format!("erreur d'ouverture : {e}"));
+                    // Nœud non ouvert : sans déclencheur, les liens reçus
+                    // s'empileraient dans `PENDING_LINK` sans le moindre
+                    // retour à l'écran (et celui du démarrage à froid serait
+                    // perdu). On installe donc un déclencheur DÉGRADÉ : il
+                    // dépose le lien dans le champ de collage et le dit — le
+                    // bouton « Aperçu » le rejouera si le nœud s'ouvre.
+                    {
+                        let status = status.clone();
+                        LINK_HANDLER.with(|h| {
+                            *h.borrow_mut() = Some(Box::new(move |uri: &str| {
+                                channel_entry.set_text(uri);
+                                status.set_text(
+                                    "nœud non ouvert — lien conservé, réessayez avec « Aperçu »",
+                                );
+                            }));
+                        });
+                    }
+                    if let Some(uri) = PENDING_LINK.with(|p| p.borrow_mut().take()) {
+                        dispatch_link(&uri);
+                    }
+                }
             }
         });
     }

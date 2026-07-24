@@ -44,9 +44,13 @@ public partial class App : Application
             return;
         }
 
-        keyInstance.Activated += OnActivated;
-
+        // La fenêtre AVANT l'abonnement à `Activated` : `OnActivated` déréférence
+        // `_window` (null-conditionnel) et laisserait tomber l'activation en
+        // silence si elle arrivait d'abord. Or la construction de MainWindow
+        // (InitializeComponent → parse XAML) est justement la partie lente du
+        // démarrage, donc « lancer l'app puis cliquer un lien » tomberait dedans.
         _window = new MainWindow();
+        keyInstance.Activated += OnActivated;
         _window.Activate();
 
         // Lien ayant servi à lancer l'app (démarrage à froid).
@@ -124,6 +128,8 @@ public partial class App : Application
     /// <paramref name="coldStart"/> garde le dernier repli : la ligne de
     /// commande du PROCESS ne décrit que le lancement initial, la rejouer sur
     /// une activation ultérieure rouvrirait l'aperçu d'un lien périmé.
+    /// Toutes les sources passent par <see cref="AsChannelLink"/> : rien d'autre
+    /// qu'un `champinium://` n'atteint l'aperçu.
     /// </summary>
     private void HandleActivation(AppActivationArguments args, bool coldStart)
     {
@@ -132,7 +138,7 @@ public partial class App : Application
         if (args.Kind == ExtendedActivationKind.Protocol
             && args.Data is WinRtActivation.IProtocolActivatedEventArgs protocolArgs)
         {
-            uri = protocolArgs.Uri?.AbsoluteUri;
+            uri = AsChannelLink(protocolArgs.Uri?.AbsoluteUri);
         }
 
         if (uri is null)
@@ -141,8 +147,8 @@ public partial class App : Application
             // vient parfois d'une autre projection que l'interface attendue —
             // il expose quand même une propriété `Uri` (System.Uri des deux
             // côtés). On la lit sans dépendre du type exact.
-            uri = (args.Data?.GetType().GetProperty("Uri")?.GetValue(args.Data) as Uri)
-                ?.AbsoluteUri;
+            uri = AsChannelLink(
+                (args.Data?.GetType().GetProperty("Uri")?.GetValue(args.Data) as Uri)?.AbsoluteUri);
         }
 
         if (uri is null && args.Data is WinRtActivation.ILaunchActivatedEventArgs launchArgs)
@@ -169,7 +175,15 @@ public partial class App : Application
         (commandLine ?? "").Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
 
     private static string? FindLink(IEnumerable<string> tokens) =>
-        tokens
-            .Select(t => t.Trim('"'))
-            .FirstOrDefault(t => t.StartsWith("champinium://", StringComparison.OrdinalIgnoreCase));
+        tokens.Select(t => AsChannelLink(t.Trim('"'))).FirstOrDefault(t => t is not null);
+
+    /// <summary>Filtre commun à TOUTES les sources d'activation (args Protocol,
+    /// repli par réflexion, lignes de commande) : seul un lien `champinium://`
+    /// est routé vers l'aperçu — une activation d'un autre scheme ou un argument
+    /// quelconque est ignoré. La règle vit ici et nulle part ailleurs.</summary>
+    private static string? AsChannelLink(string? candidate) =>
+        candidate is not null
+        && candidate.StartsWith("champinium://", StringComparison.OrdinalIgnoreCase)
+            ? candidate
+            : null;
 }

@@ -495,8 +495,20 @@ struct ContentView: View {
     /// Lien `champinium://` reçu de l'OS (clic hors de l'app). Réutilise
     /// exactement le chemin du coller-lien — donc mêmes états de chargement,
     /// même feuille d'aperçu, mêmes messages d'erreur. Ne s'abonne JAMAIS.
+    ///
+    /// Démarrage à froid : `.onOpenURL` court contre `.task { model.start() }`,
+    /// qui fait de l'I/O disque puis libp2p — la résolution partirait sur un
+    /// nœud nul et le lien serait perdu en silence. On attend donc la fin du
+    /// démarrage (parité Linux/Windows).
     private func openChannelLink(_ url: URL) async {
+        let opened = await model.waitUntilStarted()
         channelLinkField = url.absoluteString
+        guard opened else {
+            // Nœud non ouvert (l'erreur est déjà dans `model.status`) : le lien
+            // reste dans le champ de collage plutôt que d'être perdu — le
+            // bouton « Aperçu » le rejouera.
+            return
+        }
         await previewByLink()
     }
 

@@ -181,8 +181,28 @@ liens ne fonctionnent pas.
 start champinium://channel/<peerid>
 ```
 
-Désenregistrement (manuel) : supprimer la clé
+Désenregistrement : l'inverse supporté de l'API d'enregistrement est
+`ActivationRegistrationManager.UnregisterForProtocolActivation("champinium", "")`
+(second paramètre = l'`exeName` passé à l'enregistrement, vide ici). Repli
+manuel si l'app n'est plus lançable : supprimer la clé
 `HKCU\Software\Classes\champinium`.
+
+**Dossier portable déplacé** : la clé pointe toujours sur l'**ancien** chemin
+tant que l'app n'a pas été lancée **une fois** depuis son nouvel emplacement
+(c'est ce lancement qui rejoue l'enregistrement idempotent). Un lien cliqué
+entre-temps échoue ou réveille l'ancienne copie si elle existe encore.
+
+**Limitation connue** — dans le mode de défaillance *unpackaged* de
+[microsoft-ui-xaml#9225](https://github.com/microsoft/microsoft-ui-xaml/issues/9225),
+une activation **à chaud** (app déjà ouverte) peut arriver **sans l'URI** :
+l'instance secondaire redirige ses arguments d'activation tels quels vers
+l'instance primaire, et sa propre ligne de commande — qui, elle, porte l'URI
+(`"%1"`) — n'est pas propagée. Le **scénario 2 ci-dessous (app déjà ouverte) est
+donc le test qui fait foi** sur Windows. Si le lien est effectivement perdu à
+chaud, le correctif est une passe de main hors bande de l'instance secondaire
+vers la primaire (fichier de dépôt lu par la primaire). Elle n'est **pas
+implémentée volontairement** : elle ajoute un canal latéral sur disque pour un
+mode de défaillance qui n'est pas encore confirmé sur cette version du SDK.
 
 ### Les trois scénarios à vérifier
 

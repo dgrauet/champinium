@@ -315,6 +315,12 @@ public sealed class NodeViewModel : INotifyPropertyChanged
         private set => Set(ref _subscriptionStatus, value);
     }
 
+    /// <summary>Pose un message d'état quand l'échec ne vient PAS du noyau mais
+    /// de la vue elle-même (feuille d'aperçu non affichable — voir
+    /// <c>MainWindow.ShowChannelPreviewDialogAsync</c>). Le setter reste privé :
+    /// tous les autres messages sont posés ici, par les appels au noyau.</summary>
+    public void ReportSubscriptionStatus(string message) => SubscriptionStatus = message;
+
     /// <summary>Vrai pendant la résolution d'un aperçu de channel (fetch réseau) —
     /// liaison du bouton "Aperçu" (désactivé) et de son spinner.</summary>
     private bool _isPreviewLoading;

@@ -32,8 +32,13 @@ public sealed partial class MainWindow : Window
     /// <summary>Achevé quand la grille racine est dans l'arbre visuel — donc
     /// quand <c>Content.XamlRoot</c> est posé. Sans cette attente, un dialogue
     /// ouvert juste après <c>Activate()</c> lèverait (XamlRoot null). Voir
-    /// <see cref="OpenChannelLinkAsync"/>.</summary>
-    private readonly TaskCompletionSource _contentLoaded =
+    /// <see cref="OpenChannelLinkAsync"/>.
+    ///
+    /// Nom à ne PAS reprendre à la légère : le compilateur XAML génère ses
+    /// propres membres dans <c>MainWindow.g.i.cs</c> (dont un champ
+    /// <c>_contentLoaded</c>, le drapeau d'<c>InitializeComponent</c>) sur la
+    /// même classe partielle — toute collision casse le build WinUI (CS0102).</summary>
+    private readonly TaskCompletionSource _xamlRootReady =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public MainWindow()
@@ -56,7 +61,7 @@ public sealed partial class MainWindow : Window
     private void OnRootLoaded(object sender, RoutedEventArgs e)
     {
         Root.Loaded -= OnRootLoaded;
-        _contentLoaded.TrySetResult();
+        _xamlRootReady.TrySetResult();
     }
 
     private async void OnConnectClick(object sender, RoutedEventArgs e)
@@ -129,7 +134,9 @@ public sealed partial class MainWindow : Window
         var preview = await Model.PreviewByLinkAsync();
         if (preview is not null)
         {
-            await ShowChannelPreviewDialogAsync(preview);
+            // Échec d'affichage : le message est déjà posé dans
+            // `SubscriptionStatus` (voir ShowChannelPreviewDialogAsync).
+            _ = await ShowChannelPreviewDialogAsync(preview);
         }
     }
 
@@ -148,7 +155,7 @@ public sealed partial class MainWindow : Window
     /// </summary>
     public async Task OpenChannelLinkAsync(string uri)
     {
-        await _contentLoaded.Task;
+        await _xamlRootReady.Task;
 
         if (!await Model.NodeReady)
         {
@@ -166,16 +173,12 @@ public sealed partial class MainWindow : Window
             return;
         }
 
-        try
+        if (!await ShowChannelPreviewDialogAsync(preview))
         {
-            await ShowChannelPreviewDialogAsync(preview);
-        }
-        catch (Exception)
-        {
-            // Un ContentDialog est déjà ouvert (un seul à la fois par XamlRoot) :
-            // l'appel vient de l'OS, personne n'observerait l'exception. On
-            // remet le lien dans le champ de collage — l'utilisateur rejoue
-            // « Aperçu » quand il a refermé le dialogue en cours.
+            // Feuille pas montrable (un ContentDialog est déjà ouvert — un seul
+            // à la fois par XamlRoot). On remet le lien dans le champ de collage
+            // — l'utilisateur rejoue « Aperçu » quand il a refermé le dialogue
+            // en cours.
             Model.ChannelLinkField = uri;
         }
     }
@@ -187,8 +190,14 @@ public sealed partial class MainWindow : Window
     /// désabonner, ou aucun bouton (juste "Channel bloqué") si bloqué. Se
     /// ferme dans tous les cas après l'action — le <c>CatalogListener</c>
     /// existant rafraîchit les vues.
+    ///
+    /// Rend <c>false</c> si la feuille n'a PAS pu être affichée (un
+    /// <c>ContentDialog</c> est déjà ouvert — un seul à la fois par XamlRoot) ;
+    /// l'appelant décide alors quoi faire du lien. Seul <c>ShowAsync</c> est
+    /// gardé : un échec de l'abonnement qui suit doit rester visible (le VM le
+    /// pose dans <c>SubscriptionStatus</c>), pas être avalé ici.
     /// </summary>
-    private async Task ShowChannelPreviewDialogAsync(ChannelPreviewInfo preview)
+    private async Task<bool> ShowChannelPreviewDialogAsync(ChannelPreviewInfo preview)
     {
         var content = new StackPanel { Spacing = 8, Width = 320 };
 
@@ -255,11 +264,24 @@ public sealed partial class MainWindow : Window
             dialog.PrimaryButtonText = preview.Subscribed ? "Se désabonner" : "S'abonner";
         }
 
-        var result = await dialog.ShowAsync();
+        ContentDialogResult result;
+        try
+        {
+            result = await dialog.ShowAsync();
+        }
+        catch (Exception)
+        {
+            Model.ReportSubscriptionStatus(
+                "une autre fenêtre est déjà ouverte — refermez-la puis réessayez");
+            return false;
+        }
+
         if (result == ContentDialogResult.Primary)
         {
             await Model.ToggleSubscriptionAsync(preview.PeerId, preview.Subscribed);
         }
+
+        return true;
     }
 
     /// <summary>
