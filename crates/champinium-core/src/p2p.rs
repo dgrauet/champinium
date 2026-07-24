@@ -13,7 +13,7 @@
 use crate::blockstore::Blockstore;
 use crate::catalog::{Catalog, CatalogEntry, CatalogItem};
 #[cfg(feature = "cold-storage")]
-use crate::coldstore::{ArchivePayload, ArchiveQuote, ArchiveReceipt, ColdStore};
+use crate::coldstore::ColdStore;
 use crate::content::{cid_for, verify};
 use crate::error::{CoreError, Result as CoreResult};
 use crate::feed::{ChannelMeta, Feed, FeedEntry};
@@ -303,13 +303,6 @@ pub struct Node {
     /// vie privée) sans recompiler. Défaut vrai (absent/corrompu → activé).
     #[cfg(feature = "cold-storage")]
     cold_retrieval_enabled: Arc<AtomicBool>,
-    /// Portefeuille Arweave (JWK, fourni par le créateur) utilisé pour signer
-    /// les transactions d'archivage — `None` par défaut : comme `cold`, aucun
-    /// câblage de production dans cette tâche, seule l'injection de test
-    /// (`with_cold_and_wallet_for_tests`) le peuple. L'archivage est réservé au
-    /// propre contenu du créateur et exige à la fois `cold` et `wallet`.
-    #[cfg(feature = "cold-storage")]
-    wallet: Option<crate::coldstore::ArweaveWallet>,
 }
 
 /// Aperçu d'un channel résolu par lien (spec 2026-07-23, partie A), voir
@@ -555,8 +548,6 @@ impl Node {
             cold: None,
             #[cfg(feature = "cold-storage")]
             cold_retrieval_enabled,
-            #[cfg(feature = "cold-storage")]
-            wallet: None,
         })
     }
 
@@ -1868,23 +1859,32 @@ impl Node {
         self.cold_retrieval_enabled.load(Ordering::Relaxed)
     }
 
-    /// Injecte un backend [`ColdStore`] (tests/configuration) : le câblage
-    /// d'un backend réel (`ArweaveColdStore`) est un détail de configuration
-    /// laissé à un suivi ultérieur — cette tâche prouve le repli avec un
-    /// backend injectable.
+    /// Configure le backend [`ColdStore`] de **repli de récupération** — point
+    /// d'entrée public pour câbler un `ArweaveColdStore` (ou tout autre backend
+    /// de récupération). Le choix du backend concret et de ses gateways reste à
+    /// la charge de l'appelant (lot CS-b pour une config utilisateur persistée).
+    /// L'archivage étant différé (voir [`crate::coldstore`]), aucun portefeuille
+    /// n'est requis : ce backend ne sert que `retrieve`.
     #[cfg(feature = "cold-storage")]
-    #[doc(hidden)]
-    pub fn with_cold_for_tests(&self, cold: Arc<dyn ColdStore>) -> Self {
+    pub fn with_cold_store(&self, cold: Arc<dyn ColdStore>) -> Self {
         let mut node = self.clone();
         node.cold = Some(cold);
         node
     }
 
+    /// Alias `#[doc(hidden)]` de [`Node::with_cold_store`] — conservé pour les
+    /// tests d'intégration du repli froid qui l'appellent déjà.
+    #[cfg(feature = "cold-storage")]
+    #[doc(hidden)]
+    pub fn with_cold_for_tests(&self, cold: Arc<dyn ColdStore>) -> Self {
+        self.with_cold_store(cold)
+    }
+
     /// Passerelle de test vers `get_with` : `StorePolicy` est `pub(crate)`
-    /// (interne au crate) et les tests d'intégration du repli froid (tâche 3)
-    /// vivent hors crate — ce point d'entrée `#[doc(hidden)]` expose le seul
-    /// comportement observable nécessaire (`seed: bool`) sans élargir l'API
-    /// publique pour de vrai.
+    /// (interne au crate) et les tests d'intégration du repli froid vivent hors
+    /// crate — ce point d'entrée `#[doc(hidden)]` expose le seul comportement
+    /// observable nécessaire (`seed: bool`) sans élargir l'API publique pour de
+    /// vrai.
     #[cfg(feature = "cold-storage")]
     #[doc(hidden)]
     pub async fn get_with_policy_for_tests(&self, cid: Cid, seed: bool) -> CoreResult<Vec<u8>> {
@@ -1894,126 +1894,6 @@ impl Node {
             StorePolicy::Stream
         };
         self.get_with(cid, policy).await
-    }
-
-    /// Configure un backend [`ColdStore`] **et** un portefeuille Arweave —
-    /// point d'entrée public pour l'archivage (`archive_publication` /
-    /// `confirm_archive`), utilisé par la CLI (`archive`) et tout appelant de
-    /// production. Le choix du backend concret (`ArweaveColdStore` + config
-    /// de gateways) reste à la charge de l'appelant (lot CS-b pour une
-    /// config utilisateur persistée).
-    #[cfg(feature = "cold-storage")]
-    pub fn with_cold_store(
-        &self,
-        cold: Arc<dyn ColdStore>,
-        wallet: crate::coldstore::ArweaveWallet,
-    ) -> Self {
-        let mut node = self.clone();
-        node.cold = Some(cold);
-        node.wallet = Some(wallet);
-        node
-    }
-
-    /// Alias de test historique de [`Node::with_cold_store`] — conservé pour
-    /// ne pas toucher aux tests d'intégration (tâche 4) qui l'appellent déjà.
-    #[cfg(feature = "cold-storage")]
-    #[doc(hidden)]
-    pub fn with_cold_and_wallet_for_tests(
-        &self,
-        cold: Arc<dyn ColdStore>,
-        wallet: crate::coldstore::ArweaveWallet,
-    ) -> Self {
-        self.with_cold_store(cold, wallet)
-    }
-
-    /// Rassemble les octets d'une publication (manifeste + tous ses segments)
-    /// **depuis le blockstore local** — l'archivage ne concerne que le propre
-    /// contenu du créateur, épinglé chez lui (aucun appel réseau). Renvoie un
-    /// [`ArchivePayload`] dont `items` = `[(manifeste, octets), (segment_i,
-    /// octets)…]`. Un bloc absent localement → `BlockNotFound` : on n'archive
-    /// pas ce qu'on ne détient pas.
-    #[cfg(feature = "cold-storage")]
-    fn gather_publication(&self, manifest_cid: Cid) -> CoreResult<ArchivePayload> {
-        let manifest_bytes = self.blockstore.get(&manifest_cid)?;
-        let manifest = HlsManifest::from_json(&manifest_bytes)?;
-        let mut items: Vec<(Cid, Vec<u8>)> = Vec::with_capacity(1 + manifest.segments.len());
-        items.push((manifest_cid, manifest_bytes));
-        for seg in &manifest.segments {
-            let cid: Cid = seg.cid.parse().map_err(CoreError::Cid)?;
-            let bytes = self.blockstore.get(&cid)?;
-            items.push((cid, bytes));
-        }
-        Ok(ArchivePayload {
-            manifest_cid,
-            items,
-        })
-    }
-
-    /// **Premier temps** de l'archivage opt-in (ADR 0008) : rassemble la
-    /// publication (manifeste + segments, localement), calcule sa taille et un
-    /// **devis** — coût = somme des prix Arweave par item (une transaction
-    /// format 2 par bloc), solde courant du portefeuille — et le renvoie **sans
-    /// rien envoyer**. `sufficient` = le solde couvre le coût. Aucun AR n'est
-    /// dépensé ici. Voir [`Node::confirm_archive`] pour le second temps.
-    #[cfg(feature = "cold-storage")]
-    pub async fn archive_publication(&self, manifest_cid: Cid) -> CoreResult<ArchiveQuote> {
-        let (cold, wallet) = self.cold_and_wallet()?;
-        let payload = self.gather_publication(manifest_cid)?;
-
-        let mut bytes: u64 = 0;
-        let mut cost_winston: u64 = 0;
-        for (_cid, item) in &payload.items {
-            bytes += item.len() as u64;
-            let price = cold.price(item.len() as u64).await?;
-            cost_winston = cost_winston.saturating_add(price);
-        }
-        let balance_winston = cold.balance(wallet).await?;
-
-        Ok(ArchiveQuote {
-            manifest_cid: manifest_cid.to_string(),
-            bytes,
-            cost_winston,
-            balance_winston,
-            sufficient: balance_winston >= cost_winston,
-        })
-    }
-
-    /// **Second temps** de l'archivage opt-in : n'exécute l'upload que sur un
-    /// devis au **solde suffisant** (`quote.sufficient`) — sinon `Err` sans
-    /// **aucun** envoi. Sur solde suffisant : re-rassemble la publication,
-    /// signe et POSTe une transaction par item, **persiste le reçu** (dotfile
-    /// `.archives`) et le renvoie. Refus explicite si le solde est insuffisant.
-    #[cfg(feature = "cold-storage")]
-    pub async fn confirm_archive(&self, quote: &ArchiveQuote) -> CoreResult<ArchiveReceipt> {
-        if !quote.sufficient {
-            return Err(CoreError::Network(format!(
-                "archivage refusé: solde insuffisant ({} < {} winston)",
-                quote.balance_winston, quote.cost_winston
-            )));
-        }
-        let (cold, wallet) = self.cold_and_wallet()?;
-        let manifest_cid: Cid = quote.manifest_cid.parse().map_err(CoreError::Cid)?;
-        let payload = self.gather_publication(manifest_cid)?;
-
-        let receipt = cold.archive(&payload, wallet).await?;
-        crate::coldstore::receipts::save_receipt(self.blockstore.root(), &receipt)?;
-        Ok(receipt)
-    }
-
-    /// Accès conjoint au backend froid et au portefeuille, tous deux requis
-    /// pour l'archivage. Erreur claire si l'un manque (aucun câblage de
-    /// production dans cette tâche — cf. `with_cold_and_wallet_for_tests`).
-    #[cfg(feature = "cold-storage")]
-    fn cold_and_wallet(
-        &self,
-    ) -> CoreResult<(&Arc<dyn ColdStore>, &crate::coldstore::ArweaveWallet)> {
-        let cold = self.cold.as_ref().ok_or_else(|| {
-            CoreError::Network("archivage: aucun backend de stockage froid configuré".to_string())
-        })?;
-        let wallet = self.wallet.as_ref().ok_or_else(|| {
-            CoreError::Identity("archivage: aucun portefeuille Arweave configuré".to_string())
-        })?;
-        Ok((cold, wallet))
     }
 
     /// Demande un bloc précis à un pair précis. Les octets reçus sont **vérifiés

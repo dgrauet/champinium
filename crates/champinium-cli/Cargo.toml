@@ -8,8 +8,9 @@ authors.workspace = true
 repository.workspace = true
 
 [features]
-# Archivage Arweave (ADR 0008) — opt-in : garde `rsa`/`reqwest` hors du build
-# et de la résolution de dépendances par défaut (cf. Tâche 1, champinium-core).
+# Repli de récupération froide Arweave (ADR 0008) — opt-in : garde `reqwest`
+# hors du build et de la résolution de dépendances par défaut. Active la
+# sous-commande `cold-retrieval`. L'archivage est différé (voir champinium-core).
 cold-storage = ["champinium-core/cold-storage"]
 
 [dependencies]

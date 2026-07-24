@@ -1,40 +1,41 @@
 # 0008 — Stockage froid optionnel : Arweave, payé par le créateur, découverte par tags CID
 
-- Statut : accepté — **lot CS-a implémenté** (voir note de statut ci-dessous) ;
-  lot CS-b (fronts, contrat FFI v10) non lancé
+- Statut : accepté — **lot CS-a livré en récupération/repli seule** ;
+  **archivage différé d'implémentation** (voir note de statut) ; lot CS-b
+  (fronts, contrat FFI v10) non lancé
 - Date : 2026-07-23 (note de statut : 2026-07-24)
 
-> **Note de statut — CS-a implémenté (2026-07-24).** Le cœur et la CLI livrent
-> le stockage froid derrière la feature cargo opt-in **`cold-storage`** (absente
-> des builds par défaut : aucune dépendance crypto/HTTP dans le graphe par
-> défaut). La CI `cargo-deny` scanne `--all-features` : elle voit donc `rsa` et
-> exige **un ignore documenté** pour RUSTSEC-2023-0071 (Marvin), atténué par la
-> signature aveuglée `BlindedSigningKey` (voir `deny.toml`). Livré : trait `ColdStore` +
-> backend `ArweaveColdStore` (signature hand-roll deep-hash + RSA-PSS), repli
-> CID-vérifié dans `Node::get_with` (débrayable), archivage devis→confirmation
-> payé par le créateur, CLI `archive`/`archives`/`cold-retrieval`, test
-> d'intégration Arweave réel `#[ignore]`+env-gaté (`CHAMPINIUM_ARWEAVE_IT`).
-> Réserves à reprendre :
-> - **`rsa` 0.10-rc** : dépendance de signature en **pré-release** — stable 0.9
->   vulnérable (RUSTSEC-2023-0071 Marvin), 0.10-rc mitigée par la signature
->   aveuglée `BlindedSigningKey`. La CI `cargo-deny` (`--all-features`) exige un
->   **ignore documenté** de cette advisory dans `deny.toml` ; à retirer/repasser
->   stable dès `rsa 0.10.0`.
-> - **Paiement partiel non atomique** : `archive` téléverse une transaction par
->   item ; si un `POST /tx` échoue au milieu, les items déjà téléversés sont
->   **payés mais non enregistrés au reçu** (persisté en fin de boucle) — un
->   ré-essai re-paierait les items déjà stockés (nouvel anchor → nouveaux
->   tx id). Limitation connue de la forme par item-tx sans bundling ; à traiter
->   avec le bundling/UX de CS-b.
-> - **Upload inline** : la transaction est POSTée en une fois (`POST /tx`, data
->   inline dans la transaction format 2) — suffisant pour manifeste et petits
->   segments, mais **l'upload chunké (`/chunk`) reste à faire pour la vidéo**
->   (segments au-delà de la limite inline d'Arweave).
+> **Note de statut — CS-a livré : récupération/repli uniquement, archivage
+> différé (2026-07-24).** Le cœur et la CLI livrent le **repli de récupération**
+> froide derrière la feature cargo opt-in **`cold-storage`** (absente des builds
+> par défaut). Sous la feature, le seul ajout est `reqwest` (HTTP pur) — **pas
+> de `rsa`**. `cargo deny` reste donc **propre sans aucun ignore ajouté** :
+> l'advisory RUSTSEC-2023-0071 (Marvin) ne peut plus s'appliquer, `rsa` n'étant
+> tirée par aucune configuration. Livré : trait `ColdStore` (`retrieve` seul) +
+> backend `ArweaveColdStore` (découverte GraphQL par tag CID + GET + vérification
+> CID + bornage de taille), repli CID-vérifié dans `Node::get_with` (débrayable,
+> modération #2 inchangée), CLI `cold-retrieval`. Couverture par gateways
+> `wiremock`, sans réseau réel.
+>
+> **Archivage (signature + upload) différé.** La décision de conception
+> ci-dessous **tient intégralement** ; seule son **implémentation** est reportée.
+> Motif : la signature RSA-PSS des transactions Arweave n'a de voie que via la
+> crate `rsa`, dont **toute version disponible est vulnérable** — 0.9 stable sans
+> mitigation (RUSTSEC-2023-0071 Marvin), 0.10 encore en **pré-release**. Plutôt
+> que d'embarquer une dépendance CVE (et l'ignore `deny.toml` correspondant),
+> l'archivage attend une voie sans CVE : **`rsa` 0.10.0 stable**, ou une crate
+> Arweave maintenue. Rien de l'archivage n'est présent dans le code livré (ni API
+> `archive_publication`/`confirm_archive`, ni reçus, ni portefeuille, ni
+> signature hand-roll). Réserves de conception à reprendre **lors de cette
+> reprise** (elles ne concernent que l'archivage, non livré) :
 > - **Forme par item-tx** : **une transaction par item** (manifeste + chaque
 >   segment), et non « une transaction/bundle » comme l'écrit la décision §3
 >   ci-dessous. C'est **imposé par la récupération par CID** (§5 : chaque octet
 >   récupéré est vérifié seul contre son CID) — écart délibéré et correct ; la
 >   décision §3 est à lire à travers cette note.
+> - **Paiement partiel non atomique** (forme par item-tx sans bundling) et
+>   **upload inline vs chunké** (`/chunk` pour la vidéo au-delà de la limite
+>   inline d'Arweave) : à traiter avec le bundling/UX au moment de l'archivage.
 
 ## Contexte
 
@@ -104,12 +105,12 @@ position.
 
 ## Phasage (différé — chacun son plan au lancement)
 
-- **CS-a — cœur + CLI** : trait `ColdStore`, backend Arweave
-  (archive/retrieve/prix), repli dans `get_with`, CLI `archive`/`archives`.
-  Tests contre gateway mock ; test d'intégration réel optionnel gaté par
-  variable d'environnement (coûte de vrais AR). À trancher à ce moment-là :
-  lib Rust Arweave existante vs implémentation directe du format de
-  transaction.
+- **CS-a — cœur + CLI** : trait `ColdStore`, backend Arweave, repli dans
+  `get_with`, CLI. **Livré en récupération/repli seule** (`retrieve`,
+  `cold-retrieval`) — tests contre gateway mock. **L'archivage est différé**
+  faute de crate `rsa` sans CVE (voir la note de statut) ; à reprendre quand la
+  voie de signature sans CVE existe, en tranchant alors : lib Rust Arweave
+  maintenue vs implémentation directe du format de transaction.
 - **CS-b — fronts** : bouton « Archiver » (dialogue de devis), liste « mes
   archives » (reçus locaux `.archives`, statut de confirmation re-interrogé à
   la demande — pas de démon), réglage du repli. Contrat FFI v10.

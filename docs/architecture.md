@@ -362,22 +362,23 @@ quand son créateur s'éteint (choix assumé). Le **stockage froid** offre à un
 créateur qui tient à la pérennité de son contenu un filet **optionnel**, sans
 imposer de coût à personne ni composant central. Tout vit **derrière la feature
 cargo `cold-storage`**, absente des builds par défaut : aucune dépendance
-supplémentaire (`rsa`, `reqwest`) n'entre dans le graphe par défaut — la surface
-crypto reste hors de portée de `cargo deny` tant que la feature n'est pas
-activée, d'où l'absence d'ignore CVE.
+supplémentaire n'entre dans le graphe par défaut.
 
-- **Trait `ColdStore`** (`retrieve`/`archive`/`price`/`balance`) — isole le
-  backend ; Filecoin pourra s'ajouter sans toucher au repli ni à l'archivage.
-  Seul backend aujourd'hui : `ArweaveColdStore` (module
+**Périmètre livré (CS-a) : récupération/repli uniquement.** Sous la feature,
+le seul ajout est `reqwest` (HTTP pur : GraphQL de découverte + GET) — **pas
+de `rsa`**. `cargo deny` reste donc propre **sans aucun ignore ajouté**
+(l'advisory RUSTSEC-2023-0071 Marvin ne peut pas s'appliquer : `rsa` n'est
+tirée par aucune configuration). **L'archivage Arweave (signature, upload) est
+différé d'implémentation** : la seule voie de signature RSA-PSS passait par la
+crate `rsa`, dont toute version disponible est vulnérable (0.9 stable sans
+mitigation, 0.10 encore en pré-release). La décision de conception (ADR 0008)
+tient ; seule son implémentation attend une voie sans CVE (`rsa` 0.10.0 stable,
+ou une crate Arweave maintenue).
+
+- **Trait `ColdStore`** (`retrieve` uniquement) — isole le backend ; Filecoin
+  pourra s'ajouter sans toucher au repli. Seul backend aujourd'hui :
+  `ArweaveColdStore` (module
   [`coldstore/`](../crates/champinium-core/src/coldstore)).
-- **Signature de transaction hand-roll** (aucune lib Arweave, décision
-  supply-chain) : **deep-hash** (accumulateur SHA-384, transaction format 2)
-  produit les octets à signer ; signature **RSA-PSS** (SHA-256, longueur de sel
-  32, `BlindedSigningKey` *aveuglé* — mitigation Marvin) via `rsa` **0.10-rc**
-  (pré-release, contenue par le feature-gating, à repasser stable une fois
-  publiée) ; l'id de transaction est `SHA-256(signature)`. Le portefeuille JWK
-  est apporté par le créateur (chemin, permissions 0600) — champinium ne crée,
-  ne gère ni ne finance rien.
 - **Récupération = repli, jamais chemin principal.** Le seul point d'entrée est
   `Node::get_with`, **uniquement quand le P2P conclut à `NoProviders`**. Tout
   octet récupéré est **vérifié contre son CID** avant tout usage (une gateway
@@ -389,24 +390,22 @@ activée, d'où l'absence d'ignore CVE.
   défaut) : interroger une gateway par CID révèle à cette gateway l'intérêt de
   l'IP pour ce CID — surface d'observation différente du P2P pur, documentée avec
   la même franchise que l'observabilité DHT du suivi actif (§6).
-- **Archivage en deux temps, payé par le créateur.** `archive_publication`
-  calcule un **devis** (taille, coût estimé en AR, solde du portefeuille) ;
-  `confirm_archive` seul déclenche l'envoi — jamais automatique, jamais
-  silencieusement payant. Reçus locaux (`.archives`, purement informatifs).
-  **Forme par item-tx** : **une transaction Arweave par item** (manifeste HLS +
-  chaque segment), imposée par la récupération par CID (chaque CID doit être
-  adressable et vérifiable seul). Cela **s'écarte du §Archivage de la spec (« une
-  transaction/bundle ») à dessein** — le bundle empêcherait la vérification
-  d'un CID isolé au repli.
-- **Test d'intégration Arweave réel** : `#[ignore]` **et** gaté par
-  `CHAMPINIUM_ARWEAVE_IT=1` (+ `CHAMPINIUM_ARWEAVE_JWK`, JWK financé 0600) — il
-  coûte de vrais AR ; un `cargo test --features cold-storage` normal ne le lance
-  jamais. Le reste de la couverture (repli, deep-hash, RSA-PSS, devis) tourne
-  contre des mocks, sans réseau. Le job CI `cold-storage` build+clippy+teste la
-  feature **sans** aucune variable réseau (§10).
-- **CLI** (gatée par la feature `cold-storage` du CLI) : `archive`, `archives`,
-  `cold-retrieval`. Les fronts ×3 (bouton « Archiver », liste « mes archives »,
-  réglage du repli, contrat FFI v10) sont **hors périmètre CS-a** (lot CS-b).
+- **Archivage : différé d'implémentation.** La conception (archivage en deux
+  temps créateur-paie — devis puis confirmation — et forme par item-tx : une
+  transaction Arweave par item, imposée par la récupération par CID) reste
+  actée par l'ADR 0008, mais **n'est pas implémentée** : elle exige une
+  signature RSA-PSS sans dépendance CVE, indisponible aujourd'hui. Aucune API
+  d'archivage (`archive_publication`/`confirm_archive`), aucun type de reçu,
+  aucun portefeuille n'est présent dans le code livré. À reprendre dès qu'une
+  voie sans CVE existe.
+- **Couverture par mocks, sans réseau.** Le repli (récupération, vérification
+  CID, repli sous `NoProviders`, débrayage, modération #2) est testé contre des
+  gateways `wiremock` — aucun accès réseau réel. Le job CI `cold-storage`
+  build+clippy+teste la feature (§10).
+- **CLI** (gatée par la feature `cold-storage` du CLI) : `cold-retrieval`
+  (réglage du repli) uniquement. Les commandes d'archivage sont différées avec
+  l'archivage. Les fronts ×3 (contrat FFI v10) restent **hors périmètre CS-a**
+  (lot CS-b).
 
 ## 7. Modération : le garde-fou obligatoire
 

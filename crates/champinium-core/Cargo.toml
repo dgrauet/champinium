@@ -20,11 +20,13 @@ name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
 
 [features]
-# Stockage froid optionnel (Arweave, ADR 0008) — aucune dep supplémentaire
-# tirée par défaut. Décision supply-chain : voir
-# .superpowers/sdd/coldstore-decision.md (hand-roll de la signature Arweave,
-# reqwest = seul ajout, pour l'upload/GraphQL de découverte).
-cold-storage = ["dep:reqwest", "dep:async-trait", "dep:rsa", "dep:getrandom"]
+# Stockage froid optionnel (Arweave, ADR 0008) — **récupération seule**.
+# Aucune dep supplémentaire tirée par défaut ; sous la feature, seul `reqwest`
+# (HTTP pur : GraphQL de découverte + GET) et `async-trait` (dyn-compat du
+# trait) sont ajoutés. L'archivage (signature Arweave) est différé faute de
+# crate `rsa` sans CVE — donc **pas de dépendance `rsa`** et `cargo deny`
+# reste propre sans ignore. Voir .superpowers/sdd/coldstore-decision.md.
+cold-storage = ["dep:reqwest", "dep:async-trait"]
 
 [dependencies]
 uniffi = { workspace = true, features = ["cli", "tokio"] }
@@ -45,16 +47,6 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # rester dyn-compatible malgré des méthodes async (edition 2021 — les async fn
 # natives en trait ne sont pas dyn-compatibles). Gaté par la même feature.
 async-trait = { version = "0.1", optional = true }
-# Signature RSA-PSS des transactions Arweave (hand-roll, cf. coldstore-decision).
-# rsa 0.10 (ligne RustCrypto digest 0.11, alignée sur notre `sha2 = "0.11"`) :
-# la 0.9 stable est signalée par RUSTSEC-2023-0071 (Marvin, sans correctif) et
-# ferait échouer `cargo deny` — la 0.10 porte la mitigation Marvin. Gaté par la
-# même feature `cold-storage`.
-rsa = { version = "0.10.0-rc.18", optional = true }
-# RNG système pour le sel RSA-PSS (signeur *aveuglé*, mitigation Marvin). SysRng
-# (getrandom) implémente `TryCryptoRng` de rand_core 0.10 — aucune graine gérée
-# par nous. Gaté par la même feature `cold-storage`.
-getrandom = { version = "0.4", features = ["sys_rng"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

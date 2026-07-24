@@ -11,14 +11,6 @@ ignore = [
     # paste n'est plus maintenu ; dépendance transitive (uniffi, gtk4-rs macros),
     # aucun remplacement possible de notre côté.
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained — transitif via uniffi/gtk4-rs" },
-    # rsa (Marvin, timing sidechannel) — uniquement sous la feature OPT-IN
-    # `cold-storage`, pour la signature Arweave (aucune crate Arweave viable, cf.
-    # ADR 0008). La 0.9 stable est vulnérable SANS mitigation ; la 0.10-rc porte
-    # la mitigation (signature aveuglée `BlindedSigningKey`) que nous utilisons.
-    # Le build par défaut ne tire jamais rsa ; la CI cargo-deny scanne toutefois
-    # `--all-features`, d'où cet ignore explicite. À retirer/repasser dès que
-    # rsa 0.10.0 stable sort.
-    { id = "RUSTSEC-2023-0071", reason = "rsa 0.10-rc Marvin — feature cold-storage opt-in, signature Arweave aveuglée (BlindedSigningKey) ; à repasser stable à la 0.10.0" },
 ]
 
 [licenses]

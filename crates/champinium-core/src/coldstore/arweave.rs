@@ -1,32 +1,20 @@
-//! Backend Arweave du trait `ColdStore`.
+//! Backend Arweave du trait `ColdStore` — **récupération seule**.
 //!
 //! `retrieve` : découverte par tag GraphQL (`champinium-cid: <cid>`) sur
 //! chaque gateway configurée, essayées **en séquence** avec un timeout court ;
 //! sur trouvaille, téléchargement puis **vérification stricte du CID** — une
 //! gateway n'est jamais de confiance, elle peut au pire servir du silence,
-//! jamais du faux (voir la spec). `price`/`balance` interrogent directement
-//! une gateway. `archive` construit, signe (RSA-PSS + deep hash, cf.
-//! [`super::arweave_tx`]) et POSTe **une transaction format 2 par item** de la
-//! publication (manifeste + segments), chacune étiquetée `champinium-cid: <son
-//! cid>` + `champinium-schema: hls/v1` — la seule forme où chaque bloc reste
-//! récupérable et vérifiable individuellement par `retrieve` (voir le
-//! commentaire dans `archive`). Hand-roll : voir
-//! `.superpowers/sdd/coldstore-decision.md`.
+//! jamais du faux (voir la spec). L'archivage (signature + upload) est
+//! **différé** (voir [`super`]) : aucune dépendance `rsa` n'est tirée. HTTP
+//! pur (`reqwest`).
 
-use crate::coldstore::arweave_tx::{Tag, Transaction, WalletKey};
-use crate::coldstore::{ArchivePayload, ArchiveReceipt, ArweaveWallet, ColdStore};
+use crate::coldstore::ColdStore;
 use crate::content;
-use crate::error::{CoreError, Result as CoreResult};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
+use crate::error::Result as CoreResult;
 use cid::Cid;
 use reqwest::Client;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-/// Schéma d'archivage étiqueté sur chaque item (une valeur unique pour le lot).
-const SCHEMA_TAG_VALUE: &str = "hls/v1";
+use std::time::Duration;
 
 /// Timeout par gateway — court : une gateway lente ou muette ne doit pas
 /// bloquer le repli d'archive, on passe à la suivante.
@@ -79,56 +67,6 @@ impl ArweaveColdStore {
             .next()
             .map(|edge| edge.node.id)
     }
-
-    /// Récupère une ancre de transaction (`last_tx`) récente auprès d'une
-    /// gateway (`GET /tx_anchor` → chaîne base64url décodée). Une seule ancre
-    /// suffit pour tout un lot d'archivage (fenêtre d'ancre Arweave). Erreur si
-    /// aucune gateway ne répond — sans ancre, aucune transaction ne peut être
-    /// signée correctement.
-    async fn tx_anchor(&self) -> CoreResult<Vec<u8>> {
-        for gateway in &self.gateways {
-            let url = format!("{}/tx_anchor", gateway.trim_end_matches('/'));
-            if let Ok(resp) = self.http.get(&url).send().await {
-                if resp.status().is_success() {
-                    if let Ok(text) = resp.text().await {
-                        if let Ok(anchor) = URL_SAFE_NO_PAD.decode(text.trim()) {
-                            return Ok(anchor);
-                        }
-                    }
-                }
-            }
-        }
-        Err(CoreError::Network(
-            "ancre Arweave (tx_anchor) indisponible (toutes les gateways ont échoué)".to_string(),
-        ))
-    }
-
-    /// POST d'une transaction signée (`POST /tx`, JSON) : essaie les gateways
-    /// en séquence, réussit dès qu'une accepte (2xx). Poster la même
-    /// transaction (même id) sur plusieurs gateways serait idempotent, mais on
-    /// s'arrête au premier succès. Erreur si aucune n'accepte.
-    async fn post_tx(&self, body: &serde_json::Value) -> CoreResult<()> {
-        for gateway in &self.gateways {
-            let url = format!("{}/tx", gateway.trim_end_matches('/'));
-            if let Ok(resp) = self.http.post(&url).json(body).send().await {
-                if resp.status().is_success() {
-                    return Ok(());
-                }
-            }
-        }
-        Err(CoreError::Network(
-            "POST /tx Arweave: aucune gateway n'a accepté la transaction".to_string(),
-        ))
-    }
-}
-
-/// Horodatage Unix (secondes) courant, 0 si l'horloge est antérieure à l'époque
-/// (jamais en pratique) — purement informatif dans le reçu.
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,24 +119,6 @@ async fn read_bounded(mut resp: reqwest::Response, limit: u64) -> Option<Vec<u8>
     }
 }
 
-/// Dérive l'adresse Arweave (base64url de sha256(module RSA public `n`)) du
-/// portefeuille référencé. Ne lit que le champ public du JWK — jamais la clé
-/// privée (`d`) — et ne la copie nulle part, juste le temps du calcul.
-fn wallet_address(wallet: &ArweaveWallet) -> CoreResult<String> {
-    let raw = std::fs::read_to_string(wallet.path())
-        .map_err(|e| CoreError::Identity(format!("lecture portefeuille Arweave: {e}")))?;
-    let jwk: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| CoreError::Identity(format!("JWK Arweave illisible: {e}")))?;
-    let n = jwk.get("n").and_then(|v| v.as_str()).ok_or_else(|| {
-        CoreError::Identity("JWK Arweave: champ 'n' (module public) absent".to_string())
-    })?;
-    let modulus = URL_SAFE_NO_PAD
-        .decode(n)
-        .map_err(|e| CoreError::Identity(format!("JWK Arweave: champ 'n' non base64url: {e}")))?;
-    let digest = Sha256::digest(&modulus);
-    Ok(URL_SAFE_NO_PAD.encode(digest))
-}
-
 #[async_trait::async_trait]
 impl ColdStore for ArweaveColdStore {
     async fn retrieve(&self, cid: Cid) -> CoreResult<Option<Vec<u8>>> {
@@ -228,118 +148,5 @@ impl ColdStore for ArweaveColdStore {
             );
         }
         Ok(None)
-    }
-
-    async fn archive(
-        &self,
-        publication: &ArchivePayload,
-        wallet: &ArweaveWallet,
-    ) -> CoreResult<ArchiveReceipt> {
-        if publication.items.is_empty() {
-            return Err(CoreError::Network(
-                "archivage Arweave: publication vide (aucun item)".to_string(),
-            ));
-        }
-
-        // Charge la clé privée du JWK — uniquement ici, au moment de signer, et
-        // jamais recopiée (cf. `ArweaveWallet`). Lecture du fichier + parse.
-        let raw = std::fs::read_to_string(wallet.path())
-            .map_err(|e| CoreError::Identity(format!("lecture portefeuille Arweave: {e}")))?;
-        let jwk: serde_json::Value = serde_json::from_str(&raw)
-            .map_err(|e| CoreError::Identity(format!("JWK Arweave illisible: {e}")))?;
-        let key = WalletKey::from_jwk(&jwk)?;
-
-        // Une ancre commune pour tout le lot (fenêtre d'ancre Arweave).
-        let anchor = self.tx_anchor().await?;
-
-        // Chaque item (manifeste + segments) devient sa PROPRE transaction
-        // format 2 étiquetée `champinium-cid: <son cid>` : c'est la seule forme
-        // où le repli de récupération (`retrieve`, vérification stricte par
-        // CID) peut resservir chaque bloc individuellement — une transaction
-        // unique portant la publication concaténée ne serait vérifiable que
-        // pour le CID de la concaténation, pas pour chaque bloc. Le reçu retient
-        // l'id de la transaction du manifeste comme identité de la publication.
-        let manifest_cid = publication.manifest_cid;
-        let mut total_bytes: u64 = 0;
-        let mut total_cost: u64 = 0;
-        let mut manifest_tx_id: Option<String> = None;
-        for (cid, bytes) in &publication.items {
-            let reward = self.price(bytes.len() as u64).await?;
-            let tags = vec![
-                Tag {
-                    name: "champinium-cid".to_string(),
-                    value: cid.to_string(),
-                },
-                Tag {
-                    name: "champinium-schema".to_string(),
-                    value: SCHEMA_TAG_VALUE.to_string(),
-                },
-            ];
-            let tx = Transaction::build_signed(
-                &key,
-                bytes.clone(),
-                tags,
-                anchor.clone(),
-                reward.to_string(),
-            )?;
-            let tx_id = tx.id_b64();
-            self.post_tx(&tx.to_json()).await?;
-            total_bytes += bytes.len() as u64;
-            total_cost = total_cost.saturating_add(reward);
-            if *cid == manifest_cid {
-                manifest_tx_id = Some(tx_id);
-            }
-        }
-
-        let tx_id = manifest_tx_id.ok_or_else(|| {
-            CoreError::Network(
-                "archivage Arweave: le manifeste doit figurer parmi les items".to_string(),
-            )
-        })?;
-
-        Ok(ArchiveReceipt {
-            manifest_cid: manifest_cid.to_string(),
-            tx_id,
-            timestamp: now_secs(),
-            bytes: total_bytes,
-            cost_winston: total_cost,
-        })
-    }
-
-    async fn price(&self, bytes: u64) -> CoreResult<u64> {
-        for gateway in &self.gateways {
-            let url = format!("{}/price/{bytes}", gateway.trim_end_matches('/'));
-            if let Ok(resp) = self.http.get(&url).send().await {
-                if resp.status().is_success() {
-                    if let Ok(text) = resp.text().await {
-                        if let Ok(winston) = text.trim().parse::<u64>() {
-                            return Ok(winston);
-                        }
-                    }
-                }
-            }
-        }
-        Err(CoreError::Network(format!(
-            "prix Arweave indisponible pour {bytes} octets (toutes les gateways ont échoué)"
-        )))
-    }
-
-    async fn balance(&self, wallet: &ArweaveWallet) -> CoreResult<u64> {
-        let address = wallet_address(wallet)?;
-        for gateway in &self.gateways {
-            let url = format!("{}/wallet/{address}/balance", gateway.trim_end_matches('/'));
-            if let Ok(resp) = self.http.get(&url).send().await {
-                if resp.status().is_success() {
-                    if let Ok(text) = resp.text().await {
-                        if let Ok(winston) = text.trim().parse::<u64>() {
-                            return Ok(winston);
-                        }
-                    }
-                }
-            }
-        }
-        Err(CoreError::Network(format!(
-            "solde Arweave indisponible pour {address} (toutes les gateways ont échoué)"
-        )))
     }
 }
