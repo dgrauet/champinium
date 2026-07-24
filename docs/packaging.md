@@ -41,13 +41,102 @@ par release-please ; test à blanc possible via *Run workflow*).
 - Windows : `just gen-csharp` puis
   `dotnet publish apps/windows/Champinium/Champinium.csproj -c Release -r win-x64 -p:Platform=x64 -p:WindowsAppSDKSelfContained=true -p:SelfContained=true`.
 
+## Linux — Flatpak
+
+Palier Linux au-delà du tarball : un manifeste Flatpak pour le front GTK4,
+[`packaging/flatpak/org.champinium.Champinium.yml`](../packaging/flatpak/org.champinium.Champinium.yml)
+(app-id `org.champinium.Champinium`), plus le `.desktop` et le métainfo
+AppStream requis à côté. Toujours palier **gratuit** (0 €, pas de compte
+Flathub) — ce n'est pas une soumission Flathub, juste un paquet installable
+localement ou distribuable en `.flatpak` autonome.
+
+- **Runtime** : `org.gnome.Platform`/`org.gnome.Sdk` 48 (base freedesktop
+  24.08). rustc est installé au build via rustup (l'extension SDK `rust-stable`
+  est trop ancienne pour la pile gtk-rs courante — voir supply-chain ci-dessous).
+  GStreamer core/plugins-base/plugins-good sont déjà dans le runtime GNOME.
+- **Lecture H.264/AAC** : fournie par l'extension
+  `org.freedesktop.Platform.ffmpeg-full//24.08` (`add-extensions`, montée dans
+  `/app/lib/ffmpeg` avec `add-ld-path`). Le runtime embarque gst-libav mais lié
+  à l'ffmpeg de base freedesktop, amputé des décodeurs sous brevet ; l'extension
+  monte un ffmpeg complet en tête du LD_LIBRARY_PATH, et gst-libav y trouve
+  H.264/AAC. Patron Flathub standard (codecs encombrés distribués à part, jamais
+  dans l'app). Le front étant lecture seule (playbin), seul le décodage est
+  requis. Champinium ingérant en H.264/AAC (HLS), l'extension est nécessaire
+  pour lire le propre contenu de l'app.
+- **Permissions (`finish-args`)** : réseau (libp2p), wayland/fallback-x11/dri
+  (fenêtre GTK4 + rendu vidéo GStreamer), ipc, pulseaudio (audio). **Pas de**
+  `--filesystem=host` ni `--filesystem=xdg-download` : les données du nœud
+  (`champinium-core::paths::default_data_dir()` → `$XDG_DATA_HOME/champinium`)
+  atterrissent automatiquement, sous Flatpak, dans
+  `~/.var/app/org.champinium.Champinium/data` par la redirection standard de
+  `XDG_DATA_HOME` par le sandbox — aucune permission supplémentaire requise
+  pour que l'identité/les blocs persistent entre lancements.
+- **Chaîne d'approvisionnement du build (durcissement requis avant Flathub)** :
+  deux vecteurs réseau non reproductibles au build, à supprimer ensemble pour
+  une publication réelle —
+    - **Sources cargo** : build avec `--share=network` (cargo télécharge les
+      crates), PAS de vendoring hors-ligne (`cargo-sources.json` via
+      `flatpak-cargo-generator`). Flathub exige des sources vendorisées pour la
+      reproductibilité des modules cargo.
+    - **Toolchain rustc** : installé au build via `curl https://sh.rustup.rs | sh`
+      (l'extension SDK `rust-stable` de GNOME est trop ancienne pour la pile
+      gtk-rs courante, qui exige rustc ≥ 1.92). Ce `curl | sh` exécute un
+      script distant **non épinglé** — vecteur supply-chain relevé en revue.
+      Un vrai build doit épingler rustup (URL + somme de contrôle de
+      `rustup-init`, toolchain figé) ou fournir rustc via une extension SDK à
+      jour. Les sources cargo vendorisées ci-dessus supprimeront de toute façon
+      le besoin de réseau au build.
+- **Icône d'app** : le SVG (`org.champinium.Champinium.svg`, champignon stylisé,
+  encore une identité **placeholder**) est la source de vérité, **rasterisé au
+  build** (`rsvg-convert`, dans le SDK GNOME) en PNG **64/128/256** installés
+  dans hicolor (64×64 = taille mandataire du cache AppStream). Le SVG lui-même
+  n'est **volontairement pas installé** dans `hicolor/scalable/` : le conteneur
+  qui exécute `appstreamcli compose` n'a pas de loader SVG gdk-pixbuf, et le
+  compose échoue alors en `file-read-error` (« Unrecognized image file format »)
+  → `filters-but-no-output` → build rouge. C'était la cause réelle du rouge CI
+  initial (diagnostiquée via `appstreamcli compose --print-report=full`, le
+  résumé du job ne nommant pas le fichier fautif). Les PNG couvrent tous les
+  besoins d'AppStream et du thème d'icônes. Le design reste à remplacer par une
+  vraie identité visuelle.
+
+### Build/installation locale
+
+```sh
+flatpak-builder --user --install --force-clean build-dir \
+  packaging/flatpak/org.champinium.Champinium.yml
+flatpak run org.champinium.Champinium
+```
+
+Prérequis : `flatpak`, `flatpak-builder`, et les runtimes
+`org.gnome.Platform//48` + `org.gnome.Sdk//48` +
+`org.freedesktop.Platform.ffmpeg-full//24.08` installés (`flatpak install
+flathub org.gnome.Platform//48 org.gnome.Sdk//48
+org.freedesktop.Platform.ffmpeg-full//24.08`). L'extension ffmpeg-full est
+tirée automatiquement à l'installation de l'app (`no-autodownload: false`).
+
+### CI
+
+Job `flatpak` dans [`ci.yml`](../.github/workflows/ci.yml) : construit le
+manifeste dans le conteneur `bilelmoussaoui/flatpak-github-actions:gnome-47`
+via l'action `flatpak/flatpak-github-actions/flatpak-builder`, produit
+`champinium.flatpak` en artefact de workflow. C'est un build de
+**validation** (le manifeste est correct et se construit) — n'attaque jamais
+Flathub. Ce job n'a pas pu être exécuté localement pendant l'écriture de ce
+manifeste (pas de Flatpak sur macOS) : c'est ce job CI qui fait foi.
+
+### AppImage (suivi, non fait)
+
+Pas de recette AppImage pour l'instant — différé par effort, comme documenté
+plus bas. Candidat naturel d'un prochain lot packaging Linux si Flatpak seul
+ne couvre pas un besoin (ex. environnements sans `flatpak` installé).
+
 ## Ce que le palier PAYANT ajouterait (différé)
 
 | OS | Coût | Gain |
 |---|---|---|
 | macOS | Apple Developer 99 $/an | Developer ID + **notarisation** : double-clic direct, pas de contournement Gatekeeper ; canal de distribution .dmg propre |
 | Windows | Certificat Authenticode (OV ~100–300 €/an, EV plus cher) | plus d'avertissement SmartScreen (réputation immédiate avec EV) ; MSIX signé installable proprement |
-| Linux | 0 € | Flatpak (Flathub) / AppImage : gratuits — différés par **effort**, pas par coût ; candidats naturels au prochain palier |
+| Linux | 0 € | Flatpak (ce paquet) → **Flathub** (soumission, hors périmètre ici) ; AppImage : gratuit — différé par **effort**, pas par coût |
 
 Limites connues du palier gratuit :
 - macOS : arm64 uniquement (runner CI) ; pas de binaire universel.

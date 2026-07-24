@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Champinium
+Comment=Partage P2P décentralisé de contenu généré par IA
+Exec=champinium
+Icon=org.champinium.Champinium
+Terminal=false
+Categories=AudioVideo;Network;
