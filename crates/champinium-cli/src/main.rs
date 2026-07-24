@@ -181,6 +181,30 @@ enum Cmd {
         #[arg(long)]
         by_channel: bool,
     },
+    /// Archive une publication sur Arweave (devis puis confirmation) — repli
+    /// froid, ADR 0008. Nécessite un portefeuille Arweave (JWK, 0600).
+    Archive {
+        /// CID du manifeste HLS à archiver.
+        manifest_cid: String,
+        /// Portefeuille Arweave (fichier de clé JWK, permissions 0600).
+        #[arg(long)]
+        wallet: PathBuf,
+        /// Gateway(s) Arweave à essayer, dans l'ordre (répétable).
+        #[arg(long, default_value = "https://arweave.net")]
+        gateway: Vec<String>,
+        /// Confirme sans invite interactive (pour scripter).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Liste les reçus d'archivage locaux (purement informatifs).
+    Archives,
+    /// Affiche (et éventuellement définit) le débrayage du repli de
+    /// récupération froid.
+    ColdRetrieval {
+        /// `on` ou `off`.
+        #[arg(long)]
+        set: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -463,8 +487,89 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Cmd::Archive {
+            manifest_cid,
+            wallet,
+            gateway,
+            yes,
+        } => {
+            let manifest_cid: Cid = manifest_cid.parse().context("CID de manifeste invalide")?;
+            let wallet = champinium_core::coldstore::ArweaveWallet::from_path(&wallet)
+                .context("portefeuille Arweave")?;
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let cold: std::sync::Arc<dyn champinium_core::coldstore::ColdStore> =
+                std::sync::Arc::new(champinium_core::coldstore::arweave::ArweaveColdStore::new(
+                    gateway,
+                ));
+            let node = node.with_cold_and_wallet_for_tests(cold, wallet);
+
+            let quote = node.archive_publication(manifest_cid).await?;
+            println!("manifeste: {}", quote.manifest_cid);
+            println!("taille: {} octet(s)", quote.bytes);
+            println!("coût estimé: {} winston", quote.cost_winston);
+            println!("solde: {} winston", quote.balance_winston);
+            if !quote.sufficient {
+                anyhow::bail!(
+                    "solde insuffisant pour archiver ({} < {} winston) — aucun envoi",
+                    quote.balance_winston,
+                    quote.cost_winston
+                );
+            }
+
+            let confirmed = yes || prompt_confirm("confirmer l'archivage ? [o/N] ")?;
+            if !confirmed {
+                println!("archivage annulé");
+                return Ok(());
+            }
+
+            let receipt = node.confirm_archive(&quote).await?;
+            println!("archivé — tx: {}", receipt.tx_id);
+        }
+        Cmd::Archives => {
+            let receipts =
+                champinium_core::coldstore::receipts::load_receipts(&cli.data_dir.join("blocks"));
+            if receipts.is_empty() {
+                println!("aucune archive");
+            } else {
+                for r in receipts {
+                    println!(
+                        "{} — tx {} — {} — {} octet(s) — {} winston",
+                        r.manifest_cid, r.tx_id, r.timestamp, r.bytes, r.cost_winston
+                    );
+                }
+            }
+        }
+        Cmd::ColdRetrieval { set } => {
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            if let Some(value) = set {
+                let enabled = match value.to_lowercase().as_str() {
+                    "on" => true,
+                    "off" => false,
+                    other => anyhow::bail!("valeur invalide pour --set: {other} (attendu on|off)"),
+                };
+                node.set_cold_retrieval(enabled)?;
+            }
+            let state = if node.cold_retrieval_enabled() {
+                "activé"
+            } else {
+                "désactivé"
+            };
+            println!("repli de récupération froid: {state}");
+        }
     }
     Ok(())
+}
+
+/// Demande une confirmation interactive (ligne lue sur stdin) ; `o`/`oui`/`y`
+/// (insensible à la casse) valent confirmation, tout le reste = refus.
+fn prompt_confirm(prompt: &str) -> Result<bool> {
+    use std::io::Write as _;
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let answer = line.trim().to_lowercase();
+    Ok(answer == "o" || answer == "oui" || answer == "y")
 }
 
 /// Reconstruit un HLS en retentant le temps que le réseau converge.
