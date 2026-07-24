@@ -139,13 +139,16 @@ modules:
         appstreamcli validate --no-net /app/share/metainfo/org.champinium.Champinium.metainfo.xml 2>&1 || true
         echo "===== DIAG compose --verbose (reproduit le file-read-error avec fname) ====="
         mkdir -p /tmp/ascr /tmp/ascd /tmp/asci
-        appstreamcli compose --verbose --prefix=/ --result-root=/tmp/ascr \
-          --data-dir=/tmp/ascd --icons-dir=/tmp/asci \
-          --origin=diag /app 2>&1 | tail -40 || true
-        echo "----- ISSUE REPORT FILES (contiennent le fname substitué) -----"
-        find /tmp/ascr /tmp/ascd -type f 2>/dev/null | head -20
-        for f in $(find /tmp/ascr /tmp/ascd -type f \( -name '*.yml' -o -name '*.yaml' -o -name '*.html' -o -name '*.xml' \) 2>/dev/null | head -5); do
-          echo "--- $f ---"; sed 's/<[^>]*>//g' "$f" | grep -viE '^\s*$' | head -40
+        appstreamcli compose --verbose --print-report=full --prefix=/ \
+          --result-root=/tmp/ascr --data-dir=/tmp/ascd --icons-dir=/tmp/asci \
+          --origin=diag /app 2>&1 | tail -50 || true
+        echo "----- ISSUE REPORT (gz inclus) -----"
+        for f in $(find /tmp/ascr /tmp/ascd -type f 2>/dev/null | head -10); do
+          echo "--- $f ---"
+          case "$f" in
+            *.gz) zcat "$f" | sed 's/<[^>]*>//g' | grep -viE '^\s*$' | head -30 ;;
+            *) sed 's/<[^>]*>//g' "$f" | grep -viE '^\s*$' | head -30 ;;
+          esac
         done
         echo "===== DIAG END ====="
         true
