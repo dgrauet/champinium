@@ -330,6 +330,19 @@ public sealed class NodeViewModel : INotifyPropertyChanged
     /// </summary>
     public event Action<string>? PlaybackReady;
 
+    /// <summary>
+    /// Achevé quand <see cref="StartAsync"/> a terminé — <c>true</c> si le nœud
+    /// est ouvert, <c>false</c> si l'ouverture a échoué. Sert aux entrées
+    /// asynchrones qui arrivent AVANT que le nœud soit prêt (lien
+    /// `champinium://` reçu de l'OS au démarrage à froid) : sans cette attente,
+    /// l'appel partirait sur un `_node` null et échouerait en silence.
+    /// Plomberie de présentation — rien à voir avec le contrat FFI.
+    /// </summary>
+    public Task<bool> NodeReady => _nodeReady.Task;
+
+    private readonly TaskCompletionSource<bool> _nodeReady =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
     /// <summary>Ouvre le nœud sous le répertoire de données durable de l'OS et commence à écouter.</summary>
     public async Task StartAsync()
     {
@@ -376,6 +389,12 @@ public sealed class NodeViewModel : INotifyPropertyChanged
         catch (Exception ex)
         {
             Status = $"erreur d'ouverture: {ex.Message}";
+        }
+        finally
+        {
+            // Débloque les attentes de démarrage, succès comme échec (voir
+            // NodeReady) — sinon un lien reçu au lancement attendrait à jamais.
+            _nodeReady.TrySetResult(_node is not null);
         }
     }
 
