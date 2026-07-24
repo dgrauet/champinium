@@ -88,12 +88,16 @@ localement ou distribuable en `.flatpak` autonome.
       le besoin de réseau au build.
 - **Icône d'app** : le SVG (`org.champinium.Champinium.svg`, champignon stylisé,
   encore une identité **placeholder**) est la source de vérité, **rasterisé au
-  build** (`rsvg-convert`, dans le SDK GNOME) en PNG 128/256 installés dans
-  hicolor + le SVG scalable conservé. Une icône raster trouvable est **requise**
-  par `appstreamcli compose` : un SVG scalable seul échoue en
-  `file-read-error`/`filters-but-no-output` (cause du premier rouge CI). Le
-  design reste à remplacer par une vraie identité visuelle, mais la chaîne
-  d'icônes est complète et valide.
+  build** (`rsvg-convert`, dans le SDK GNOME) en PNG **64/128/256** installés
+  dans hicolor (64×64 = taille mandataire du cache AppStream). Le SVG lui-même
+  n'est **volontairement pas installé** dans `hicolor/scalable/` : le conteneur
+  qui exécute `appstreamcli compose` n'a pas de loader SVG gdk-pixbuf, et le
+  compose échoue alors en `file-read-error` (« Unrecognized image file format »)
+  → `filters-but-no-output` → build rouge. C'était la cause réelle du rouge CI
+  initial (diagnostiquée via `appstreamcli compose --print-report=full`, le
+  résumé du job ne nommant pas le fichier fautif). Les PNG couvrent tous les
+  besoins d'AppStream et du thème d'icônes. Le design reste à remplacer par une
+  vraie identité visuelle.
 
 ### Build/installation locale
 

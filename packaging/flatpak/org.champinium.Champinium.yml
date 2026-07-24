@@ -102,12 +102,16 @@ modules:
       - install -Dm755 target/release/champinium /app/bin/champinium
       # Point de montage de l'extension ffmpeg-full (peuplé à l'installation).
       - mkdir -p /app/lib/ffmpeg
-      # Icône : le SVG est la source de vérité, rasterisé au build (rsvg-convert
-      # est dans org.gnome.Sdk) en PNG 128/256. appstreamcli compose exige une
-      # icône RASTER trouvable (un SVG scalable seul échoue en
-      # `file-read-error`/`filters-but-no-output` — cause du rouge CI initial).
-      # 64x64 = taille MANDATAIRE du cache d'icônes AppStream. Sans elle,
-      # appstreamcli compose peut lever file-read-error au lieu de downscaler.
+      # Icônes : le SVG (packaging/) est la source de vérité, rasterisé au build
+      # (rsvg-convert, fourni par org.gnome.Sdk) en PNG 64/128/256 — 64x64 est la
+      # taille mandataire du cache d'icônes AppStream.
+      #
+      # Le SVG lui-même n'est VOLONTAIREMENT PAS installé dans
+      # hicolor/scalable/ : `appstreamcli compose` tente de le décoder et échoue
+      # (« Unable to read data from file …scalable/apps/….svg: Unrecognized image
+      # file format » → file-read-error → filters-but-no-output → build rouge),
+      # le conteneur de compose n'ayant pas de loader SVG gdk-pixbuf. Les PNG
+      # couvrent tous les besoins d'AppStream et du thème d'icônes.
       - rsvg-convert -w 64 -h 64 packaging/flatpak/org.champinium.Champinium.svg
         -o org.champinium.Champinium-64.png
       - install -Dm644 org.champinium.Champinium-64.png
@@ -120,38 +124,10 @@ modules:
         -o org.champinium.Champinium-256.png
       - install -Dm644 org.champinium.Champinium-256.png
         /app/share/icons/hicolor/256x256/apps/org.champinium.Champinium.png
-      # SVG scalable conservé (sources vectorielles, thèmes à haute densité).
-      - install -Dm644 packaging/flatpak/org.champinium.Champinium.svg
-        /app/share/icons/hicolor/scalable/apps/org.champinium.Champinium.svg
       - install -Dm644 packaging/flatpak/org.champinium.Champinium.desktop
         /app/share/applications/org.champinium.Champinium.desktop
       - install -Dm644 packaging/flatpak/org.champinium.Champinium.metainfo.xml
         /app/share/metainfo/org.champinium.Champinium.metainfo.xml
-      # DIAG TEMPORAIRE (à retirer) — surface le {{fname}} du file-read-error
-      # d'appstreamcli compose, que le résumé CI ne montre pas.
-      - |
-        echo "===== DIAG icons (taille/type) ====="
-        ls -la /app/share/icons/hicolor/*/apps/ 2>&1 || true
-        file /app/share/icons/hicolor/*/apps/* 2>&1 || true
-        echo "===== DIAG desktop ====="
-        cat /app/share/applications/org.champinium.Champinium.desktop || true
-        echo "===== DIAG metainfo validate ====="
-        appstreamcli validate --no-net /app/share/metainfo/org.champinium.Champinium.metainfo.xml 2>&1 || true
-        echo "===== DIAG compose --verbose (reproduit le file-read-error avec fname) ====="
-        mkdir -p /tmp/ascr /tmp/ascd /tmp/asci
-        appstreamcli compose --verbose --print-report=full --prefix=/ \
-          --result-root=/tmp/ascr --data-dir=/tmp/ascd --icons-dir=/tmp/asci \
-          --origin=diag /app 2>&1 | tail -50 || true
-        echo "----- ISSUE REPORT (gz inclus) -----"
-        for f in $(find /tmp/ascr /tmp/ascd -type f 2>/dev/null | head -10); do
-          echo "--- $f ---"
-          case "$f" in
-            *.gz) zcat "$f" | sed 's/<[^>]*>//g' | grep -viE '^\s*$' | head -30 ;;
-            *) sed 's/<[^>]*>//g' "$f" | grep -viE '^\s*$' | head -30 ;;
-          esac
-        done
-        echo "===== DIAG END ====="
-        true
     sources:
       - type: dir
         path: ../..
