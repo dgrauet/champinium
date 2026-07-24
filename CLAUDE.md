@@ -356,19 +356,24 @@ sur deux machines physiques.
   pratique est déjà assurée par le point ci-dessus, l'interop IPFS public
   reste bloquée par ailleurs — voir [`docs/adr/0007-ipns-deferred.md`](docs/adr/0007-ipns-deferred.md)).
   **La refonte channels (lots a–d) est intégralement livrée.**
-- **Packaging Linux — Flatpak ✔ (structurel, palier gratuit)** : manifeste
+- **Packaging Linux — Flatpak ✔ (fonctionnel, palier gratuit)** : manifeste
   [`packaging/flatpak/org.champinium.Champinium.yml`](packaging/flatpak/org.champinium.Champinium.yml)
-  (app-id `org.champinium.Champinium`, runtime GNOME 47 + extension
-  rust-stable), `.desktop` + métainfo AppStream à côté. `finish-args` minimal
+  (app-id `org.champinium.Champinium`, runtime GNOME 48, rustc via rustup au
+  build), `.desktop` + métainfo AppStream à côté. `finish-args` minimal
   (réseau, wayland/x11/dri, ipc, pulseaudio — **pas** de
   `--filesystem=host` : `default_data_dir()` atterrit déjà dans le sandbox via
-  la redirection standard de `XDG_DATA_HOME`). Build cargo en `--share=network`
-  (pas encore vendorisé hors-ligne — écart documenté, voir
-  [`docs/packaging.md`](docs/packaging.md)). Job CI `flatpak` (conteneur
-  `bilelmoussaoui/flatpak-github-actions:gnome-47`) = seule validation réelle
-  du manifeste, non exécutable en dev macOS. GStreamer plugins-bad/libav
-  (H.264/AAC) absents du runtime GNOME de base et non recompilés ici — suivi.
-  AppImage non fait (suivi, différé par effort).
+  la redirection standard de `XDG_DATA_HOME`). **Lecture H.264/AAC ✔** via
+  l'extension `org.freedesktop.Platform.ffmpeg-full//24.08` (montée dans
+  `/app/lib/ffmpeg`, `add-ld-path` → gst-libav y trouve les décodeurs sous
+  brevet ; front lecture seule = décodage suffit). **Icône ✔** : SVG champignon
+  (placeholder de design) rasterisé au build en PNG 128/256 (`rsvg-convert`) +
+  SVG conservé — appstreamcli compose exige une icône raster trouvable. Job CI
+  `flatpak` (conteneur `bilelmoussaoui/flatpak-github-actions:gnome-47`) = seule
+  validation réelle du manifeste, non exécutable en dev macOS. **Différé
+  (Flathub only)** : sources cargo vendorisées hors-ligne (aujourd'hui
+  `--share=network` au build) + épinglage rustup — voir
+  [`docs/packaging.md`](docs/packaging.md). AppImage non fait (différé par
+  effort). Design d'icône réel = suivi.
 
 **Stockage froid CS-a ✔ (ADR 0008) — récupération/repli seule ; archivage
 différé.** Filet de dernier recours contre la perte d'un contenu sans abonné,

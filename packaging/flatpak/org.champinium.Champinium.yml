@@ -5,38 +5,54 @@
 # courante — voir le module ci-dessous), module unique compilant
 # `champinium-linux` (feature `gui`).
 #
-# Choix de version : org.gnome.Platform/Sdk 47 (stable courante au moment de
-# l'écriture de ce manifeste — à faire suivre lors des mises à jour GNOME).
+# Choix de version : org.gnome.Platform/Sdk 48 (base freedesktop 24.08). À
+# faire suivre lors des mises à jour GNOME — l'extension ffmpeg-full ci-dessous
+# doit rester alignée sur la base freedesktop du runtime.
 #
-# GStreamer : org.gnome.Platform embarque gstreamer1.0 core + plugins-base +
-# plugins-good (assez pour VP8/VP9/Opus/WebM). Les plugins **plugins-bad** et
-# **libav** (nécessaires pour H.264/AAC — voir scripts/package-linux-app.sh qui
-# les liste comme dépendances système du tarball) NE SONT PAS embarqués par le
-# runtime GNOME de base (restrictions de brevets/licences en amont). Ce
-# manifeste ne les construit pas depuis les sources pour l'instant : c'est un
-# suivi documenté (voir docs/packaging.md), pas un blocage du build Flatpak
-# lui-même. À terme : soit compiler gst-plugins-bad/gst-libav en module
-# flatpak-builder, soit dépendre d'une extension Flathub équivalente si une
-# apparaît pour org.gnome.Platform.
+# Lecture H.264/AAC : le runtime GNOME embarque gstreamer1.0 core + plugins-base
+# + plugins-good (VP8/VP9/Opus/WebM) ET le plugin gst-libav, mais ce dernier est
+# lié à l'ffmpeg de base freedesktop, amputé des décodeurs sous brevet
+# (H.264/AAC). L'extension `org.freedesktop.Platform.ffmpeg-full` (voir
+# `add-extensions`) monte un ffmpeg complet dans `/app/lib/ffmpeg` et, via
+# `add-ld-path`, le place en tête du LD_LIBRARY_PATH : gst-libav y trouve alors
+# les décodeurs H.264/AAC. C'est le patron Flathub standard — les codecs
+# encombrés de brevets sont distribués dans une extension séparée, jamais dans
+# l'app. Le front est LECTURE seule (playbin GStreamer) : seul le décodage est
+# requis, pas d'encodage dans le bac à sable. Champinium ingère en H.264/AAC
+# (HLS), donc cette extension est nécessaire pour lire le propre contenu de
+# l'app.
 #
 # Sources cargo : ce manifeste build avec `--share=network` pendant le module
 # de compilation (cargo télécharge les crates depuis crates.io). C'est un
 # ÉCART assumé par rapport au patron Flatpak/Flathub « correct » qui utiliserait
 # des sources vendorisées hors-ligne (cargo-sources.json généré par
 # flatpak-cargo-generator, cf. https://github.com/flatpak/flatpak-builder-tools).
-# Générer ce fichier nécessite un accès réseau + le script flatpak-cargo-generator,
-# indisponibles dans l'environnement où ce manifeste a été rédigé (pas de
-# Flatpak ni de clone du dépôt flatpak-builder-tools). Le job CI qui construit
-# ce manifeste a un accès réseau (runner GitHub Actions) donc `--share=network`
-# au build fonctionne ; une vraie publication Flathub devrait basculer sur les
-# sources vendorisées pour la reproductibilité (Flathub l'exige d'ailleurs pour
-# les modules cargo). Noté comme suivi dans docs/packaging.md.
+# Le job CI qui construit ce manifeste a un accès réseau (runner GitHub Actions)
+# donc `--share=network` au build fonctionne ; une VRAIE publication Flathub
+# devra basculer sur les sources vendorisées pour la reproductibilité (Flathub
+# l'exige pour les modules cargo). DIFFÉRÉ, suivi documenté dans
+# docs/packaging.md — ce lot vise un Flatpak fonctionnel, pas une soumission
+# Flathub.
 
 app-id: org.champinium.Champinium
 runtime: org.gnome.Platform
 runtime-version: "48"
 sdk: org.gnome.Sdk
 command: champinium
+
+# Codecs sous brevet (H.264/AAC) fournis par une extension séparée, montée dans
+# /app/lib/ffmpeg. `add-ld-path: .` (relatif au `directory`) préfixe le
+# LD_LIBRARY_PATH → l'ffmpeg complet de l'extension prime sur celui du runtime,
+# et le gst-libav du runtime y trouve les décodeurs. `version` alignée sur la
+# base freedesktop du runtime GNOME 48 (24.08). Créé vide au build (mkdir
+# ci-dessous) ; peuplé à l'installation par flatpak.
+add-extensions:
+  org.freedesktop.Platform.ffmpeg-full:
+    directory: lib/ffmpeg
+    version: "24.08"
+    add-ld-path: .
+    no-autodownload: false
+    autodelete: false
 
 # Permissions minimales pour un lecteur P2P (pas de --filesystem=host) :
 # - réseau : libp2p (TCP/QUIC) parle au monde entier, pas de proxy possible.
@@ -71,7 +87,7 @@ modules:
     build-commands:
       # rustc via rustup plutôt que l'extension SDK rust-stable : la pile
       # gtk-rs courante (glib/gio-sys 0.22) exige rustc ≥ 1.92, or l'extension
-      # rust-stable du SDK GNOME 47 est figée à 1.89 (échec CI observé). Le
+      # rust-stable du SDK GNOME est figée en deçà (échec CI observé). Le
       # réseau étant déjà partagé au build (voir en-tête), on installe le
       # toolchain stable courant, garanti ≥ 1.92 (le job CI ubuntu compile la
       # même pile avec le rustc du runner). CARGO_HOME/RUSTUP_HOME dans le
@@ -84,8 +100,21 @@ modules:
         export PATH="$CARGO_HOME/bin:$PATH"
         cargo build --release -p champinium-linux --features gui
       - install -Dm755 target/release/champinium /app/bin/champinium
-      # Icône placeholder (appstreamcli refuse une app GUI sans icône) — à
-      # remplacer par une vraie identité visuelle.
+      # Point de montage de l'extension ffmpeg-full (peuplé à l'installation).
+      - mkdir -p /app/lib/ffmpeg
+      # Icône : le SVG est la source de vérité, rasterisé au build (rsvg-convert
+      # est dans org.gnome.Sdk) en PNG 128/256. appstreamcli compose exige une
+      # icône RASTER trouvable (un SVG scalable seul échoue en
+      # `file-read-error`/`filters-but-no-output` — cause du rouge CI initial).
+      - rsvg-convert -w 128 -h 128 packaging/flatpak/org.champinium.Champinium.svg
+        -o org.champinium.Champinium-128.png
+      - install -Dm644 org.champinium.Champinium-128.png
+        /app/share/icons/hicolor/128x128/apps/org.champinium.Champinium.png
+      - rsvg-convert -w 256 -h 256 packaging/flatpak/org.champinium.Champinium.svg
+        -o org.champinium.Champinium-256.png
+      - install -Dm644 org.champinium.Champinium-256.png
+        /app/share/icons/hicolor/256x256/apps/org.champinium.Champinium.png
+      # SVG scalable conservé (sources vectorielles, thèmes à haute densité).
       - install -Dm644 packaging/flatpak/org.champinium.Champinium.svg
         /app/share/icons/hicolor/scalable/apps/org.champinium.Champinium.svg
       - install -Dm644 packaging/flatpak/org.champinium.Champinium.desktop

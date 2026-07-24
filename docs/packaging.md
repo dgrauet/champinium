@@ -50,13 +50,19 @@ AppStream requis à côté. Toujours palier **gratuit** (0 €, pas de compte
 Flathub) — ce n'est pas une soumission Flathub, juste un paquet installable
 localement ou distribuable en `.flatpak` autonome.
 
-- **Runtime** : `org.gnome.Platform`/`org.gnome.Sdk` 47 (stable courante) +
-  extension SDK `org.freedesktop.Sdk.Extension.rust-stable` pour builder
-  cargo. GStreamer core/plugins-base/plugins-good sont déjà dans le runtime
-  GNOME. **Limite connue** : plugins-bad et libav (H.264/AAC — voir la liste
-  de dépendances du tarball ci-dessus) n'y sont **pas** inclus ; ce manifeste
-  ne les compile pas depuis les sources pour l'instant (suivi documenté,
-  pas un blocage du build).
+- **Runtime** : `org.gnome.Platform`/`org.gnome.Sdk` 48 (base freedesktop
+  24.08). rustc est installé au build via rustup (l'extension SDK `rust-stable`
+  est trop ancienne pour la pile gtk-rs courante — voir supply-chain ci-dessous).
+  GStreamer core/plugins-base/plugins-good sont déjà dans le runtime GNOME.
+- **Lecture H.264/AAC** : fournie par l'extension
+  `org.freedesktop.Platform.ffmpeg-full//24.08` (`add-extensions`, montée dans
+  `/app/lib/ffmpeg` avec `add-ld-path`). Le runtime embarque gst-libav mais lié
+  à l'ffmpeg de base freedesktop, amputé des décodeurs sous brevet ; l'extension
+  monte un ffmpeg complet en tête du LD_LIBRARY_PATH, et gst-libav y trouve
+  H.264/AAC. Patron Flathub standard (codecs encombrés distribués à part, jamais
+  dans l'app). Le front étant lecture seule (playbin), seul le décodage est
+  requis. Champinium ingérant en H.264/AAC (HLS), l'extension est nécessaire
+  pour lire le propre contenu de l'app.
 - **Permissions (`finish-args`)** : réseau (libp2p), wayland/fallback-x11/dri
   (fenêtre GTK4 + rendu vidéo GStreamer), ipc, pulseaudio (audio). **Pas de**
   `--filesystem=host` ni `--filesystem=xdg-download` : les données du nœud
@@ -80,13 +86,14 @@ localement ou distribuable en `.flatpak` autonome.
       `rustup-init`, toolchain figé) ou fournir rustc via une extension SDK à
       jour. Les sources cargo vendorisées ci-dessus supprimeront de toute façon
       le besoin de réseau au build.
-- **Icône d'app** : une icône **placeholder** (`org.champinium.Champinium.svg`,
-  champignon stylisé) est installée pour satisfaire `appstreamcli`
-  (`gui-app-without-icon`) — à remplacer par une vraie identité visuelle.
-- **Lecture H.264/AAC** : le runtime `org.gnome.Platform` de base n'embarque pas
-  gstreamer-plugins-bad/libav → l'app se lance mais ne lit pas la plupart des
-  vidéos. **Bloqueur avant tout usage réel** : ajouter ces plugins en modules
-  flatpak-builder.
+- **Icône d'app** : le SVG (`org.champinium.Champinium.svg`, champignon stylisé,
+  encore une identité **placeholder**) est la source de vérité, **rasterisé au
+  build** (`rsvg-convert`, dans le SDK GNOME) en PNG 128/256 installés dans
+  hicolor + le SVG scalable conservé. Une icône raster trouvable est **requise**
+  par `appstreamcli compose` : un SVG scalable seul échoue en
+  `file-read-error`/`filters-but-no-output` (cause du premier rouge CI). Le
+  design reste à remplacer par une vraie identité visuelle, mais la chaîne
+  d'icônes est complète et valide.
 
 ### Build/installation locale
 
@@ -97,9 +104,11 @@ flatpak run org.champinium.Champinium
 ```
 
 Prérequis : `flatpak`, `flatpak-builder`, et les runtimes
-`org.gnome.Platform//47` + `org.gnome.Sdk//47` +
-`org.freedesktop.Sdk.Extension.rust-stable//47` installés (`flatpak install
-flathub org.gnome.Platform//47 org.gnome.Sdk//47`).
+`org.gnome.Platform//48` + `org.gnome.Sdk//48` +
+`org.freedesktop.Platform.ffmpeg-full//24.08` installés (`flatpak install
+flathub org.gnome.Platform//48 org.gnome.Sdk//48
+org.freedesktop.Platform.ffmpeg-full//24.08`). L'extension ffmpeg-full est
+tirée automatiquement à l'installation de l'app (`no-autodownload: false`).
 
 ### CI
 

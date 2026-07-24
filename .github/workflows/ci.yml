@@ -173,6 +173,12 @@ jobs:
     # CI, jamais publié.
     runs-on: ubuntu-latest
     container:
+      # L'image ne publie pas de tag gnome-48 (s'arrête à gnome-47 + nightly),
+      # mais le manifeste cible le runtime GNOME 48. C'est OK : flatpak-builder
+      # tire org.gnome.Platform/Sdk//48 au build (réseau dispo sur le runner),
+      # et GNOME 47 comme 48 partagent la base freedesktop 24.08 (donc
+      # l'extension ffmpeg-full//24.08 du manifeste reste alignée). Décalage
+      # image/runtime volontaire — à passer sur gnome-48 dès que le tag existe.
       image: bilelmoussaoui/flatpak-github-actions:gnome-47
       options: --privileged
     steps:
