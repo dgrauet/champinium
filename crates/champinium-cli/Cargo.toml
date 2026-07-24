@@ -7,6 +7,12 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+# Repli de récupération froide Arweave (ADR 0008) — opt-in : garde `reqwest`
+# hors du build et de la résolution de dépendances par défaut. Active la
+# sous-commande `cold-retrieval`. L'archivage est différé (voir champinium-core).
+cold-storage = ["champinium-core/cold-storage"]
+
 [dependencies]
 champinium-core.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "fs"] }

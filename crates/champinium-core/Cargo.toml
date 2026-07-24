@@ -19,6 +19,15 @@ name = "champinium_core"
 name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
 
+[features]
+# Stockage froid optionnel (Arweave, ADR 0008) — **récupération seule**.
+# Aucune dep supplémentaire tirée par défaut ; sous la feature, seul `reqwest`
+# (HTTP pur : GraphQL de découverte + GET) et `async-trait` (dyn-compat du
+# trait) sont ajoutés. L'archivage (signature Arweave) est différé faute de
+# crate `rsa` sans CVE — donc **pas de dépendance `rsa`** et `cargo deny`
+# reste propre sans ignore. Voir .superpowers/sdd/coldstore-decision.md.
+cold-storage = ["dep:reqwest", "dep:async-trait"]
+
 [dependencies]
 uniffi = { workspace = true, features = ["cli", "tokio"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "macros", "fs", "io-util", "process"] }
@@ -33,7 +42,17 @@ serde_json = "1"
 base64 = "0.22"
 thiserror = "2"
 tracing = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
+# Désacharnement (« type erasure ») pour le trait `ColdStore` : nécessaire pour
+# rester dyn-compatible malgré des méthodes async (edition 2021 — les async fn
+# natives en trait ne sont pas dyn-compatibles). Gaté par la même feature.
+async-trait = { version = "0.1", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 tempfile = "3"
+# Serveur HTTP mock pour les tests coldstore (gateways Arweave simulées).
+# httpmock écarté : dépendance non optionnelle sur async-std (discontinué,
+# RUSTSEC-2025-0052) — fait échouer `cargo deny check`. wiremock (base tokio,
+# cohérente avec le reste du workspace) est cargo-deny-clean.
+wiremock = "0.6"

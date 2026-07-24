@@ -21,6 +21,8 @@ uniffi::setup_scaffolding!();
 pub mod blockstore;
 pub mod catalog;
 pub mod channel_link;
+#[cfg(feature = "cold-storage")]
+pub mod coldstore;
 pub mod content;
 pub mod error;
 pub mod feed;

@@ -69,11 +69,16 @@ La suppression centrale est impossible par construction → modération côté n
 1. **Persistance** — contenu sans seeder disparaît. Mitigation : seed proactif
    des abonnés (chaque abonné retient et resert ce qu'il suit, sous quota) +
    pins (contenu propre auto-épinglé, plus tout manifeste épinglé manuellement) ;
-   cold storage optionnel décidé (Arweave, payé par le créateur — ADR 0008), non implémenté au pilot.
+   cold storage optionnel Arweave (ADR 0008) livré côté cœur+CLI (CS-a) derrière
+   la feature opt-in `cold-storage` **en repli de récupération CID-vérifié seul**
+   (archivage différé, voir « État actuel ») — voir « État actuel ».
 2. **Async FFI** — async/streams tokio → Swift ET C#. Mitigé par le spike Phase 0.
 3. **Modération décentralisée** — deux checkpoints, denylists signées.
 4. **Recherche décentralisée non résolue** — tags DHT + index local ; limites assumées.
-5. **Coûts vidéo** — cold storage documenté, non implémenté.
+5. **Coûts vidéo** — cold storage opt-in (CS-a, feature `cold-storage`) livré en
+   **repli de récupération seul** ; l'archivage créateur-paie (par publication
+   choisie, devis affiché) reste conçu (ADR 0008) mais **différé** faute de
+   crate `rsa` sans CVE.
 6. **NAT traversal** — relay-v2 + DCUtR ; relays stateless multipliables.
 7. **Signature multi-OS** — notarisation Apple / Authenticode / Flatpak (Phase 6).
 8. **Maintenance ×3 UI** — mitigée par zéro logique dans les fronts.
@@ -350,6 +355,37 @@ sur deux machines physiques.
   pratique est déjà assurée par le point ci-dessus, l'interop IPFS public
   reste bloquée par ailleurs — voir [`docs/adr/0007-ipns-deferred.md`](docs/adr/0007-ipns-deferred.md)).
   **La refonte channels (lots a–d) est intégralement livrée.**
+
+**Stockage froid CS-a ✔ (ADR 0008) — récupération/repli seule ; archivage
+différé.** Filet de dernier recours contre la perte d'un contenu sans abonné,
+entièrement **derrière une feature cargo opt-in `cold-storage`** (absente des
+builds par défaut). Sous la feature, **seul `reqwest` (HTTP pur) est ajouté —
+PAS de `rsa`** : `cargo deny` reste **propre sans aucun ignore ajouté**
+(l'advisory RUSTSEC-2023-0071 Marvin ne peut plus s'appliquer, `rsa` n'étant
+tirée par aucune configuration ; `deny.toml` ne porte que ses deux ignores
+préexistants bincode/paste). Livré :
+- **Trait `ColdStore`** (`retrieve` seul), backend Arweave `ArweaveColdStore`
+  (module `coldstore/`) : découverte GraphQL par tag CID + GET + **vérification
+  CID** + bornage de taille. HTTP pur, aucune signature.
+- **Repli de récupération froide dans `Node::get_with`** : uniquement sur
+  `NoProviders` (jamais chemin principal), **CID-vérifié** avant tout usage (les
+  gateways peuvent servir du silence, jamais du faux), puis flux normal —
+  politique Seed/Stream inchangée (souscrit → **réamorce le P2P**), checkpoint de
+  modération #2 inchangé. **Débrayable** (dotfile `.cold_enabled`, actif par
+  défaut) : interroger une gateway par CID révèle l'intérêt de l'IP, surface
+  d'observation documentée avec la même franchise que le suivi actif.
+- **CLI** (gatée par la feature `cold-storage` du CLI) : `cold-retrieval
+  [--set on|off]` (réglage du repli) uniquement.
+- Couverture par gateways `wiremock`, **sans réseau réel** ; le job CI
+  `cold-storage` build+clippy+teste la feature.
+- **Archivage Arweave DIFFÉRÉ d'implémentation** : la conception (deux temps
+  créateur-paie devis→confirmation, signature deep-hash + RSA-PSS, forme par
+  item-tx) **reste actée par l'ADR 0008**, mais n'est **pas implémentée** — la
+  seule voie de signature RSA-PSS passe par la crate `rsa`, dont toute version
+  est vulnérable (0.9 stable sans mitigation, 0.10 en pré-release). Aucune API
+  d'archivage, aucun reçu, aucun portefeuille dans le code. À reprendre dès
+  `rsa 0.10.0` stable ou une crate Arweave maintenue.
+- **CS-b hors périmètre** (fronts ×3 ; contrat FFI v10 ; Filecoin via le trait).
 
 Phasing : 0 (spike async FFI ✔ contrat) → **1 (P2P nu CLI ✔)** → **2 (modération ✔,
 feeds/gossipsub/catalogue ✔, ingestion ffmpeg ✔)** → **3 (contrat UniFFI v3 ✔,

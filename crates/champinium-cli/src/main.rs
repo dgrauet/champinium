@@ -181,6 +181,14 @@ enum Cmd {
         #[arg(long)]
         by_channel: bool,
     },
+    /// Affiche (et éventuellement définit) le débrayage du repli de
+    /// récupération froid.
+    #[cfg(feature = "cold-storage")]
+    ColdRetrieval {
+        /// `on` ou `off`.
+        #[arg(long)]
+        set: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -462,6 +470,24 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+        }
+        #[cfg(feature = "cold-storage")]
+        Cmd::ColdRetrieval { set } => {
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            if let Some(value) = set {
+                let enabled = match value.to_lowercase().as_str() {
+                    "on" => true,
+                    "off" => false,
+                    other => anyhow::bail!("valeur invalide pour --set: {other} (attendu on|off)"),
+                };
+                node.set_cold_retrieval(enabled)?;
+            }
+            let state = if node.cold_retrieval_enabled() {
+                "activé"
+            } else {
+                "désactivé"
+            };
+            println!("repli de récupération froid: {state}");
         }
     }
     Ok(())
