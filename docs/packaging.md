@@ -124,6 +124,77 @@ via l'action `flatpak/flatpak-github-actions/flatpak-builder`, produit
 Flathub. Ce job n'a pas pu être exécuté localement pendant l'écriture de ce
 manifeste (pas de Flatpak sur macOS) : c'est ce job CI qui fait foi.
 
+## Liens `champinium://`
+
+Cliquer un lien `champinium://channel/<peerid>` hors de l'app (navigateur,
+messagerie, terminal) ouvre Champinium sur **l'aperçu du channel** — jamais un
+abonnement : un lien est une invitation à regarder, pas un engagement. Si l'app
+tourne déjà, le lien est **transmis à l'instance en cours** ; jamais un second
+nœud sur le même répertoire de données (identité Ed25519, blocs, `.seed_index`,
+`seq` du feed).
+
+Le bout-en-bout n'est **pas automatisable en CI** (il faut une session de bureau
+et une app installée) — voici la procédure manuelle par OS.
+
+### macOS
+
+Déclaré par `CFBundleURLTypes` dans l'`Info.plist` du bundle (généré par
+[`scripts/package-macos-app.sh`](../scripts/package-macos-app.sh)).
+LaunchServices enregistre le handler quand il voit l'app : déplacer
+`Champinium.app` dans `/Applications` ou la lancer une fois.
+
+```sh
+open 'champinium://channel/<peerid>'
+```
+
+### Linux
+
+Déclaré par `MimeType=x-scheme-handler/champinium;` + `Exec=… %u` dans le
+`.desktop` — **les deux** : celui du tarball
+([`scripts/package-linux-app.sh`](../scripts/package-linux-app.sh)) et celui du
+Flatpak ([`packaging/flatpak/`](../packaging/flatpak/)). Ils doivent rester
+cohérents : un utilisateur a l'un OU l'autre, le comportement ne doit pas
+différer.
+
+Après installation du `.desktop` du tarball, rafraîchir la base des handlers :
+
+```sh
+update-desktop-database ~/.local/share/applications
+xdg-open 'champinium://channel/<peerid>'
+```
+
+(Le Flatpak exporte son `.desktop` tout seul à l'installation.)
+
+### Windows
+
+**Pas d'installeur** (ZIP portable) : l'app **s'enregistre elle-même au
+démarrage**, sous `HKCU\Software\Classes\champinium` (utilisateur courant, aucun
+droit admin), via `ActivationRegistrationManager` du Windows App SDK — l'API
+prévue pour les apps *unpackaged*. Il faut donc **lancer l'app au moins une
+fois** avant qu'un lien fonctionne. L'enregistrement est rejoué à chaque
+démarrage : il est idempotent et corrige tout seul le chemin de l'exe si le
+dossier portable est déplacé. Un échec d'écriture (registre verrouillé par une
+politique d'entreprise) est **non fatal** — l'app démarre normalement, seuls les
+liens ne fonctionnent pas.
+
+```
+start champinium://channel/<peerid>
+```
+
+Désenregistrement (manuel) : supprimer la clé
+`HKCU\Software\Classes\champinium`.
+
+### Les trois scénarios à vérifier
+
+Sur chaque OS, tester les trois — ils empruntent des chemins de code différents :
+
+1. **App fermée** (démarrage à froid) — le lien doit attendre l'ouverture du
+   nœud puis afficher l'aperçu, jamais être perdu en silence.
+2. **App déjà ouverte** — le lien arrive dans l'instance en cours (aucun second
+   process).
+3. **Lien invalide** (ex. `champinium://channel/pas-une-cle`) — message d'erreur
+   clair, app utilisable, aucun abonnement.
+
 ### AppImage (suivi, non fait)
 
 Pas de recette AppImage pour l'instant — différé par effort, comme documenté

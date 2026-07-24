@@ -251,8 +251,8 @@ sur deux machines physiques.
   trois fronts ont une vue **Abonnements** (par défaut) et une vue
   **Explorer** (catalogue complet, opt-in derrière un avertissement) avec
   désabonnement possible depuis les deux. L'enregistrement OS du scheme
-  `champinium://` (Info.plist / appxmanifest / .desktop) est différé au
-  packaging (Phase 6) — coller le lien reste manuel jusque-là.
+  `champinium://` est **livré** (partie B, voir plus bas) : un lien s'ouvre
+  d'un clic depuis un navigateur, en plus du collage manuel.
 - **Channels lot (c) ✔** : politique de stockage explicite par appel,
   **`StorePolicy::Stream` par défaut** (`get` ne met plus le bloc en cache et
   n'annonce plus le consommateur comme fournisseur) — **seed-what-you-consume
@@ -340,12 +340,27 @@ sur deux machines physiques.
   Les trois fronts : champ de collage de lien → bouton « Aperçu » (état de
   chargement pendant l'appel async) → fiche/feuille/fenêtre d'aperçu avec
   « S'abonner » / « Se désabonner » selon `subscribed`, ou « Channel bloqué »
-  si `blocked`. **Partie B** (enregistrement du scheme `champinium://` auprès
-  de l'OS — `CFBundleURLTypes`/`onOpenURL`, `x-scheme-handler` + instance
-  unique, registre Windows — pour ouvrir un lien d'un clic depuis un
-  navigateur) reste **différée à la Phase 6 (packaging)**, sur ce même
-  `resolve_channel` : coller le lien manuellement dans l'app reste le seul
-  chemin jusque-là.
+  si `blocked`.
+- **Liens `champinium://` partie B ✔ (enregistrement OS du scheme)** : cliquer
+  un lien hors de l'app ouvre Champinium sur **l'aperçu** de la partie A —
+  jamais un abonnement. Deux moitiés par front : *déclaration* (packaging) et
+  *réception* (code du front), la réception **rejouant le chemin du coller-lien
+  existant** (mêmes états de chargement, mêmes messages d'erreur, zéro
+  duplication). macOS : `CFBundleURLTypes` dans l'`Info.plist` généré +
+  `.onOpenURL`. Linux : `MimeType=x-scheme-handler/champinium;` + `Exec=… %u`
+  dans les **deux** `.desktop` (tarball ET Flatpak) + `ApplicationFlags::
+  HANDLES_OPEN`/`connect_open` (le signal `open` REMPLACE `activate` au
+  lancement par URI — la fenêtre doit être construite là). Windows : l'app
+  s'enregistre elle-même au démarrage sous `HKCU\Software\Classes\champinium`
+  via `ActivationRegistrationManager` (API WinAppSDK pour app **unpackaged**,
+  aucun droit admin, idempotente — corrige le chemin si le dossier portable
+  bouge), plus `AppInstance` + redirection d'activation. **Instance unique**
+  (exigence de correction, pas de confort) : deux process se disputeraient
+  identité Ed25519/blockstore/`.seed_index`/`seq`. Démarrage à froid géré
+  partout (le lien attend que le nœud soit ouvert, jamais perdu en silence).
+  **Contrat FFI inchangé (v10)** — rien dans le cœur. Test de bout en bout non
+  automatisable en CI : procédure manuelle par OS dans
+  [`docs/packaging.md`](docs/packaging.md).
 - **Durabilité du record de feed ✔** : `Node::republish_known_feeds`
   (`champinium-seed`, même boucle que `reprovide_all`) re-PUT dans la DHT le
   feed signé du nœud lui-même et ceux de ses **abonnements** — corrige un
@@ -422,7 +437,7 @@ bitswap différé)** → 5 (en cours : peer scoring ✔, signalement P2P ✔, r�
 mesurée ✔, recherche ✔ (#20) ; **refonte channels COMPLÈTE** — lot (a) identité
 ✔, lot (b) abonnements ✔, lot (c) seed proactif/quota/pins ✔, lot (d) modération
 par clé + blocage local + signalements par channel ✔ ; aperçu de channel par
-lien ✔ (`resolve_channel`, contrat v9, partie B différée Phase 6) ; durabilité
+lien ✔ (`resolve_channel`, contrat v9 ; partie B — scheme OS — ✔) ; durabilité
 du record de feed ✔ (`republish_known_feeds`) ; IPNS #21 close, voir ADR 0007).
 Voir le spec.
 
