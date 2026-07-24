@@ -5,7 +5,12 @@
   la validation `appstreamcli validate` en CI.
 -->
 <component type="desktop-application">
-  <id>org.champinium.Champinium.desktop</id>
+  <!-- L'ID ne porte PAS le suffixe `.desktop` : appstreamcli compose dérive le
+       nom du fichier .desktop en ajoutant `.desktop` à l'ID. Avec un ID
+       `…Champinium.desktop`, il cherchait `…Champinium.desktop.desktop`
+       (introuvable → file-read-error → filters-but-no-output → rouge CI). Le
+       lien vers le vrai fichier passe par <launchable> ci-dessous. -->
+  <id>org.champinium.Champinium</id>
   <name>Champinium</name>
   <summary>Partage P2P décentralisé de contenu généré par IA</summary>
   <metadata_license>CC0-1.0</metadata_license>
