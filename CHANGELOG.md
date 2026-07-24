@@ -6,6 +6,13 @@ versionnage : [SemVer](https://semver.org/lang/fr/). À partir de la 0.2.0, ce
 fichier est maintenu automatiquement par release-please (voir
 [ADR-0005](docs/adr/0005-release-please.md)).
 
+## [0.9.0](https://github.com/dgrauet/champinium/compare/v0.8.0...v0.9.0) (2026-07-24)
+
+
+### Features
+
+* stockage froid — récupération/repli Arweave (feature opt-in, archivage différé) ([#62](https://github.com/dgrauet/champinium/issues/62)) ([5e60433](https://github.com/dgrauet/champinium/commit/5e604330c605d3c155a83f8d692ba9d37c87097d))
+
 ## [0.8.0](https://github.com/dgrauet/champinium/compare/v0.7.0...v0.8.0) (2026-07-23)
 
 
