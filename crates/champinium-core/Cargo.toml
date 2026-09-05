@@ -42,6 +42,15 @@ serde_json = "1"
 base64 = "0.23"
 thiserror = "2"
 tracing = "0.1"
+# Serveur HLS local de la lecture progressive (spec 2026-09-05) : HTTP/1.1
+# minimal sur 127.0.0.1. `hyper` est déjà dans le graphe via `reqwest`
+# (feature cold-storage) — aucune crate nouvelle pour `cargo deny`.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+# Jeton d'URL de session (128 bits aléatoires).
+rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
 # Désacharnement (« type erasure ») pour le trait `ColdStore` : nécessaire pour
 # rester dyn-compatible malgré des méthodes async (edition 2021 — les async fn
@@ -56,3 +65,5 @@ tempfile = "3"
 # RUSTSEC-2025-0052) — fait échouer `cargo deny check`. wiremock (base tokio,
 # cohérente avec le reste du workspace) est cargo-deny-clean.
 wiremock = "0.6"
+# Client HTTP nu (sans TLS) pour tester le serveur HLS local.
+reqwest = { version = "0.12", default-features = false }
