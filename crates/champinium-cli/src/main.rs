@@ -398,12 +398,16 @@ async fn main() -> Result<()> {
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => break,
                     r = events.recv() => {
-                        if r.is_err() { break; }
-                        if let Ok(st) = node.stream_status(info.id) {
-                            match st.failed_reason {
-                                Some(reason) => eprintln!("échec: {reason}"),
-                                None => eprintln!("{}/{}", st.fetched_segments, st.total_segments),
+                        match r {
+                            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                if let Ok(st) = node.stream_status(info.id) {
+                                    match st.failed_reason {
+                                        Some(reason) => eprintln!("échec: {reason}"),
+                                        None => eprintln!("{}/{}", st.fetched_segments, st.total_segments),
+                                    }
+                                }
                             }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
                     }
                 }
