@@ -13,6 +13,7 @@ use cid::Cid;
 use futures::future::BoxFuture;
 use scheduler::{FailureCause, SegmentScheduler, SegmentState, RETRY_DELAY};
 use server::{LocalHttpServer, SegmentError, SegmentSource};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -98,12 +99,30 @@ impl SessionState {
         }
     }
 
+    /// Lecture **bloquante** des octets locaux : `Blockstore::get` fait un
+    /// `std::fs::read` complet suivi d'une re-vérification SHA-256 du CID, et
+    /// un segment vidéo pèse des mégaoctets. À n'appeler que depuis un
+    /// contexte bloquant — voir [`SessionState::read_local`].
     fn local_bytes(&self, index: usize) -> Option<Vec<u8>> {
         let cid = self.segments.get(index)?;
         if self.blockstore.has(cid) {
             return self.blockstore.get(cid).ok();
         }
         std::fs::read(self.dir.join(format!("{index}.ts"))).ok()
+    }
+
+    /// [`SessionState::local_bytes`] déportée sur le pool bloquant : appelée
+    /// depuis la tâche de connexion HTTP, qui partage son runtime avec la
+    /// boucle d'évènements libp2p — une lecture multi-mégaoctets + SHA-256 y
+    /// bloquerait le swarm. Le verrou de l'ordonnanceur n'est jamais tenu
+    /// pendant l'attente (aucun appelant ne le détient à ce point).
+    async fn read_local(
+        state: Arc<SessionState>,
+        index: usize,
+    ) -> Result<Option<Vec<u8>>, SegmentError> {
+        tokio::task::spawn_blocking(move || state.local_bytes(index))
+            .await
+            .map_err(|e| SegmentError::Internal(format!("lecture locale interrompue: {e}")))
     }
 }
 
@@ -116,30 +135,32 @@ impl SegmentSource for SessionState {
         if index >= self.segments.len() {
             return Box::pin(async { Err(SegmentError::NotFound) });
         }
-        if let Some(bytes) = self.local_bytes(index) {
-            self.lock().request(index);
-            return Box::pin(async move { Ok(bytes) });
-        }
-        // Absent : passe en tête de priorité, puis attend le changement d'état.
-        // `subscribe` AVANT `request` : sinon un segment devenu présent entre
-        // les deux ne réveillerait jamais cette attente.
+        // La demande déplace la tête de lecture dans tous les cas. `subscribe`
+        // AVANT `request` : sinon un segment devenu présent entre les deux ne
+        // réveillerait jamais l'attente ci-dessous.
         let mut rx = self.changed.subscribe();
         {
             self.lock().request(index);
         }
-        self.wake.notify_one();
         let state: Arc<SessionState> = self.self_arc();
         Box::pin(async move {
+            // Chemin rapide : octets déjà locaux. La lecture part sur le pool
+            // bloquant, jamais sur le runtime partagé avec le swarm.
+            if let Some(bytes) = SessionState::read_local(state.clone(), index).await? {
+                return Ok(bytes);
+            }
+            // Absent : la boucle de fetch doit le prendre en priorité.
+            state.wake.notify_one();
             loop {
                 // L'état est cloné dans un `let` avant le `match` : le verrou
                 // tombe ainsi dès la fin de l'instruction, jamais pendant la
-                // lecture disque de `local_bytes`.
+                // lecture des octets.
                 let current = state.lock().state(index).clone();
                 match current {
                     SegmentState::Present => {
-                        return state.local_bytes(index).ok_or(SegmentError::Internal(
-                            "segment marqué présent mais illisible".into(),
-                        ));
+                        return SessionState::read_local(state.clone(), index).await?.ok_or(
+                            SegmentError::Internal("segment marqué présent mais illisible".into()),
+                        );
                     }
                     SegmentState::Failed {
                         cause: FailureCause::Moderated,
@@ -241,6 +262,11 @@ impl StreamSession {
 /// `Node` lâche la table des sessions, donc annule cette tâche.
 async fn fetch_loop(fetcher: Fetcher, state: Arc<SessionState>) {
     let mut inflight: JoinSet<(usize, Result<Vec<u8>, CoreError>)> = JoinSet::new();
+    // Index du segment par identifiant de tâche : sans lui, une tâche qui
+    // panique rendrait un `JoinError` sans index et laisserait le segment
+    // `InFlight` à jamais — jamais réessayé (l'ordonnanceur juge `InFlight`
+    // inéligible) et occupant durablement un des `MAX_INFLIGHT` créneaux.
+    let mut task_index: HashMap<tokio::task::Id, usize> = HashMap::new();
     let mut completed_notified = false;
     loop {
         // Réclame tout ce que l'ordonnanceur autorise.
@@ -250,12 +276,32 @@ async fn fetch_loop(fetcher: Fetcher, state: Arc<SessionState>) {
             let f = fetcher.clone();
             let cid = state.segments[idx];
             let policy = state.policy;
-            inflight.spawn(async move { (idx, f.get_with(cid, policy).await) });
+            let handle = inflight.spawn(async move { (idx, f.get_with(cid, policy).await) });
+            task_index.insert(handle.id(), idx);
         }
 
         tokio::select! {
-            Some(joined) = inflight.join_next(), if !inflight.is_empty() => {
-                let Ok((idx, res)) = joined else { continue };
+            Some(joined) = inflight.join_next_with_id(), if !inflight.is_empty() => {
+                let (idx, res) = match joined {
+                    Ok((task_id, payload)) => {
+                        task_index.remove(&task_id);
+                        payload
+                    }
+                    Err(join_error) => {
+                        // Tâche paniquée ou annulée : on retrouve son segment
+                        // par identifiant pour le marquer en échec, donc
+                        // rejouable après `RETRY_DELAY`.
+                        let Some(idx) = task_index.remove(&join_error.id()) else { continue };
+                        tracing::warn!("session {}: tâche du segment {idx} interrompue: {join_error}", state.id);
+                        state.lock().mark_failed(
+                            idx,
+                            FailureCause::Other(format!("tâche de récupération interrompue: {join_error}")),
+                            Instant::now(),
+                        );
+                        state.notify_changed();
+                        continue;
+                    }
+                };
                 match res {
                     Ok(bytes) => {
                         if state.policy == StorePolicy::Stream {
@@ -289,5 +335,55 @@ async fn fetch_loop(fetcher: Fetcher, state: Arc<SessionState>) {
             _ = state.wake.notified() => {}
             _ = tokio::time::sleep(RETRY_DELAY) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Garde de la reprise après panique d'une tâche de récupération
+    /// (`fetch_loop`) : l'identifiant rendu par `JoinSet::spawn` retrouve le
+    /// segment dans le `JoinError`, et le marquer `Failed` le rend à nouveau
+    /// éligible après `RETRY_DELAY` — sans quoi il resterait `InFlight` à
+    /// jamais et retiendrait un des `MAX_INFLIGHT` créneaux.
+    #[tokio::test]
+    async fn panicking_fetch_task_is_traced_back_to_its_segment_and_retried() {
+        let mut inflight: JoinSet<(usize, Result<Vec<u8>, CoreError>)> = JoinSet::new();
+        let mut task_index: HashMap<tokio::task::Id, usize> = HashMap::new();
+
+        let mut sched = SegmentScheduler::new(vec![1.0; 3]);
+        let t0 = Instant::now();
+        let idx = sched.next_to_fetch(t0).expect("un segment à récupérer");
+        let handle = inflight.spawn(async { panic!("récupération en échec") });
+        task_index.insert(handle.id(), idx);
+
+        let joined = inflight
+            .join_next_with_id()
+            .await
+            .expect("une tâche à joindre");
+        let join_error = joined.expect_err("la tâche a paniqué");
+        assert_eq!(
+            task_index.remove(&join_error.id()),
+            Some(idx),
+            "le JoinError doit retrouver son segment"
+        );
+
+        sched.mark_failed(idx, FailureCause::Other("interrompue".into()), t0);
+        assert_eq!(
+            sched.next_to_fetch(t0),
+            Some(idx + 1),
+            "pas de reprise immédiate"
+        );
+        sched.mark_present(idx + 1);
+        assert_eq!(
+            sched.next_to_fetch(t0 + RETRY_DELAY),
+            Some(idx),
+            "le segment doit redevenir éligible après RETRY_DELAY"
+        );
+        assert!(
+            sched.failed_reason().is_none(),
+            "une panique ne fige pas la session (seule la modération le fait)"
+        );
     }
 }
