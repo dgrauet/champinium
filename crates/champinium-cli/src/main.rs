@@ -119,7 +119,7 @@ enum Cmd {
         #[arg(long)]
         peer: String,
     },
-    /// Reconstruit un HLS jouable depuis un manifeste, récupéré depuis un pair.
+    /// Export hors ligne : télécharge TOUT un HLS (manifeste + segments) dans un répertoire. Pour lire, préférer `stream`.
     FetchHls {
         /// CID du manifeste HLS.
         manifest: String,
@@ -128,6 +128,14 @@ enum Cmd {
         /// Répertoire de sortie (recevra index.m3u8 + segments).
         #[arg(long)]
         out: PathBuf,
+    },
+    /// Lecture progressive : ouvre une session HLS locale et affiche son URL
+    /// (à donner à ffplay/VLC) ; reste en vie jusqu'à Ctrl-C.
+    Stream {
+        /// CID du manifeste HLS.
+        manifest: String,
+        #[arg(long)]
+        peer: String,
     },
     /// S'abonne à un créateur (par lien ou PeerId nu).
     Subscribe {
@@ -374,6 +382,35 @@ async fn main() -> Result<()> {
             let playlist = fetch_hls_with_retry(&node, manifest_cid, &out).await?;
             println!("HLS reconstruit: {}", playlist.display());
         }
+        Cmd::Stream { manifest, peer } => {
+            let manifest_cid: Cid = manifest.parse().context("CID de manifeste invalide")?;
+            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            node.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await?;
+            connect_peer(&node, &peer).await?;
+            let info = open_stream_with_retry(&node, manifest_cid).await?;
+            println!("{}", info.url);
+            eprintln!(
+                "session {} — {} segment(s) — Ctrl-C pour fermer",
+                info.id, info.total_segments
+            );
+            let mut events = node.subscribe_stream();
+            loop {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => break,
+                    r = events.recv() => {
+                        if r.is_err() { break; }
+                        if let Ok(st) = node.stream_status(info.id) {
+                            match st.failed_reason {
+                                Some(reason) => eprintln!("échec: {reason}"),
+                                None => eprintln!("{}/{}", st.fetched_segments, st.total_segments),
+                            }
+                        }
+                    }
+                }
+            }
+            node.close_stream(info.id).await;
+            eprintln!("session fermée");
+        }
         Cmd::Subscribe {
             link_or_peerid,
             peer,
@@ -502,6 +539,25 @@ async fn fetch_hls_with_retry(node: &Node, manifest: Cid, out: &Path) -> Result<
             Ok(p) => return Ok(p),
             Err(e) if start.elapsed() < deadline => {
                 tracing::debug!("fetch-hls en attente ({e}) — nouvelle tentative");
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Ouvre une session de lecture en retentant le temps que le réseau converge.
+async fn open_stream_with_retry(
+    node: &Node,
+    manifest: Cid,
+) -> Result<champinium_core::StreamSessionInfo> {
+    let deadline = std::time::Duration::from_secs(60);
+    let start = std::time::Instant::now();
+    loop {
+        match node.open_stream(manifest).await {
+            Ok(i) => return Ok(i),
+            Err(e) if start.elapsed() < deadline => {
+                tracing::debug!("stream en attente ({e}) — nouvelle tentative");
                 tokio::time::sleep(std::time::Duration::from_millis(400)).await;
             }
             Err(e) => return Err(e.into()),
