@@ -53,8 +53,11 @@ Le `.csproj` :
 
 `OpenNode(<LocalAppData>\Champinium)` au démarrage, puis
 `Listen("/ip4/0.0.0.0/tcp/0")`. Coller un multiaddr de pair → **Connecter** ;
-**Rafraîchir** relit le catalogue ; **Lire** sur un CID → `FetchHls` puis lecture
-dans le `MediaPlayerElement`.
+**Rafraîchir** relit le catalogue ; **Lire** sur un CID → `OpenStream` ouvre une
+session de lecture progressive servie par le noyau sur `127.0.0.1` (ADR 0009),
+dont l'URL est passée directement au `MediaPlayerElement` ; une ligne de
+progression affiche « segments : x/y » et **Arrêter**/fermeture appelle
+`CloseStream`.
 
 ## Vérification de compilation — IMPORTANT
 

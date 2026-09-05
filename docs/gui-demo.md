@@ -77,9 +77,10 @@ Laisser la commande tourner (elle sert le contenu et rediffuse le feed).
    L'entrée montre « Démo Champinium » avec ses tags `demo · nature`.
 4. ✅ **Recherche** : taper `nature` (ou `démo`) dans le champ de recherche —
    l'entrée est filtrée par titre/tag. Effacer pour revenir au catalogue.
-5. ✅ **Lecture** : cliquer **Lire**. Statut « récupération… » puis « lecture
-   en cours » : la vidéo joue dans le lecteur natif (AVPlayer /
-   MediaPlayerElement / GStreamer).
+5. ✅ **Lecture** : cliquer **Lire**. La vidéo démarre en quelques secondes,
+   avant la fin du téléchargement ; la ligne « segments : x/y » progresse dans
+   le lecteur natif (AVPlayer / MediaPlayerElement / GStreamer). Sauter à la
+   fin de la vidéo (seek) redémarre en quelques secondes.
 
 ## 3. B est devenu seeder (persistance)
 
@@ -111,8 +112,22 @@ Pendant que B garde son app ouverte, **couper A** (Ctrl-C). Puis, au choix :
 | 2 | B la voit | catalogue apparaît **sans action**, titre + tags corrects |
 | 3 | Recherche | filtre par titre et par tag |
 | 4 | B la regarde | vidéo + son dans le lecteur natif, ~30 s |
+| 4bis | Démarrage avant la fin | la vidéo démarre en quelques secondes, avant la fin du téléchargement ; « segments : x/y » progresse |
+| 4ter | Seek vers la fin | sauter à la fin de la vidéo redémarre en quelques secondes |
 | 5 | B seede | `fetch-hls` depuis B réussit **avec A éteint** |
 | 6 | Modération visible *(bonus)* | un CID couvert par une denylist souscrite affiche « contenu bloqué par la modération » (pas une erreur technique) |
+
+## CLI
+
+Lecture progressive en ligne de commande, sans front GUI : `stream` ouvre la
+session et imprime l'URL locale sur stdout (la progression va sur stderr) —
+composable avec un lecteur qui accepte une URL HTTP :
+
+```sh
+champinium-cli --data-dir ./verif stream <Manifeste-HLS> --peer <ADRESSE_A> | xargs ffplay
+```
+
+Ctrl-C ferme la session (`close_stream`) et purge le cache de lecture.
 
 ## Dépannage
 

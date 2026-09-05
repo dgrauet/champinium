@@ -11,5 +11,6 @@ Documentation Champinium. À étoffer à mesure des phases.
 - Format de denylist signée et souscription multi-listes (Phase 2/5).
 - Limites de la recherche décentralisée (tags DHT + index local) (Phase 5).
 - Stockage froid optionnel : décision figée par l'[ADR 0008](adr/0008-cold-storage-arweave.md) (Arweave, créateur-paie, découverte par tags CID) — implémentation différée (lots CS-a/CS-b).
+- Lecture progressive par serveur HLS local : décision figée par l'[ADR 0009](adr/0009-progressive-hls-local-server.md), implémentée (contrat FFI v11).
 - Packaging & signature par OS (Phase 6).
 - Seeding en arrière-plan : launchd / Windows Service / systemd user (Phase 4).

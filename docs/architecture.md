@@ -2,7 +2,7 @@
 
 > Public : quiconque veut comprendre comment le projet fonctionne de bout en
 > bout. Les renvois pointent vers le code (chemins cliquables) et les ADRs
-> (`docs/adr/`) pour les décisions. État au contrat FFI **v8** (voir
+> (`docs/adr/`) pour les décisions. État au contrat FFI **v11** (voir
 > `.release-please-manifest.json` / `CHANGELOG.md` pour la version de release
 > — elle dérive, pas de version en dur ici, cf. `CLAUDE.md`).
 
@@ -62,6 +62,7 @@ un front est un bug). Carte des modules :
 | [`moderation`](../crates/champinium-core/src/moderation.rs) | denylist compilée (non désactivable) + denylists signées souscrites (fédéré), **v2** = CIDs **et** clés (`key_entries`, ban d'émetteur entier) ; blocage local privé de channel côté `Node` (§7) |
 | [`report`](../crates/champinium-core/src/report.rs) | signalement P2P : rapport signé + agrégateur borné de rapporteurs distincts |
 | [`ingest`](../crates/champinium-core/src/ingest.rs) | orchestration ffmpeg → segments HLS alignés keyframes → manifeste `champinium-hls/v1` |
+| [`stream`](../crates/champinium-core/src/stream) | lecture progressive : session HLS servie sur 127.0.0.1 (`scheduler` pur, `server` HTTP), `open_stream`/`close_stream`/`stream_status` |
 | [`p2p`](../crates/champinium-core/src/p2p.rs) | le cœur : `Node`, la boucle d'évènements libp2p, tous les flux (§4, §6), le suivi actif des abonnements |
 | [`channel_link`](../crates/champinium-core/src/channel_link.rs) | lien partageable `champinium://channel/<peerid>` d'un channel (format/parse, tolérant à un PeerId nu) |
 | [`relay`](../crates/champinium-core/src/relay.rs) | serveur de relais stateless (utilisé par `infra/relay`) |
@@ -125,7 +126,9 @@ déplacer du contenu d'un champ à l'autre à signature constante
   EST la vérité : tout bloc reçu du réseau est vérifié contre le CID demandé
   avant usage. Un « contenu » vidéo = 1 manifeste + N segments, chacun un bloc.
 - **Manifeste HLS** (`champinium-hls/v1`, JSON) : ordre + durée des segments →
-  leurs CIDs. `fetch_hls` le retransforme en `index.m3u8` jouable localement.
+  leurs CIDs. `open_stream` le sert en lecture progressive (§6) ; `fetch_hls`
+  (CLI seul, ADR 0009) le retransforme en `index.m3u8` jouable localement pour
+  un export hors ligne.
 - **Feed** (`champinium-feed/v3`, JSON signé) : LA publication d'un créateur.
   `{schema, issuer_pubkey, seq, channel{name, description, avatar_cid},
   entries[{cid, title, tags}], signature}`. Versionné par `seq` **monotone et
@@ -251,14 +254,25 @@ plutôt que de le coller manuellement) est **différée à la Phase 6
 ### Lecture (`StorePolicy::Stream` par défaut)
 
 ```
-clic « Lire » → fetch_hls(manifeste)
-  get(manifeste) : cache local ? sinon [modération #2] → providers DHT
-      → requêtes à TOUS les fournisseurs EN PARALLÈLE, 1ʳᵉ réponse valide gagne
-      → bloc vérifié contre le CID → rendu à l'appelant, PAS mis en cache,
-        PAS d'annonce fournisseur (StorePolicy::Stream)
-  idem pour chaque segment → écrit index.m3u8 + .ts → lecteur natif
-  (échec en route → répertoire de sortie nettoyé, pas de lecture partielle)
+clic « Lire » → open_stream(manifeste)
+  get(manifeste) [modération #2] → playlist VOD complète servie sur
+  http://127.0.0.1:<port>/<jeton>/index.m3u8 → lecteur natif
+  requête de <n>.ts : cache local ? servi. sinon → tête de priorité de
+  l'ordonnanceur, attente bornée (60 s → 503, le lecteur réessaie) ;
+  préchargement 90 s devant la tête ; seek = nouvelle tête.
+  Seed (channel souscrit) : segments au blockstore + annonce, complétion →
+  réveil du seed proactif (SeedIndex sous quota).
+  Stream : segments dans <blocs>/.streams/<id>/, purgés à close_stream.
+  Moderated sur un segment → 403 + session figée (failed_reason).
 ```
+
+Lecture progressive (ADR 0009) : le cœur sert la playlist et les segments sur
+un serveur HTTP local (`127.0.0.1`, jeton d'URL 128 bits) plutôt que
+d'attendre le téléchargement complet avant de rendre un fichier jouable — le
+lecteur natif démarre en quelques secondes et le seek libre déclenche
+simplement un déplacement de la tête de priorité. `fetch_hls` (téléchargement
+complet en `index.m3u8` local) est retiré du FFI et reste au CLI comme export
+hors ligne.
 
 `get` prend une politique de stockage explicite (`crate::p2p::StorePolicy`,
 interne) : **`Stream`** (défaut de toute lecture/consommation — rend les
@@ -520,7 +534,7 @@ Autour, trois mécanismes d'écosystème :
   catalogue borné à 1024 émetteurs (refus-quand-plein, pas d'éviction), c'est
   la défense contre l'inondation par clés jetables.
 
-## 8. La frontière FFI : le contrat v9
+## 8. La frontière FFI : le contrat v11
 
 La surface UniFFI de [`ffi.rs`](../crates/champinium-core/src/ffi.rs) est
 **le contrat** entre le noyau et les fronts (tableau exhaustif et protocole de
@@ -542,13 +556,29 @@ changement dans [`AGENTS.md`](../AGENTS.md)). Ce qui la caractérise :
   même choix que `FfiCatalogEntry`. `subscribe_channel`/`unsubscribe_channel`
   ne changent pas (toujours contrat v6) : l'aperçu et l'abonnement restent
   deux actions FFI distinctes, voir §6.
+- **Débrayage du repli de récupération froide (v10)** : `cold_retrieval_enabled()
+  -> bool` (sync) et `set_cold_retrieval(enabled)` (sync, persiste dans
+  `.cold_enabled`) — surface identique que le binaire soit compilé avec la
+  feature cargo `cold-storage` ou non ; seul l'effet réseau réel dépend de la
+  feature (§6, ADR 0008).
+- **Lecture progressive (v11, ADR 0009)** : `open_stream(manifest_cid) ->
+  FfiStreamSession { id, url, total_segments }` (async — récupère le
+  manifeste, `Moderated`/`NotFound` sortent ici ; `url` = playlist HLS VOD
+  servie sur `127.0.0.1`, à passer telle quelle au lecteur natif, seek libre),
+  `close_stream(id)` (async, idempotent), `stream_status(id) ->
+  FfiStreamStatus { fetched_segments, total_segments, failed_reason }` (sync).
+  Callback interface **`StreamListener`** (`on_stream_updated(id)`), même
+  patron que `CatalogListener`/`SeedListener`. `fetch_hls` est **retiré du
+  FFI** (rupture) — le téléchargement complet reste au CLI comme export hors
+  ligne. Politique de stockage inchangée : `Seed` si channel souscrit
+  (complétion → réveil du seed proactif), `Stream` sinon.
 - **Erreurs typées** : `FfiError::{Moderated, Network, NotFound, InvalidInput,
   Internal}` — un contenu bloqué par la modération s'affiche « contenu
   bloqué », pas comme une panne réseau.
 - **Bindings générés au build, jamais commités** : Swift via
   UniFFI/XCFramework (`just macos-prepare`), C# via `uniffi-bindgen-cs`
   (`just gen-csharp`). Le front Linux consomme le crate **directement** (pas
-  de FFI). `CONTRACT_VERSION` (=9) permet aux fronts de détecter une
+  de FFI). `CONTRACT_VERSION` (=11) permet aux fronts de détecter une
   incompatibilité au démarrage.
 - **Abonnements (v6)** : `subscribe_channel`/`unsubscribe_channel` (lien
   `champinium://channel/<peerid>` ou PeerId nu), `subscriptions` (liste
@@ -637,14 +667,16 @@ qui compte vit dans le réseau, chaque nœud n'en garde qu'une vue.
 | Windows/C# | validé par CI ; pas de stack intendant | `.intendant.toml` |
 | Channels lot (c) | seed proactif des channels souscrits + quota + éviction + pins + retrait de seed-what-you-consume — **implémenté** (contrat FFI v7) | §6 bis |
 | Channels lot (d) | denylist par clé (v2), blocage local privé de channel, purge rétroactive étendue (SeedIndex + `stop_providing`), signalements par channel — **implémenté** (contrat FFI v8) ; clôt la refonte channels (lots a–d) | §7 |
+| Lecture progressive | serveur HLS local (`open_stream`/`close_stream`/`stream_status`), `fetch_hls` retiré du FFI (reste au CLI, export hors ligne) — **implémenté** (contrat FFI v11) | §6, [ADR 0009](adr/0009-progressive-hls-local-server.md) |
 
 ## 12. Carte des documents
 
 - [`CLAUDE.md`](../CLAUDE.md) — principes + état d'avancement (source de vérité).
-- [`AGENTS.md`](../AGENTS.md) — contrat FFI (tableau v8) + garde-fous d'équipe.
+- [`AGENTS.md`](../AGENTS.md) — contrat FFI (tableau v11) + garde-fous d'équipe.
 - [`docs/adr/`](adr/) — décisions : libp2p vs iroh (0001), modération côté
   nœud (0002), feeds signés (0003), transport de blocs (0006), IPNS (0007),
-  stockage froid Arweave (0008)…
+  stockage froid Arweave (0008), lecture progressive par serveur HLS local
+  (0009)…
 - [`docs/mvp-demo.md`](mvp-demo.md) / [`docs/gui-demo.md`](gui-demo.md) —
   démos de bout en bout (CLI validée ; GUI deux machines à dérouler).
 - [`docs/deploy-bootstrap-relay.md`](deploy-bootstrap-relay.md) — opérer
