@@ -7,12 +7,13 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use champinium_core::p2p::ChannelPreview;
-use champinium_core::{channel_link, paths, CatalogEntry, Cid, CoreError, Node, PeerId};
+use champinium_core::{
+    channel_link, paths, CatalogEntry, Cid, CoreError, Node, PeerId, StreamSessionInfo,
+};
 use gstreamer::prelude::*;
 use gtk::glib;
 use gtk::prelude::*;
@@ -95,18 +96,18 @@ pub fn run() {
     let _ = app.run();
 }
 
-/// Racine des répertoires de lecture temporaires (un sous-dossier par contenu).
-fn play_root() -> PathBuf {
-    std::env::temp_dir().join("champinium-play")
-}
-
 /// État partagé sur le thread principal GTK (non Send : Rc/RefCell).
 struct Ui {
     rt: Arc<Runtime>,
     node: RefCell<Option<Node>>,
     player: RefCell<Option<gstreamer::Element>>,
-    /// Répertoire de la lecture en cours (supprimé au changement de contenu).
-    current_play_dir: RefCell<Option<PathBuf>>,
+    /// Session de lecture progressive en cours (fermée au changement de
+    /// contenu ou à la fermeture de la fenêtre) — le core purge lui-même son
+    /// répertoire de session, rien à supprimer ici.
+    current_stream: RefCell<Option<u64>>,
+    /// Label de progression de la session en cours (« segments : x/y » ou
+    /// « lecture interrompue : … »), affiché à côté de `status`.
+    stream_progress: RefCell<Option<Label>>,
     /// Avertissement Explorer déjà accepté cette session (mémoire de session
     /// uniquement — pas de GSettings, YAGNI, voir brief tâche 7).
     explorer_warned: Cell<bool>,
@@ -117,15 +118,12 @@ struct Ui {
 }
 
 fn build_ui(app: &Application) {
-    // Purge les répertoires de lecture des exécutions précédentes (ils ne
-    // servent qu'à la session en cours et s'accumuleraient sinon).
-    let _ = std::fs::remove_dir_all(play_root());
-
     let ui = Rc::new(Ui {
         rt: Arc::new(Runtime::new().expect("runtime tokio")),
         node: RefCell::new(None),
         player: RefCell::new(None),
-        current_play_dir: RefCell::new(None),
+        current_stream: RefCell::new(None),
+        stream_progress: RefCell::new(None),
         explorer_warned: Cell::new(false),
         window: RefCell::new(None),
     });
@@ -133,6 +131,11 @@ fn build_ui(app: &Application) {
     let status = Label::new(Some("démarrage…"));
     status.set_xalign(0.0);
     status.set_hexpand(true);
+    // Progression de la lecture en cours (« segments : x/y » ou « lecture
+    // interrompue : … ») — mise à jour par la boucle d'évènements de
+    // streaming (`subscribe_stream`).
+    let stream_progress = Label::new(None);
+    stream_progress.set_xalign(0.0);
     // Réglages de seed (lot c) : quota (Go) + usage courant — popup dédiée
     // pour rester cohérente avec la vue unique existante (pas de fenêtre de
     // préférences séparée).
@@ -142,8 +145,10 @@ fn build_ui(app: &Application) {
     let blocked_channels_btn = Button::with_label("Channels bloqués");
     let header_bar = GtkBox::new(Orientation::Horizontal, 8);
     header_bar.append(&status);
+    header_bar.append(&stream_progress);
     header_bar.append(&seed_settings_btn);
     header_bar.append(&blocked_channels_btn);
+    *ui.stream_progress.borrow_mut() = Some(stream_progress);
 
     let peer_entry = Entry::builder()
         .placeholder_text("/ip4/…/tcp/…/p2p/<peerid>")
@@ -268,6 +273,7 @@ fn build_ui(app: &Application) {
                     status.set_text(&format!("nœud en ligne — {}", node.peer_id()));
                     let mut events = node.subscribe_catalog();
                     let mut seed_events = node.subscribe_seed();
+                    let mut stream_events = node.subscribe_stream();
                     *ui.node.borrow_mut() = Some(node);
                     // Le nœud est prêt : router les liens champinium:// vers
                     // le chemin du bouton « Aperçu » (rejoue spinner +
@@ -309,6 +315,42 @@ fn build_ui(app: &Application) {
                                     &explorer_list,
                                     &search_entry,
                                 );
+                            }
+                        });
+                    }
+
+                    // Progression de la session de lecture en cours (lot
+                    // « lecture progressive »). Même patron que la boucle de
+                    // seed ci-dessus : un canal séparé, sur son propre
+                    // `spawn_future_local`, pas de logique — juste relire
+                    // `stream_status` et réafficher le texte.
+                    {
+                        let ui = ui.clone();
+                        glib::spawn_future_local(async move {
+                            loop {
+                                let id = match stream_events.recv().await {
+                                    Ok(id) => id,
+                                    Err(RecvError::Lagged(_)) => continue,
+                                    Err(RecvError::Closed) => break,
+                                };
+                                if ui.current_stream.borrow().as_ref() == Some(&id) {
+                                    if let Some(node) = ui.node.borrow().clone() {
+                                        if let (Ok(st), Some(l)) = (
+                                            node.stream_status(id),
+                                            ui.stream_progress.borrow().as_ref(),
+                                        ) {
+                                            match st.failed_reason {
+                                                Some(reason) => l.set_text(&format!(
+                                                    "lecture interrompue : {reason}"
+                                                )),
+                                                None => l.set_text(&format!(
+                                                    "segments : {}/{}",
+                                                    st.fetched_segments, st.total_segments
+                                                )),
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         });
                     }
@@ -488,6 +530,16 @@ fn build_ui(app: &Application) {
             let link = channel_link::format(&node.peer_id());
             btn.clipboard().set_text(&link);
             status.set_text("lien copié");
+        });
+    }
+
+    // Ferme la session de lecture en cours à la fermeture de la fenêtre
+    // principale (le core purge lui-même son répertoire de session).
+    {
+        let ui = ui.clone();
+        window.connect_close_request(move |_| {
+            close_current_stream(&ui);
+            glib::Propagation::Proceed
         });
     }
 
@@ -908,30 +960,25 @@ fn content_row(
             status.set_text("CID invalide");
             return;
         };
-        // Arrête la lecture précédente et supprime son répertoire (pas
-        // d'accumulation de segments dans le tmp au fil des lectures).
-        if let Some(old) = ui.player.borrow_mut().take() {
-            let _ = old.set_state(gstreamer::State::Null);
-        }
-        if let Some(old_dir) = ui.current_play_dir.borrow_mut().take() {
-            let _ = std::fs::remove_dir_all(old_dir);
-        }
+        close_current_stream(&ui);
         let rt = ui.rt.clone();
         let ui = ui.clone();
         let status = status.clone();
-        status.set_text("récupération…");
+        status.set_text("ouverture de la session…");
         glib::spawn_future_local(async move {
             let (tx, rx) = tokio::sync::oneshot::channel();
             rt.spawn(async move {
-                let _ = tx.send(fetch_inner(&node, manifest).await);
+                let _ = tx.send(open_stream_inner(&node, manifest).await);
             });
             match rx.await {
-                Ok(Ok(playlist)) => match start_playback(&playlist) {
+                Ok(Ok(info)) => match start_playback(&info.url) {
                     Ok(player) => {
                         *ui.player.borrow_mut() = Some(player);
-                        *ui.current_play_dir.borrow_mut() =
-                            playlist.parent().map(Path::to_path_buf);
+                        *ui.current_stream.borrow_mut() = Some(info.id);
                         status.set_text("lecture en cours");
+                        if let Some(l) = ui.stream_progress.borrow().as_ref() {
+                            l.set_text(&format!("segments : 0/{}", info.total_segments));
+                        }
                     }
                     Err(e) => status.set_text(&format!("lecture : {e}")),
                 },
@@ -1320,11 +1367,10 @@ fn storage_stats_text(used: u64, quota: u64) -> String {
     )
 }
 
-/// Démarre une lecture GStreamer (playbin + fenêtre vidéo par défaut).
-fn start_playback(playlist: &Path) -> Result<gstreamer::Element, String> {
-    let uri = format!("file://{}", playlist.display());
+/// Démarre une lecture GStreamer sur l'URL HLS locale (hlsdemux + souphttpsrc).
+fn start_playback(url: &str) -> Result<gstreamer::Element, String> {
     let playbin = gstreamer::ElementFactory::make("playbin")
-        .property("uri", &uri)
+        .property("uri", url)
         .build()
         .map_err(|e| format!("playbin indisponible : {e}"))?;
     playbin
@@ -1365,9 +1411,21 @@ async fn connect_inner(node: &Node, peer: &str) -> Result<(), String> {
     node.connect(addr).await.map_err(|e| e.to_string())
 }
 
-async fn fetch_inner(node: &Node, manifest: Cid) -> Result<PathBuf, CoreError> {
-    let out = play_root().join(manifest.to_string());
-    node.fetch_hls(manifest, &out).await
+async fn open_stream_inner(node: &Node, manifest: Cid) -> Result<StreamSessionInfo, CoreError> {
+    node.open_stream(manifest).await
+}
+
+/// Ferme la session courante (idempotent) — sur le runtime tokio.
+fn close_current_stream(ui: &Rc<Ui>) {
+    if let Some(old) = ui.player.borrow_mut().take() {
+        let _ = old.set_state(gstreamer::State::Null);
+    }
+    if let (Some(id), Some(node)) = (
+        ui.current_stream.borrow_mut().take(),
+        ui.node.borrow().clone(),
+    ) {
+        ui.rt.spawn(async move { node.close_stream(id).await });
+    }
 }
 
 /// S'abonne à un émetteur — appel sync du core (écriture disque + tâche de
