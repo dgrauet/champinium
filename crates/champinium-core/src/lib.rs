@@ -47,6 +47,7 @@ pub use p2p::Node;
 pub use relay::{start_relay, RelayHandle};
 pub use report::Report;
 pub use seeding::{SeedIndex, SeededPublication};
+pub use stream::{StreamSessionInfo, StreamStatus};
 
 // Réexports pratiques pour les consommateurs Rust du crate (cli, front Linux).
 pub use cid::Cid;
