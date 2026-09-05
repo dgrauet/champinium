@@ -49,10 +49,16 @@ struct ContentView: View {
                 VideoPlayer(player: player)
                     .frame(minHeight: 220)
                     .cornerRadius(8)
+                if !model.streamProgress.isEmpty {
+                    Text("segments : \(model.streamProgress)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
         .padding()
         .task { await model.start() }
+        .onDisappear { Task { await model.stopPlayback() } }
         .alert("Explorer", isPresented: $showExplorerWarning) {
             Button("Annuler", role: .cancel) {}
             Button("Continuer") {
