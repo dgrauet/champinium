@@ -35,6 +35,7 @@ pub mod paths;
 pub mod relay;
 pub mod report;
 pub mod seeding;
+pub mod stream;
 
 pub use blockstore::Blockstore;
 pub use catalog::{Catalog, CatalogEntry};
