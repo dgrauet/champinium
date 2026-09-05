@@ -58,6 +58,18 @@ fn seg_url(info: &champinium_core::StreamSessionInfo, n: usize) -> String {
 /// le segment existe réellement (sinon CID d'un contenu que personne ne
 /// détient — jamais récupérable).
 async fn publish(creator: &Node, present: &[bool]) -> (cid::Cid, Vec<cid::Cid>) {
+    publish_with_duration(creator, present, 1.0).await
+}
+
+/// Comme `publish`, avec une durée par segment paramétrable — nécessaire pour
+/// placer un segment hors de la fenêtre d'avance passive
+/// (`stream::scheduler::LOOKAHEAD_SECS`, 90 s) et ainsi prouver qu'un seek
+/// (et non le préchargement d'arrière-plan) l'a ramené.
+async fn publish_with_duration(
+    creator: &Node,
+    present: &[bool],
+    duration: f32,
+) -> (cid::Cid, Vec<cid::Cid>) {
     let mut cids = vec![];
     for (i, p) in present.iter().enumerate() {
         let payload = format!("segment {i} du test stream");
@@ -69,11 +81,11 @@ async fn publish(creator: &Node, present: &[bool]) -> (cid::Cid, Vec<cid::Cid>) 
         cids.push(cid);
     }
     let manifest = HlsManifest::new(
-        1.0,
+        duration,
         cids.iter()
             .map(|c| HlsSegment {
                 cid: c.to_string(),
-                duration: 1.0,
+                duration,
             })
             .collect(),
     );
@@ -127,22 +139,33 @@ async fn seek_serves_requested_segment_before_intermediates() {
         .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
         .await
         .unwrap();
-    // Intermédiaires introuvables : seul le seek direct peut réussir.
-    let (m, _) = publish(&a, &[true, false, false, false, true]).await;
+    // 12 segments de 10 s (120 s au total) : la fenêtre d'avance passive
+    // (`LOOKAHEAD_SECS` = 90 s) ne couvre, depuis la tête 0, que les indices
+    // dont la durée cumulée reste ≤ 90 s — donc jusqu'à l'indice 9 au plus.
+    // Les indices 1..=10 sont introuvables partout et l'indice 11 est HORS
+    // fenêtre : seul un seek direct (`request(11)`, déclenché par la requête
+    // HTTP du lecteur) peut le ramener. Si le préchargement d'arrière-plan
+    // servait le 11 sans passer par le seek, ce test échouerait faute de
+    // pouvoir distinguer les deux chemins ; en le plaçant hors fenêtre, seul
+    // le seek peut réussir.
+    let mut present = vec![false; 12];
+    present[0] = true;
+    present[11] = true;
+    let (m, _) = publish_with_duration(&a, &present, 10.0).await;
     let b = node(dir.path(), "b2").await;
     wire(&b, &a, addr).await;
 
     let info = open_until_ok(&b, m).await;
-    let r = reqwest::get(seg_url(&info, 4)).await.unwrap();
+    let r = reqwest::get(seg_url(&info, 11)).await.unwrap();
     assert_eq!(r.status(), 200);
     assert_eq!(
         r.bytes().await.unwrap().as_ref(),
-        b"segment 4 du test stream"
+        b"segment 11 du test stream"
     );
     let st = b.stream_status(info.id).unwrap();
     assert!(
         st.fetched_segments <= 2,
-        "1..3 ne doivent pas être présents"
+        "1..=10 ne doivent pas être présents"
     );
     assert!(
         st.failed_reason.is_none(),
