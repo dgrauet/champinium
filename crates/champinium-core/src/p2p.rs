@@ -306,6 +306,58 @@ pub struct Node {
     cold_retrieval_enabled: Arc<AtomicBool>,
 }
 
+/// Ce qu'il faut pour récupérer un bloc (P2P + repli froid) **sans** détenir
+/// une poignée `Node` : utilisé par les tâches de fond qui ne doivent pas
+/// retenir le nœud en vie (boucle de fetch d'une session de lecture).
+#[derive(Clone)]
+pub(crate) struct Fetcher {
+    blockstore: Blockstore,
+    moderation: Arc<RwLock<Moderation>>,
+    cmd_tx: mpsc::Sender<Command>,
+    peer_id: PeerId,
+    keypair: Keypair,
+    reports: Arc<Mutex<ReportBook>>,
+    #[cfg(feature = "cold-storage")]
+    cold: Option<Arc<dyn ColdStore>>,
+    #[cfg_attr(not(feature = "cold-storage"), allow(dead_code))]
+    cold_retrieval_enabled: Arc<AtomicBool>,
+}
+
+impl Fetcher {
+    pub(crate) async fn get_with(&self, cid: Cid, policy: StorePolicy) -> CoreResult<Vec<u8>> {
+        let result = get_with_inner(
+            &self.blockstore,
+            &self.moderation,
+            &self.cmd_tx,
+            self.peer_id,
+            &self.keypair,
+            &self.reports,
+            cid,
+            policy,
+        )
+        .await;
+        #[cfg(feature = "cold-storage")]
+        if matches!(&result, Err(CoreError::NoProviders(_)))
+            && self.cold_retrieval_enabled.load(Ordering::Relaxed)
+        {
+            if let Some(cold) = self.cold.as_ref() {
+                return cold_fallback_inner(
+                    &self.blockstore,
+                    &self.moderation,
+                    &self.cmd_tx,
+                    &self.reports,
+                    &self.keypair,
+                    cold,
+                    cid,
+                    policy,
+                )
+                .await;
+            }
+        }
+        result
+    }
+}
+
 /// Aperçu d'un channel résolu par lien (spec 2026-07-23, partie A), voir
 /// [`Node::resolve_channel`]. Instantané en lecture seule — ne crée ni
 /// n'implique aucun abonnement.
@@ -1804,44 +1856,24 @@ impl Node {
     /// **signalé** aux pairs (rapport signé sur le topic des signalements,
     /// best-effort).
     pub(crate) async fn get_with(&self, cid: Cid, policy: StorePolicy) -> CoreResult<Vec<u8>> {
-        let result = get_with_inner(
-            &self.blockstore,
-            &self.moderation,
-            &self.cmd_tx,
-            self.peer_id,
-            &self.keypair,
-            &self.reports,
-            cid,
-            policy,
-        )
-        .await;
+        self.fetcher().get_with(cid, policy).await
+    }
 
-        // Repli de récupération froide (ADR 0008, CS-a tâche 3) : uniquement
-        // sur `NoProviders` (plus aucun fournisseur P2P), jamais sur les
-        // autres erreurs (`Moderated` en particulier reste un refus ferme).
-        // No-op garanti si la feature est absente ou si aucun `ColdStore`
-        // n'est câblé : `result` est alors renvoyé tel quel, comportement
-        // identique à avant cette tâche.
-        #[cfg(feature = "cold-storage")]
-        if matches!(&result, Err(CoreError::NoProviders(_)))
-            && self.cold_retrieval_enabled.load(Ordering::Relaxed)
-        {
-            if let Some(cold) = self.cold.as_ref() {
-                return cold_fallback_inner(
-                    &self.blockstore,
-                    &self.moderation,
-                    &self.cmd_tx,
-                    &self.reports,
-                    &self.keypair,
-                    cold,
-                    cid,
-                    policy,
-                )
-                .await;
-            }
+    /// Extrait un [`Fetcher`] clonable, indépendant de la poignée `Node` :
+    /// utilisé par les tâches de fond (boucle de fetch d'une session de
+    /// lecture) qui ne doivent pas retenir le nœud en vie.
+    pub(crate) fn fetcher(&self) -> Fetcher {
+        Fetcher {
+            blockstore: self.blockstore.clone(),
+            moderation: self.moderation.clone(),
+            cmd_tx: self.cmd_tx.clone(),
+            peer_id: self.peer_id,
+            keypair: self.keypair.clone(),
+            reports: self.reports.clone(),
+            #[cfg(feature = "cold-storage")]
+            cold: self.cold.clone(),
+            cold_retrieval_enabled: self.cold_retrieval_enabled.clone(),
         }
-
-        result
     }
 
     /// Active/désactive le repli de récupération froide et persiste le choix
