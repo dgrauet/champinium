@@ -311,9 +311,15 @@
         </Pivot>
 
         <!-- Lecteur média (Media Foundation via MediaPlayerElement) -->
-        <MediaPlayerElement Grid.Row="5"
-                            x:Name="Player"
-                            AreTransportControlsEnabled="True"
-                            MinHeight="220" />
+        <StackPanel Grid.Row="5" Spacing="4">
+            <MediaPlayerElement x:Name="Player"
+                                AreTransportControlsEnabled="True"
+                                MinHeight="220" />
+            <!-- Progression de la session de lecture progressive (OpenStream) —
+                 « segments : x/y » ou « lecture interrompue : <raison> ». -->
+            <TextBlock Text="{Binding StreamProgress, Mode=OneWay}"
+                       Style="{StaticResource CaptionTextBlockStyle}"
+                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+        </StackPanel>
     </Grid>
 </Window>

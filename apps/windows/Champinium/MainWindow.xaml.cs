@@ -51,8 +51,12 @@ public sealed partial class MainWindow : Window
 
         Root.Loaded += OnRootLoaded;
 
-        // Quand un média est prêt, branche son playlist HLS sur le lecteur.
+        // Quand un média est prêt, branche l'URL de streaming sur le lecteur.
         Model.PlaybackReady += OnPlaybackReady;
+
+        // Ferme la session de lecture en cours à la fermeture de la fenêtre
+        // (idempotent côté cœur — voir StopPlaybackAsync).
+        this.Closed += (_, _) => _ = Model.StopPlaybackAsync();
 
         // Au lancement : openNode → listen (équivalent du .task macOS).
         DispatcherQueue.TryEnqueue(async () => await Model.StartAsync());
@@ -373,15 +377,15 @@ public sealed partial class MainWindow : Window
         Clipboard.SetContent(package);
     }
 
-    /// <summary>Reçoit le chemin du index.m3u8 reconstruit et lance la lecture.</summary>
-    private void OnPlaybackReady(string playlistPath)
+    /// <summary>Reçoit l'URL locale de la session de lecture progressive
+    /// (`http://127.0.0.1:&lt;port&gt;/&lt;jeton&gt;/index.m3u8`, jamais parsée
+    /// côté front) et lance la lecture.</summary>
+    private void OnPlaybackReady(string url)
     {
         // Repasse sur le thread UI : l'événement peut venir d'un await arrière-plan.
         DispatcherQueue.TryEnqueue(() =>
         {
-            // Chemin de fichier local → URI file:// pour MediaSource.
-            var uri = new Uri(playlistPath);
-            Player.Source = MediaSource.CreateFromUri(uri);
+            Player.Source = MediaSource.CreateFromUri(new Uri(url));
 
             if (Player.MediaPlayer is MediaPlayer mp)
             {
