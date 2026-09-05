@@ -71,6 +71,33 @@ pub trait SeedListener: Send + Sync {
     fn on_seed_updated(&self);
 }
 
+/// Callback implémenté par les fronts : rappelé à chaque changement d'état
+/// d'une session de lecture progressive (segment reçu, échec, fermeture).
+/// Même contrat que `SeedListener` : tic fusionnable, le front re-dispatche
+/// puis relit `stream_status(id)`.
+#[uniffi::export(with_foreign)]
+pub trait StreamListener: Send + Sync {
+    fn on_stream_updated(&self, id: u64);
+}
+
+/// Session de lecture ouverte : `url` se donne telle quelle au lecteur natif
+/// (`http://127.0.0.1:<port>/<jeton>/index.m3u8`), jamais parsée côté front.
+#[derive(uniffi::Record)]
+pub struct FfiStreamSession {
+    pub id: u64,
+    pub url: String,
+    pub total_segments: u32,
+}
+
+/// État d'une session : progression et, le cas échéant, échec définitif
+/// (contenu refusé par la modération).
+#[derive(uniffi::Record)]
+pub struct FfiStreamStatus {
+    pub fetched_segments: u32,
+    pub total_segments: u32,
+    pub failed_reason: Option<String>,
+}
+
 /// Un contenu avec ses métadonnées signées (titre, tags). Sert à la fois de
 /// sortie (catalogue, recherche) et d'entrée (`publish_feed_with`).
 #[derive(uniffi::Record)]
@@ -285,6 +312,16 @@ impl ChampiniumNode {
         self.inner.set_cold_retrieval(enabled)?;
         Ok(())
     }
+
+    /// État d'une session de lecture ; id inconnu → `NotFound`.
+    pub fn stream_status(&self, id: u64) -> Result<FfiStreamStatus, FfiError> {
+        let s = self.inner.stream_status(id)?;
+        Ok(FfiStreamStatus {
+            fetched_segments: s.fetched_segments,
+            total_segments: s.total_segments,
+            failed_reason: s.failed_reason,
+        })
+    }
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -491,21 +528,38 @@ impl ChampiniumNode {
         });
     }
 
-    /// Récupère et reconstruit un HLS depuis un manifeste, dans `out_dir`.
-    /// Renvoie le chemin du `index.m3u8` jouable.
-    pub async fn fetch_hls(
-        &self,
-        manifest_cid: String,
-        out_dir: String,
-    ) -> Result<String, FfiError> {
+    /// Ouvre une session de lecture progressive et rend l'URL HLS locale.
+    /// `Moderated`/`NotFound` sortent ici (manifeste), avant tout serveur.
+    pub async fn open_stream(&self, manifest_cid: String) -> Result<FfiStreamSession, FfiError> {
         let cid: Cid = manifest_cid.parse().map_err(|e| FfiError::InvalidInput {
             msg: format!("CID invalide: {e}"),
         })?;
-        let playlist = self
-            .inner
-            .fetch_hls(cid, std::path::Path::new(&out_dir))
-            .await?;
-        Ok(playlist.to_string_lossy().into_owned())
+        let s = self.inner.open_stream(cid).await?;
+        Ok(FfiStreamSession {
+            id: s.id,
+            url: s.url,
+            total_segments: s.total_segments,
+        })
+    }
+
+    /// Ferme une session (idempotent) : serveur arrêté, cache purgé.
+    pub async fn close_stream(&self, id: u64) {
+        self.inner.close_stream(id).await;
+    }
+
+    /// Même patron que `set_seed_listener`.
+    pub async fn set_stream_listener(&self, listener: Arc<dyn StreamListener>) {
+        let mut events = self.inner.subscribe_stream();
+        tokio::spawn(async move {
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                match events.recv().await {
+                    Ok(id) => listener.on_stream_updated(id),
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        });
     }
 }
 
@@ -961,6 +1015,57 @@ mod tests {
             "le catalogue doit contenir l'entrée du nœud lui-même après ingest_file + publish",
         );
         assert!(own.pinned.contains(&manifest_cid));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_stream_via_ffi_returns_url_and_listener_fires() {
+        struct Probe(std::sync::Mutex<Option<tokio::sync::oneshot::Sender<u64>>>);
+        impl StreamListener for Probe {
+            fn on_stream_updated(&self, id: u64) {
+                if let Some(tx) = self.0.lock().unwrap().take() {
+                    let _ = tx.send(id);
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let node = open_node(dir.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        node.set_stream_listener(Arc::new(Probe(std::sync::Mutex::new(Some(tx)))))
+            .await;
+
+        let seg = node.inner.add(b"seg").await.unwrap();
+        let manifest = crate::ingest::HlsManifest::new(
+            1.0,
+            vec![crate::ingest::HlsSegment {
+                cid: seg.to_string(),
+                duration: 1.0,
+            }],
+        );
+        let m = node
+            .inner
+            .add(manifest.to_json().unwrap().as_bytes())
+            .await
+            .unwrap();
+        let s = node.open_stream(m.to_string()).await.unwrap();
+        assert!(s.url.starts_with("http://127.0.0.1:"));
+        assert_eq!(s.total_segments, 1);
+        let fired = tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fired, s.id);
+        assert_eq!(node.stream_status(s.id).unwrap().total_segments, 1);
+        node.close_stream(s.id).await;
+        assert!(matches!(
+            node.stream_status(s.id),
+            Err(FfiError::NotFound { .. })
+        ));
+        assert!(matches!(
+            node.open_stream("pas-un-cid".into()).await,
+            Err(FfiError::InvalidInput { .. })
+        ));
     }
 
     /// Contrat v8 : `block_channel` accepte un lien `champinium://channel/…`
