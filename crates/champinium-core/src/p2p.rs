@@ -344,6 +344,12 @@ impl Fetcher {
             policy,
         )
         .await;
+        // Repli de récupération froide (ADR 0008, CS-a tâche 3) : uniquement
+        // sur `NoProviders` (plus aucun fournisseur P2P), jamais sur les
+        // autres erreurs (`Moderated` en particulier reste un refus ferme).
+        // No-op garanti si la feature est absente ou si aucun `ColdStore`
+        // n'est câblé : `result` est alors renvoyé tel quel, comportement
+        // identique à avant cette tâche.
         #[cfg(feature = "cold-storage")]
         if matches!(&result, Err(CoreError::NoProviders(_)))
             && self.cold_retrieval_enabled.load(Ordering::Relaxed)

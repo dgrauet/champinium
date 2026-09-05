@@ -2,13 +2,19 @@
 //! réseau ni horloge propre (l'`Instant` est injecté), testable seule.
 //!
 //! Priorité : (1) segments demandés par le lecteur et absents, dans l'ordre de
-//! demande ; (2) fenêtre d'avance de `LOOKAHEAD_SECS` après la tête de
-//! lecture ; (3) rien. Un seek déplace la tête. `Moderated` fige la session.
+//! demande — jamais bloqués par `MAX_INFLIGHT`, un seek ne doit pas attendre
+//! le préchargement ; (2) fenêtre d'avance de `LOOKAHEAD_SECS` après la tête
+//! de lecture, plafonnée à `MAX_INFLIGHT` récupérations simultanées ; (3)
+//! rien. Un seek déplace la tête. `Moderated` fige la session.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 pub const LOOKAHEAD_SECS: f32 = 90.0;
+/// Plafond de récupérations simultanées pour le **préchargement** (fenêtre
+/// d'avance, priorité (2)) uniquement. Les demandes explicites du lecteur
+/// (`wanted`, priorité (1)) n'y sont jamais soumises : un seek ne doit pas
+/// attendre la fin de trois préchargements en cours.
 pub const MAX_INFLIGHT: usize = 3;
 pub const RETRY_DELAY: Duration = Duration::from_secs(5);
 
@@ -100,13 +106,16 @@ impl SegmentScheduler {
     }
 
     /// Réclame le prochain segment à récupérer (marqué `InFlight`), ou `None`
-    /// si rien n'est éligible, si `MAX_INFLIGHT` est atteint, ou si la
-    /// session est figée.
+    /// si rien n'est éligible ou si la session est figée. `MAX_INFLIGHT` ne
+    /// borne que la fenêtre de préchargement (priorité (2)) : une demande
+    /// explicite du lecteur (`wanted`, priorité (1)) est toujours servie,
+    /// même si le plafond est déjà atteint par le préchargement.
     pub fn next_to_fetch(&mut self, now: Instant) -> Option<usize> {
-        if self.frozen.is_some() || self.in_flight() >= MAX_INFLIGHT {
+        if self.frozen.is_some() {
             return None;
         }
-        // (1) demandes explicites du lecteur.
+        // (1) demandes explicites du lecteur — jamais soumises à
+        // `MAX_INFLIGHT`, un seek ne doit pas attendre le préchargement.
         if let Some(pos) = self.wanted.iter().position(|&i| self.eligible(i, now)) {
             let idx = self.wanted.remove(pos).expect("position valide");
             self.states[idx] = SegmentState::InFlight;
@@ -115,6 +124,9 @@ impl SegmentScheduler {
         // Purge les demandes devenues présentes.
         self.wanted
             .retain(|&i| self.states[i] != SegmentState::Present);
+        if self.in_flight() >= MAX_INFLIGHT {
+            return None;
+        }
         // (2) fenêtre d'avance après la tête.
         let mut acc = 0.0_f32;
         for idx in self.head..self.states.len() {
@@ -209,6 +221,35 @@ mod tests {
         s.mark_failed(0, FailureCause::Moderated, now);
         assert!(s.failed_reason().unwrap().contains("modération"));
         assert_eq!(s.next_to_fetch(now + RETRY_DELAY), None);
+    }
+
+    #[test]
+    fn player_request_bypasses_max_inflight_prefetch_cap() {
+        let mut s = sched(100, 10.0);
+        let now = Instant::now();
+        // Sature MAX_INFLIGHT via la fenêtre de préchargement uniquement.
+        assert_eq!(s.next_to_fetch(now), Some(0));
+        assert_eq!(s.next_to_fetch(now), Some(1));
+        assert_eq!(s.next_to_fetch(now), Some(2));
+        assert_eq!(
+            s.next_to_fetch(now),
+            None,
+            "plafond de préchargement atteint"
+        );
+        // Un seek explicite du lecteur n'attend pas la fin des trois
+        // préchargements en vol.
+        s.request(40);
+        assert_eq!(
+            s.next_to_fetch(now),
+            Some(40),
+            "la demande du lecteur passe devant le plafond de préchargement"
+        );
+        // Le préchargement, lui, reste plafonné (4 en vol désormais).
+        assert_eq!(
+            s.next_to_fetch(now),
+            None,
+            "le préchargement reste plafonné par MAX_INFLIGHT"
+        );
     }
 
     #[test]

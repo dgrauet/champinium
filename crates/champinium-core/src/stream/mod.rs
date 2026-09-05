@@ -155,7 +155,10 @@ impl SegmentSource for SessionState {
                 // L'état est cloné dans un `let` avant le `match` : le verrou
                 // tombe ainsi dès la fin de l'instruction, jamais pendant la
                 // lecture des octets.
-                let current = state.lock().state(index).clone();
+                let (current, frozen) = {
+                    let s = state.lock();
+                    (s.state(index).clone(), s.failed_reason().is_some())
+                };
                 match current {
                     SegmentState::Present => {
                         return SessionState::read_local(state.clone(), index).await?.ok_or(
@@ -166,6 +169,18 @@ impl SegmentSource for SessionState {
                         cause: FailureCause::Moderated,
                         ..
                     } => return Err(SegmentError::Forbidden),
+                    // Déjà en cours de récupération (tâche lancée avant que
+                    // la session ne gèle) : elle peut encore aboutir, on
+                    // continue d'attendre son issue normalement.
+                    SegmentState::InFlight => {}
+                    // `Absent`, ou `Failed` non modéré (`NoProviders`/
+                    // `Other`) : si la session est figée, `next_to_fetch` ne
+                    // planifiera plus jamais sa récupération — il n'arrivera
+                    // donc jamais. Sans ce test, une requête sur n'importe
+                    // quel segment absent attendrait le
+                    // `STREAM_REQUEST_TIMEOUT` complet avant un 503, en
+                    // boucle, au lieu d'un 403 immédiat.
+                    _ if frozen => return Err(SegmentError::Forbidden),
                     _ => {}
                 }
                 if rx.changed().await.is_err() {

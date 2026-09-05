@@ -236,7 +236,10 @@ async fn moderated_segment_is_403_and_freezes_session() {
         .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
         .await
         .unwrap();
-    let (m, cids) = publish(&a, &[true, true]).await;
+    // Segment 2 : introuvable partout (jamais présent chez le créateur).
+    // Sert à prouver qu'une session figée renvoie 403 immédiatement pour
+    // n'importe quel autre segment absent, pas seulement le modéré.
+    let (m, cids) = publish(&a, &[true, true, false]).await;
 
     let issuer = Keypair::generate_ed25519();
     let dl = Denylist::build_signed("test", UPDATED, &issuer, &[cids[1]], &[]).unwrap();
@@ -251,6 +254,18 @@ async fn moderated_segment_is_403_and_freezes_session() {
     let st = b.stream_status(info.id).unwrap();
     assert!(st.failed_reason.is_some());
     assert!(!b.blockstore().has(&cids[1]));
+
+    // La session est figée : une requête sur un AUTRE segment absent doit
+    // rendre 403 sans attendre `STREAM_REQUEST_TIMEOUT` (60 s) — sinon
+    // chaque requête immobiliserait une connexion pour rien.
+    let started = std::time::Instant::now();
+    assert_eq!(reqwest::get(seg_url(&info, 2)).await.unwrap().status(), 403);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "le 403 doit arriver sans attendre le timeout de requête, a pris {:?}",
+        started.elapsed()
+    );
+
     b.close_stream(info.id).await;
 }
 
