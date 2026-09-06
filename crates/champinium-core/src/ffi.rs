@@ -98,8 +98,56 @@ pub struct FfiStreamStatus {
     pub failed_reason: Option<String>,
 }
 
-/// Un contenu avec ses métadonnées signées (titre, tags). Sert à la fois de
-/// sortie (catalogue, recherche) et d'entrée (`publish_feed_with`).
+/// Mode de provenance **déclaré** par le créateur (feed v4, ADR 0010) — une
+/// affirmation signée, pas une vérification. `Undeclared` est explicite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiProvenanceMode {
+    Generated,
+    Assisted,
+    Captured,
+    Undeclared,
+}
+
+/// Déclaration de provenance d'un contenu : mode + outils (normalisés,
+/// cherchables comme les tags).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiProvenance {
+    pub mode: FfiProvenanceMode,
+    pub tools: Vec<String>,
+}
+
+impl From<crate::feed::Provenance> for FfiProvenance {
+    fn from(p: crate::feed::Provenance) -> Self {
+        use crate::feed::ProvenanceMode as M;
+        Self {
+            mode: match p.mode {
+                M::Generated => FfiProvenanceMode::Generated,
+                M::Assisted => FfiProvenanceMode::Assisted,
+                M::Captured => FfiProvenanceMode::Captured,
+                M::Undeclared => FfiProvenanceMode::Undeclared,
+            },
+            tools: p.tools,
+        }
+    }
+}
+
+impl From<FfiProvenance> for crate::feed::Provenance {
+    fn from(p: FfiProvenance) -> Self {
+        use crate::feed::ProvenanceMode as M;
+        Self {
+            mode: match p.mode {
+                FfiProvenanceMode::Generated => M::Generated,
+                FfiProvenanceMode::Assisted => M::Assisted,
+                FfiProvenanceMode::Captured => M::Captured,
+                FfiProvenanceMode::Undeclared => M::Undeclared,
+            },
+            tools: p.tools,
+        }
+    }
+}
+
+/// Un contenu avec ses métadonnées signées (titre, tags, provenance). Sert à
+/// la fois de sortie (catalogue, recherche) et d'entrée (`publish_feed_with`).
 #[derive(uniffi::Record)]
 pub struct FfiContentItem {
     /// CID du contenu (chaîne CIDv1) — pour une vidéo, le manifeste HLS.
@@ -108,6 +156,8 @@ pub struct FfiContentItem {
     pub title: String,
     /// Tags (normalisés en minuscules à la publication).
     pub tags: Vec<String>,
+    /// Déclaration de provenance signée (feed v4).
+    pub provenance: FfiProvenance,
 }
 
 /// Un résultat de recherche.
@@ -121,6 +171,8 @@ pub struct FfiSearchHit {
     pub title: String,
     /// Tags.
     pub tags: Vec<String>,
+    /// Déclaration de provenance signée (feed v4).
+    pub provenance: FfiProvenance,
 }
 
 /// Identité éditoriale du channel de ce nœud (spec channels §1).
@@ -349,21 +401,20 @@ impl ChampiniumNode {
         Ok(cid.to_string())
     }
 
-    /// Publie un feed signé listant `cids` (sans métadonnées).
-    pub async fn publish_feed(&self, cids: Vec<String>) -> Result<(), FfiError> {
-        let parsed = parse_cids(&cids)?;
-        self.inner.publish_feed(&parsed).await?;
-        Ok(())
-    }
-
-    /// Publie un feed signé avec métadonnées (titre, tags) : rend le contenu
-    /// **cherchable** (index local des pairs + découverte par tag via la DHT).
+    /// Publie un feed signé avec métadonnées (titre, tags, provenance) : rend
+    /// le contenu **cherchable** (index local des pairs + découverte par tag
+    /// via la DHT).
     pub async fn publish_feed_with(&self, items: Vec<FfiContentItem>) -> Result<(), FfiError> {
         // Valide les CIDs avant signature (erreur typée InvalidInput).
         parse_cids(&items.iter().map(|i| i.cid.clone()).collect::<Vec<_>>())?;
         let entries: Vec<crate::feed::FeedEntry> = items
             .into_iter()
-            .map(|i| crate::feed::FeedEntry::undeclared(i.cid, i.title, i.tags))
+            .map(|i| crate::feed::FeedEntry {
+                cid: i.cid,
+                title: i.title,
+                tags: i.tags,
+                provenance: i.provenance.into(),
+            })
             .collect();
         self.inner.publish_feed_with(&entries).await?;
         Ok(())
@@ -579,6 +630,7 @@ fn catalog_entry_to_ffi(node: &Node, e: crate::catalog::CatalogEntry) -> FfiCata
                 cid: i.cid.to_string(),
                 title: i.title,
                 tags: i.tags,
+                provenance: i.provenance.into(),
             })
             .collect(),
         channel: FfiChannelProfile {
@@ -609,6 +661,7 @@ fn channel_preview_to_ffi(p: crate::p2p::ChannelPreview) -> FfiChannelPreview {
                 cid: i.cid.to_string(),
                 title: i.title,
                 tags: i.tags,
+                provenance: i.provenance.into(),
             })
             .collect(),
         subscribed: p.subscribed,
@@ -630,6 +683,7 @@ fn search_hit_to_ffi(h: crate::catalog::SearchHit) -> FfiSearchHit {
         cid: h.cid.to_string(),
         title: h.title,
         tags: h.tags,
+        provenance: h.provenance.into(),
     }
 }
 
@@ -691,6 +745,43 @@ mod tests {
         ));
     }
 
+    /// Contrat v12 : la provenance déclarée traverse `publish_feed_with` →
+    /// catalogue → recherche (outils normalisés, dédupliqués comme les tags).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provenance_roundtrips_through_publish_and_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = open_node(dir.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        let cid = node.inner.add(b"contenu ia").await.unwrap();
+        node.publish_feed_with(vec![FfiContentItem {
+            cid: cid.to_string(),
+            title: "Dunes".into(),
+            tags: vec!["desert".into()],
+            provenance: FfiProvenance {
+                mode: FfiProvenanceMode::Generated,
+                tools: vec![" Sora ".into(), "sora".into()],
+            },
+        }])
+        .await
+        .unwrap();
+        let entry = node
+            .catalog()
+            .into_iter()
+            .find(|e| e.issuer == node.peer_id())
+            .expect("le créateur figure dans son catalogue");
+        let item = &entry.items[0];
+        assert!(matches!(item.provenance.mode, FfiProvenanceMode::Generated));
+        assert_eq!(item.provenance.tools, vec!["sora".to_string()]);
+        let hits = node.search("sora".into());
+        assert_eq!(hits.len(), 1);
+        assert!(matches!(
+            hits[0].provenance.mode,
+            FfiProvenanceMode::Generated
+        ));
+        assert_eq!(crate::contract_version(), 12);
+    }
+
     /// Le listener enregistré est rappelé quand le catalogue change — c'est le
     /// mécanisme qui remplace le délai gossip codé en dur dans les fronts.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -714,7 +805,17 @@ mod tests {
             .await;
 
         let cid = crate::content::cid_for(b"contenu ffi").to_string();
-        node.publish_feed(vec![cid]).await.unwrap();
+        node.publish_feed_with(vec![FfiContentItem {
+            cid,
+            title: String::new(),
+            tags: vec![],
+            provenance: FfiProvenance {
+                mode: FfiProvenanceMode::Undeclared,
+                tools: vec![],
+            },
+        }])
+        .await
+        .unwrap();
 
         tokio::time::timeout(std::time::Duration::from_secs(5), rx)
             .await
@@ -736,6 +837,10 @@ mod tests {
             cid: cid.clone(),
             title: "Aurores boréales".into(),
             tags: vec!["nature".into()],
+            provenance: FfiProvenance {
+                mode: FfiProvenanceMode::Undeclared,
+                tools: vec![],
+            },
         }])
         .await
         .unwrap();
@@ -770,7 +875,17 @@ mod tests {
         assert_eq!(node.channel_profile().name, "Aurores");
 
         let cid = crate::content::cid_for(b"contenu v5").to_string();
-        node.publish_feed(vec![cid]).await.unwrap();
+        node.publish_feed_with(vec![FfiContentItem {
+            cid,
+            title: String::new(),
+            tags: vec![],
+            provenance: FfiProvenance {
+                mode: FfiProvenanceMode::Undeclared,
+                tools: vec![],
+            },
+        }])
+        .await
+        .unwrap();
         assert_eq!(node.catalog()[0].channel.name, "Aurores");
     }
 
@@ -840,7 +955,17 @@ mod tests {
             .unwrap();
 
         let cid = crate::content::cid_for(b"contenu v6").to_string();
-        a.publish_feed(vec![cid]).await.unwrap();
+        a.publish_feed_with(vec![FfiContentItem {
+            cid,
+            title: String::new(),
+            tags: vec![],
+            provenance: FfiProvenance {
+                mode: FfiProvenanceMode::Undeclared,
+                tools: vec![],
+            },
+        }])
+        .await
+        .unwrap();
         // Injecte directement l'entrée de a dans le catalogue de b (pas de
         // réseau dans ce test) : on souscrit puis on peuple le catalogue via
         // le feed déjà signé de a, appliqué localement.
@@ -918,7 +1043,17 @@ mod tests {
             .unwrap();
 
         let cid = crate::content::cid_for(b"contenu v7").to_string();
-        node.publish_feed(vec![cid.clone()]).await.unwrap();
+        node.publish_feed_with(vec![FfiContentItem {
+            cid: cid.clone(),
+            title: String::new(),
+            tags: vec![],
+            provenance: FfiProvenance {
+                mode: FfiProvenanceMode::Undeclared,
+                tools: vec![],
+            },
+        }])
+        .await
+        .unwrap();
 
         let entry = &node.catalog()[0];
         assert_eq!(entry.total_count, 1);
@@ -990,7 +1125,17 @@ mod tests {
         // `ingest_file` seede/épingle le contenu propre mais ne publie pas de
         // feed : sans `publish_feed`, aucune entrée de catalogue ne référence
         // le manifeste (le catalogue reconstruit uniquement depuis les feeds).
-        node.publish_feed(vec![manifest_cid.clone()]).await.unwrap();
+        node.publish_feed_with(vec![FfiContentItem {
+            cid: manifest_cid.clone(),
+            title: String::new(),
+            tags: vec![],
+            provenance: FfiProvenance {
+                mode: FfiProvenanceMode::Undeclared,
+                tools: vec![],
+            },
+        }])
+        .await
+        .unwrap();
 
         tokio::time::timeout(std::time::Duration::from_secs(5), rx)
             .await
@@ -1162,6 +1307,10 @@ mod tests {
             cid: cid.clone(),
             title: "Aurores boréales".into(),
             tags: vec!["nature".into()],
+            provenance: FfiProvenance {
+                mode: FfiProvenanceMode::Undeclared,
+                tools: vec![],
+            },
         }])
         .await
         .unwrap();
@@ -1193,7 +1342,17 @@ mod tests {
             .unwrap();
 
         let cid = crate::content::cid_for(b"contenu v9 auto-abonnement").to_string();
-        node.publish_feed(vec![cid]).await.unwrap();
+        node.publish_feed_with(vec![FfiContentItem {
+            cid,
+            title: String::new(),
+            tags: vec![],
+            provenance: FfiProvenance {
+                mode: FfiProvenanceMode::Undeclared,
+                tools: vec![],
+            },
+        }])
+        .await
+        .unwrap();
         node.subscribe_channel(node.peer_id()).await.unwrap();
 
         let preview = node.resolve_channel(node.peer_id()).await.unwrap();
@@ -1223,7 +1382,17 @@ mod tests {
             .unwrap();
 
         let cid = crate::content::cid_for(b"contenu v9 bare").to_string();
-        node.publish_feed(vec![cid]).await.unwrap();
+        node.publish_feed_with(vec![FfiContentItem {
+            cid,
+            title: String::new(),
+            tags: vec![],
+            provenance: FfiProvenance {
+                mode: FfiProvenanceMode::Undeclared,
+                tools: vec![],
+            },
+        }])
+        .await
+        .unwrap();
 
         let preview = node.resolve_channel(node.peer_id()).await.unwrap();
         assert_eq!(preview.peer_id, node.peer_id());
