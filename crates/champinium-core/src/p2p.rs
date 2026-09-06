@@ -46,6 +46,11 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 const BLOCK_PROTOCOL: &str = "/champinium/block/1.0.0";
+/// Protocole Kademlia dédié : sans lui, `kad::Config::default()` parle
+/// `/ipfs/kad/1.0.0` et le nœud rejoint la DHT IPFS publique dès qu'il croise
+/// un pair kubo, mélangeant nos records avec le réseau public. DHT séparée
+/// (ADR 0012) ; interop IPFS différée.
+const KAD_PROTOCOL: &str = "/champinium/kad/1.0.0";
 const IDENTIFY_PROTOCOL: &str = "/champinium/0.1.0";
 const FEEDS_TOPIC: &str = "champinium/feeds/v1";
 const REPORTS_TOPIC: &str = "champinium/reports/v1";
@@ -109,7 +114,7 @@ impl Behaviour {
         // écraser le record de feed d'autrui chez les nœuds stockeurs (déni de
         // découverte). Les records sont validés dans la boucle d'évènements
         // (voir `EventLoop::handle_inbound_kad_request`).
-        let mut kad_cfg = kad::Config::default();
+        let mut kad_cfg = kad::Config::new(StreamProtocol::new(KAD_PROTOCOL));
         kad_cfg.set_record_filtering(kad::StoreInserts::FilterBoth);
         let store_cfg = kad::store::MemoryStoreConfig {
             max_provided_keys: MAX_PROVIDED_KEYS,
@@ -4170,6 +4175,23 @@ mod tests {
     use super::*;
     use crate::blockstore::Blockstore;
     use crate::content::cid_for;
+
+    /// La DHT Champinium ne doit PAS parler `/ipfs/kad/1.0.0` (le protocole par
+    /// défaut de libp2p-kad) : rejoindre la DHT IPFS publique par accident
+    /// exposerait nos records à n'importe quel nœud kubo. Voir ADR 0012.
+    #[test]
+    fn kademlia_uses_champinium_protocol() {
+        let key = Keypair::generate_ed25519();
+        let swarm = build_swarm(key).expect("build_swarm");
+        let names: Vec<String> = swarm
+            .behaviour()
+            .kademlia
+            .protocol_names()
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        assert_eq!(names, vec![KAD_PROTOCOL.to_string()]);
+    }
 
     /// Le point de commit du seed ne retient une publication que si l'émetteur
     /// est toujours abonné ET non banni ; le ban prime sur l'abonnement (garde
