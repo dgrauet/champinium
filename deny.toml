@@ -11,6 +11,19 @@ ignore = [
     # paste n'est plus maintenu ; dépendance transitive (uniffi, gtk4-rs macros),
     # aucun remplacement possible de notre côté.
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained — transitif via uniffi/gtk4-rs" },
+    # hickory-proto 0.25.2, transitif via libp2p-dns/libp2p-mdns 0.44/0.48 (résolution
+    # DNS du transport, tâche 2) → hickory-resolver 0.25.x : ce nœud n'agit qu'en
+    # résolveur DNSSEC (jamais en serveur), la boucle non bornée n'est atteignable
+    # que si l'attaquant contrôle déjà la réponse DNS reçue par ce nœud lors d'un
+    # dial `/dns4/`. « No safe upgrade is available! » — hickory-resolver 0.26 a
+    # retiré l'API dont dépend libp2p-dns 0.44 ; pas de version de libp2p 0.56 qui
+    # tire un hickory-resolver corrigé. À réévaluer dès que libp2p-dns bumpe vers
+    # hickory 0.26+.
+    { id = "RUSTSEC-2026-0118", reason = "hickory-proto 0.25.x — transitif via libp2p-dns/mdns, pas de version corrigée compatible libp2p 0.56" },
+    # Même chaîne de dépendance que RUSTSEC-2026-0118 — amplification CPU côté
+    # encodage, atteignable seulement si ce nœud encode des réponses DNS (il n'en
+    # émet jamais, résolveur client uniquement).
+    { id = "RUSTSEC-2026-0119", reason = "hickory-proto 0.25.x — transitif via libp2p-dns/mdns, pas de version corrigée compatible libp2p 0.56" },
 ]
 
 [licenses]

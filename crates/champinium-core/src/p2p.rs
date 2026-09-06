@@ -32,8 +32,9 @@ use libp2p::kad::{
     GetProvidersOk, GetRecordOk, QueryId, QueryResult, RecordKey,
 };
 use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport};
+use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{dcutr, gossipsub, identify, identity::Keypair, noise, ping, relay, tcp, yamux};
+use libp2p::{dcutr, gossipsub, identify, identity::Keypair, mdns, noise, ping, relay, tcp, yamux};
 use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -170,10 +171,13 @@ struct Behaviour {
     // NAT traversal : client de circuit relay v2 + hole punching DCUtR.
     relay_client: relay::client::Behaviour,
     dcutr: dcutr::Behaviour,
+    /// Découverte locale (réseau physique) — débrayable (tâche 2), défaut
+    /// actif. `Toggle::from(None)` n'ouvre aucun socket multicast.
+    mdns: Toggle<mdns::tokio::Behaviour>,
 }
 
 impl Behaviour {
-    fn new(key: &Keypair, relay_client: relay::client::Behaviour) -> Self {
+    fn new(key: &Keypair, relay_client: relay::client::Behaviour, mdns_enabled: bool) -> Self {
         let peer_id = key.public().to_peer_id();
         // Filtrage des stores entrants : sans lui, n'importe quel pair peut
         // écraser le record de feed d'autrui chez les nœuds stockeurs (déni de
@@ -230,6 +234,11 @@ impl Behaviour {
         gossipsub
             .with_peer_score(score_params, gossipsub::PeerScoreThresholds::default())
             .expect("paramètres de scoring valides");
+        let mdns = Toggle::from(if mdns_enabled {
+            mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id).ok()
+        } else {
+            None
+        });
         Self {
             kademlia,
             identify,
@@ -238,6 +247,7 @@ impl Behaviour {
             gossipsub,
             relay_client,
             dcutr: dcutr::Behaviour::new(peer_id),
+            mdns,
         }
     }
 }
@@ -405,6 +415,12 @@ pub struct Node {
     /// soit la feature de build, seul le repli réseau lui-même reste gaté
     /// (`cold`, ci-dessus).
     cold_retrieval_enabled: Arc<AtomicBool>,
+    /// Débrayage mDNS (tâche 2), persisté (dotfile `.mdns_enabled`), défaut
+    /// actif. Contrairement à `cold_retrieval_enabled`, ce réglage ne prend
+    /// effet qu'au **prochain démarrage** (`build_swarm` construit le
+    /// comportement `mdns` une fois pour toutes) — voir la doc de
+    /// [`Node::set_mdns`].
+    mdns_enabled: Arc<AtomicBool>,
     /// Sessions de lecture progressive ouvertes (spec 2026-09-05). Aucune
     /// session ne détient de `Node` (voir `Fetcher`) : lâcher la dernière
     /// poignée lâche la table, donc arrête serveurs et boucles.
@@ -613,7 +629,13 @@ impl Node {
         project_issuer: Option<PeerId>,
     ) -> CoreResult<Self> {
         let peer_id = identity::peer_id(&keypair);
-        let mut swarm = build_swarm(keypair.clone())?;
+        // Débrayage mDNS (tâche 2) : lu AVANT `build_swarm` — contrairement au
+        // débrayage de repli froid (simple lecture d'un `bool`), celui-ci
+        // conditionne la construction du comportement réseau lui-même, donc
+        // aucun setter post-construction ne peut l'appliquer avant le prochain
+        // démarrage (même remarque que `FOLLOW_INTERVAL`).
+        let mdns_enabled_initial = load_mdns_enabled(&blockstore);
+        let mut swarm = build_swarm(keypair.clone(), mdns_enabled_initial)?;
         // Mode serveur : stocke et sert les provider records (pas seulement client).
         swarm
             .behaviour_mut()
@@ -772,6 +794,7 @@ impl Node {
         // s'écrit même dans un build par défaut, sans effet réseau sans la
         // feature.
         let cold_retrieval_enabled = Arc::new(AtomicBool::new(load_cold_enabled(&blockstore)));
+        let mdns_enabled = Arc::new(AtomicBool::new(mdns_enabled_initial));
 
         // Purge des sessions de lecture orphelines (un front qui n'a pas fermé).
         let _ = std::fs::remove_dir_all(stream::streams_root(&blockstore));
@@ -802,6 +825,7 @@ impl Node {
             #[cfg(feature = "cold-storage")]
             cold: None,
             cold_retrieval_enabled,
+            mdns_enabled,
             streams: Arc::new(Mutex::new(HashMap::new())),
             stream_next_id: Arc::new(AtomicU64::new(0)),
             stream_events,
@@ -2471,6 +2495,23 @@ impl Node {
         self.cold_retrieval_enabled.load(Ordering::Relaxed)
     }
 
+    /// État courant du débrayage mDNS (vrai par défaut).
+    pub fn mdns_enabled(&self) -> bool {
+        self.mdns_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Active/désactive la découverte mDNS et persiste le choix (dotfile
+    /// `.mdns_enabled`, à côté des blocs). Contrairement à
+    /// [`Node::set_cold_retrieval`], **l'effet n'est visible qu'au prochain
+    /// démarrage** : le comportement `mdns` est construit une fois pour
+    /// toutes par `build_swarm`, avant que ce nœud existe — il n'existe pas
+    /// de setter qui rouvrirait/fermerait le socket multicast à chaud sans
+    /// reconstruire tout le swarm.
+    pub fn set_mdns(&self, enabled: bool) -> CoreResult<()> {
+        self.mdns_enabled.store(enabled, Ordering::Relaxed);
+        save_mdns_enabled(&self.blockstore, enabled)
+    }
+
     /// Configure le backend [`ColdStore`] de **repli de récupération** — point
     /// d'entrée public pour câbler un `ArweaveColdStore` (ou tout autre backend
     /// de récupération). Le choix du backend concret et de ses gateways reste à
@@ -2630,6 +2671,27 @@ fn load_cold_enabled(blockstore: &Blockstore) -> bool {
 /// Persiste le débrayage de repli froid.
 fn save_cold_enabled(blockstore: &Blockstore, enabled: bool) -> CoreResult<()> {
     std::fs::write(cold_enabled_path(blockstore), enabled.to_string())?;
+    Ok(())
+}
+
+/// Chemin du débrayage mDNS persisté (tâche 2), à côté des blocs — même
+/// patron que `.cold_enabled`.
+fn mdns_enabled_path(blockstore: &Blockstore) -> PathBuf {
+    blockstore.root().join(".mdns_enabled")
+}
+
+/// Charge le débrayage mDNS persisté (activé par défaut si absent/illisible
+/// — même logique que `load_cold_enabled`).
+fn load_mdns_enabled(blockstore: &Blockstore) -> bool {
+    std::fs::read_to_string(mdns_enabled_path(blockstore))
+        .ok()
+        .and_then(|s| s.trim().parse::<bool>().ok())
+        .unwrap_or(true)
+}
+
+/// Persiste le débrayage mDNS.
+fn save_mdns_enabled(blockstore: &Blockstore, enabled: bool) -> CoreResult<()> {
+    std::fs::write(mdns_enabled_path(blockstore), enabled.to_string())?;
     Ok(())
 }
 
@@ -3959,7 +4021,7 @@ pub fn split_peer_id(mut addr: Multiaddr) -> CoreResult<(PeerId, Multiaddr)> {
     }
 }
 
-fn build_swarm(keypair: Keypair) -> CoreResult<Swarm<Behaviour>> {
+fn build_swarm(keypair: Keypair, mdns_enabled: bool) -> CoreResult<Swarm<Behaviour>> {
     let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
@@ -3968,10 +4030,16 @@ fn build_swarm(keypair: Keypair) -> CoreResult<Swarm<Behaviour>> {
             yamux::Config::default,
         )
         .map_err(|e| CoreError::Network(e.to_string()))?
+        .with_dns()
+        .map_err(|e| CoreError::Network(e.to_string()))?
         .with_relay_client(noise::Config::new, yamux::Config::default)
         .map_err(|e| CoreError::Network(e.to_string()))?
         .with_behaviour(|key, relay_client| {
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Behaviour::new(key, relay_client))
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Behaviour::new(
+                key,
+                relay_client,
+                mdns_enabled,
+            ))
         })
         .map_err(|e| CoreError::Network(e.to_string()))?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
@@ -4226,6 +4294,23 @@ impl EventLoop {
                     self.handle_feed_message(&message_id, &propagation_source, &message.data);
                 }
             }
+            SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
+                // Découverte locale (réseau physique) : peuple la table de
+                // routage Kademlia ET tente un dial best-effort — sans lui,
+                // un pair mDNS resterait connu mais jamais connecté tant
+                // qu'aucune requête Kademlia ne le sollicite.
+                for (peer, addr) in peers {
+                    self.swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .add_address(&peer, addr.clone());
+                    let _ = self.swarm.dial(addr);
+                }
+            }
+            // `Expired` : rien à faire — libp2p-mdns retire déjà l'entrée de
+            // sa propre table interne, et une adresse Kademlia expirée sera
+            // simplement ignorée si elle redevient injoignable.
+            SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Expired(_))) => {}
             _ => {}
         }
     }
@@ -4521,7 +4606,7 @@ mod tests {
     #[test]
     fn kademlia_uses_champinium_protocol() {
         let key = Keypair::generate_ed25519();
-        let swarm = build_swarm(key).expect("build_swarm");
+        let swarm = build_swarm(key, true).expect("build_swarm");
         let names: Vec<String> = swarm
             .behaviour()
             .kademlia
@@ -5448,5 +5533,72 @@ mod tests {
         assert!(!session_dir.exists());
         assert!(node.stream_status(info.id).is_err());
         node.close_stream(info.id).await; // idempotent
+    }
+
+    /// Le débrayage mDNS (tâche 2) est lisible/modifiable et **persisté**
+    /// (dotfile `.mdns_enabled`, défaut actif) — même patron que
+    /// `cold_retrieval_toggle_persists_without_feature`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mdns_setting_persists_and_defaults_to_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).await.unwrap();
+        assert!(node.mdns_enabled());
+        node.set_mdns(false).unwrap();
+        drop(node);
+        let node = Node::open(dir.path()).await.unwrap();
+        assert!(!node.mdns_enabled());
+    }
+
+    /// Deux nœuds sur la même machine, AUCUN dial : mDNS les met en relation.
+    /// Peut être bloqué par un runner CI sans multicast → échéance généreuse
+    /// et message explicite (voir ledger si passage en #[ignore]).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "mDNS multicast indisponible sur certains runners — validé par le test manuel deux machines"]
+    async fn mdns_discovers_local_peer_without_dial() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Node::open(&dir.path().join("a")).await.unwrap();
+        let b = Node::open(&dir.path().join("b")).await.unwrap();
+        a.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        b.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(40), async {
+            loop {
+                if a.connected_peers().await.unwrap() >= 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+        .await
+        .expect("mDNS doit découvrir le pair local (multicast bloqué sur ce runner ?)");
+    }
+
+    /// mDNS désactivé : `Toggle::from(None)` ne doit ouvrir aucun socket
+    /// multicast — vérifié indirectement en s'assurant que `build_swarm`
+    /// avec `mdns_enabled = false` construit sans erreur et que le
+    /// comportement `mdns` est bien désactivé (`Toggle::is_enabled`).
+    #[test]
+    fn mdns_disabled_toggle_is_off() {
+        let key = Keypair::generate_ed25519();
+        let swarm = build_swarm(key, false).expect("build_swarm");
+        assert!(!swarm.behaviour().mdns.is_enabled());
+    }
+
+    /// Une multiadresse `/dns4/...` doit être acceptée par `dial` sans erreur
+    /// synchrone — la feature `dns` doit être branchée dans le transport
+    /// (`.with_dns()`), sinon `Swarm::dial` échouerait immédiatement faute de
+    /// transport capable de résoudre `/dns4/`.
+    #[tokio::test]
+    async fn dns_multiaddr_dials_without_sync_error() {
+        let key = Keypair::generate_ed25519();
+        let peer = PeerId::random();
+        let mut swarm = build_swarm(key, false).expect("build_swarm");
+        let addr: Multiaddr = format!("/dns4/localhost/tcp/1/p2p/{peer}").parse().unwrap();
+        swarm
+            .dial(addr)
+            .expect("dial /dns4/ ne doit pas échouer synchroniquement");
     }
 }
