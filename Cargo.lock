@@ -551,6 +551,8 @@ dependencies = [
  "anyhow",
  "champinium-core",
  "clap",
+ "serde_json",
+ "time",
  "tokio",
  "tracing",
  "tracing-subscriber",
