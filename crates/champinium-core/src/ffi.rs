@@ -363,11 +363,7 @@ impl ChampiniumNode {
         parse_cids(&items.iter().map(|i| i.cid.clone()).collect::<Vec<_>>())?;
         let entries: Vec<crate::feed::FeedEntry> = items
             .into_iter()
-            .map(|i| crate::feed::FeedEntry {
-                cid: i.cid,
-                title: i.title,
-                tags: i.tags,
-            })
+            .map(|i| crate::feed::FeedEntry::undeclared(i.cid, i.title, i.tags))
             .collect();
         self.inner.publish_feed_with(&entries).await?;
         Ok(())

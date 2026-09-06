@@ -396,6 +396,7 @@ fn catalog_items_from_feed(feed: &Feed) -> Vec<CatalogItem> {
                 cid,
                 title: e.title.clone(),
                 tags: e.tags.clone(),
+                provenance: e.provenance.clone(),
             })
         })
         .collect()
@@ -929,11 +930,7 @@ impl Node {
     pub async fn publish_feed(&self, cids: &[Cid]) -> CoreResult<()> {
         let entries: Vec<FeedEntry> = cids
             .iter()
-            .map(|c| FeedEntry {
-                cid: c.to_string(),
-                title: String::new(),
-                tags: Vec::new(),
-            })
+            .map(|c| FeedEntry::undeclared(c.to_string(), String::new(), Vec::new()))
             .collect();
         self.publish_feed_with(&entries).await
     }
@@ -1038,6 +1035,7 @@ impl Node {
                             cid,
                             title: e.title.clone(),
                             tags: e.tags.clone(),
+                            provenance: e.provenance.clone(),
                         });
                     }
                 }
@@ -1801,6 +1799,7 @@ impl Node {
                     cid: i.cid.to_string(),
                     title: i.title.clone(),
                     tags: i.tags.clone(),
+                    provenance: i.provenance.clone(),
                 })
                 .collect();
             self.publish_feed_with(&entries).await?;
