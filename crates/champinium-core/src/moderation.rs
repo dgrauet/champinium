@@ -26,6 +26,7 @@ use libp2p::identity::{Keypair, PublicKey};
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 /// Identifiant de schéma de denylist.
@@ -204,10 +205,56 @@ impl Denylist {
     }
 }
 
-/// Moteur de modération : ensemble des CIDs et des clés bloqués (par
-/// souscription à des denylists signées — voir le doc de module).
+/// Résultat de [`Moderation::apply_list`] : soit la liste était plus récente
+/// que ce qui est connu de cet éditeur (et remplace ses entrées), soit elle
+/// est périmée (`seq` inférieur ou égal au `seq` connu) et est ignorée.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Applied {
+    /// La liste a remplacé les entrées connues de cet éditeur.
+    Newer {
+        /// Nombre de CIDs désormais bloqués pour cet éditeur.
+        added_cids: usize,
+        /// Nombre de clés désormais bloquées pour cet éditeur.
+        added_keys: usize,
+    },
+    /// La liste est périmée (`seq` ≤ `seq` connu) : ignorée.
+    Stale,
+}
+
+/// Instantané des entrées connues pour un éditeur de denylist donné.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DenylistSource {
+    /// Éditeur de la liste.
+    pub issuer: PeerId,
+    /// Nom lisible de la liste.
+    pub name: String,
+    /// Numéro de séquence courant.
+    pub seq: u64,
+    /// Horodatage de mise à jour.
+    pub updated: String,
+    /// Nombre de CIDs bloqués par cet éditeur.
+    pub entry_count: usize,
+    /// Nombre de clés bloquées par cet éditeur.
+    pub key_count: usize,
+}
+
+/// Entrées connues pour un éditeur donné (partie de l'index par éditeur).
+#[derive(Debug, Clone, Default)]
+struct IssuerEntries {
+    name: String,
+    seq: u64,
+    updated: String,
+    cids: HashSet<Cid>,
+    keys: HashSet<PeerId>,
+}
+
+/// Moteur de modération : entrées **par éditeur** (souscription à des
+/// denylists signées — voir le doc de module) + vues agrégées reconstruites à
+/// chaque changement, pour garder le chemin chaud des checkpoints
+/// (`is_blocked`/`is_blocked_key`) en O(1) et sans changement de signature.
 #[derive(Debug, Clone, Default)]
 pub struct Moderation {
+    by_issuer: std::collections::HashMap<PeerId, IssuerEntries>,
     blocked: HashSet<Cid>,
     blocked_keys: HashSet<PeerId>,
 }
@@ -223,34 +270,148 @@ impl Moderation {
         Self::default()
     }
 
-    /// Souscrit à une denylist signée : **vérifie la signature** puis ajoute ses
-    /// CIDs et ses clés bloquées.
-    pub fn subscribe(&mut self, list: &Denylist) -> CoreResult<()> {
-        list.verify()?;
-        self.blocked.extend(list.cids()?);
-        self.blocked_keys.extend(list.keys()?);
-        Ok(())
+    fn rebuild_views(&mut self) {
+        self.blocked = self
+            .by_issuer
+            .values()
+            .flat_map(|e| e.cids.iter().copied())
+            .collect();
+        self.blocked_keys = self
+            .by_issuer
+            .values()
+            .flat_map(|e| e.keys.iter().copied())
+            .collect();
     }
 
-    /// Indique si un CID est bloqué.
+    /// Applique une denylist signée : **vérifie la signature**, puis remplace
+    /// les entrées connues de son éditeur si `seq` est strictement supérieur
+    /// au `seq` connu (une liste périmée, `seq` ≤ connu, est ignorée — protège
+    /// contre le rejeu d'une version antérieure par un tiers qui la
+    /// relaierait).
+    pub fn apply_list(&mut self, list: &Denylist) -> CoreResult<Applied> {
+        list.verify()?;
+        let issuer = list.issuer_peer_id()?;
+        if let Some(known) = self.by_issuer.get(&issuer) {
+            if list.seq <= known.seq {
+                return Ok(Applied::Stale);
+            }
+        }
+        let cids = list.cids()?;
+        let keys = list.keys()?;
+        let applied = Applied::Newer {
+            added_cids: cids.len(),
+            added_keys: keys.len(),
+        };
+        self.by_issuer.insert(
+            issuer,
+            IssuerEntries {
+                name: list.name.clone(),
+                seq: list.seq,
+                updated: list.updated.clone(),
+                cids,
+                keys,
+            },
+        );
+        self.rebuild_views();
+        Ok(applied)
+    }
+
+    /// Souscrit à une denylist signée (conservé pour compatibilité : mince
+    /// enveloppe autour de [`Moderation::apply_list`]).
+    pub fn subscribe(&mut self, list: &Denylist) -> CoreResult<()> {
+        self.apply_list(list).map(|_| ())
+    }
+
+    /// Retire toutes les entrées connues d'un éditeur. Renvoie `true` si
+    /// l'éditeur était connu (et a donc été retiré).
+    pub fn remove_issuer(&mut self, issuer: &PeerId) -> bool {
+        let removed = self.by_issuer.remove(issuer).is_some();
+        if removed {
+            self.rebuild_views();
+        }
+        removed
+    }
+
+    /// `seq` connu pour un éditeur donné, s'il est souscrit.
+    pub fn known_seq(&self, issuer: &PeerId) -> Option<u64> {
+        self.by_issuer.get(issuer).map(|e| e.seq)
+    }
+
+    /// Instantané des entrées connues pour un éditeur donné.
+    pub fn source(&self, issuer: &PeerId) -> Option<DenylistSource> {
+        self.by_issuer.get(issuer).map(|e| DenylistSource {
+            issuer: *issuer,
+            name: e.name.clone(),
+            seq: e.seq,
+            updated: e.updated.clone(),
+            entry_count: e.cids.len(),
+            key_count: e.keys.len(),
+        })
+    }
+
+    /// Indique si un CID est bloqué (vue agrégée, tous éditeurs confondus).
     pub fn is_blocked(&self, cid: &Cid) -> bool {
         self.blocked.contains(cid)
     }
 
-    /// Indique si une clé (PeerId) est bloquée en entier.
+    /// Indique si une clé (PeerId) est bloquée en entier (vue agrégée, tous
+    /// éditeurs confondus).
     pub fn is_blocked_key(&self, peer: &PeerId) -> bool {
         self.blocked_keys.contains(peer)
     }
 
-    /// Nombre de CIDs bloqués.
+    /// Nombre de CIDs bloqués (vue agrégée).
     pub fn len(&self) -> usize {
         self.blocked.len()
     }
 
-    /// Vrai si aucun CID n'est bloqué.
+    /// Vrai si aucun CID n'est bloqué (vue agrégée).
     pub fn is_empty(&self) -> bool {
         self.blocked.is_empty()
     }
+}
+
+/// Répertoire de cache disque des denylists souscrites (`root/.denylists`).
+pub fn denylist_cache_dir(root: &Path) -> PathBuf {
+    root.join(".denylists")
+}
+
+/// Persiste une denylist signée dans le cache disque, sous
+/// `<root>/.denylists/<peerid>.json`.
+pub fn save_cached_list(root: &Path, list: &Denylist) -> CoreResult<()> {
+    let dir = denylist_cache_dir(root);
+    std::fs::create_dir_all(&dir)?;
+    let json =
+        serde_json::to_string(list).map_err(|e| CoreError::Moderation(format!("json: {e}")))?;
+    std::fs::write(dir.join(format!("{}.json", list.issuer_peer_id()?)), json)?;
+    Ok(())
+}
+
+/// Charge toutes les denylists mises en cache. Un fichier illisible ou
+/// invalide (JSON corrompu, signature invalide) est **ignoré** — journalisé
+/// via `tracing::warn!` — plutôt que de faire échouer le chargement complet.
+pub fn load_cached_lists(root: &Path) -> Vec<Denylist> {
+    let Ok(entries) = std::fs::read_dir(denylist_cache_dir(root)) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let text = std::fs::read_to_string(e.path()).ok()?;
+            match Denylist::from_json(&text).and_then(|l| l.verify().map(|_| l)) {
+                Ok(l) => Some(l),
+                Err(err) => {
+                    tracing::warn!("cache de denylist ignoré ({}): {err}", e.path().display());
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// Supprime la denylist mise en cache pour un éditeur donné, si elle existe.
+pub fn remove_cached_list(root: &Path, issuer: &PeerId) {
+    let _ = std::fs::remove_file(denylist_cache_dir(root).join(format!("{issuer}.json")));
 }
 
 #[cfg(test)]
@@ -512,5 +673,69 @@ mod tests {
         let m = Moderation::empty();
         let peer = PeerId::from(Keypair::generate_ed25519().public());
         assert!(!m.is_blocked_key(&peer));
+    }
+
+    fn list(issuer: &Keypair, seq: u64, cids: &[Cid], keys: &[PeerId]) -> Denylist {
+        Denylist::build_signed("l", "2026-09-06T00:00:00Z", issuer, seq, cids, keys).unwrap()
+    }
+
+    #[test]
+    fn apply_list_replaces_per_issuer_and_ignores_stale() {
+        let a = Keypair::generate_ed25519();
+        let c1 = cid_for(b"1");
+        let c2 = cid_for(b"2");
+        let mut m = Moderation::new();
+        assert!(matches!(
+            m.apply_list(&list(&a, 1, &[c1], &[])).unwrap(),
+            Applied::Newer { added_cids: 1, .. }
+        ));
+        assert!(m.is_blocked(&c1));
+        // seq 2 remplace : c1 sort, c2 entre.
+        assert!(matches!(
+            m.apply_list(&list(&a, 2, &[c2], &[])).unwrap(),
+            Applied::Newer { .. }
+        ));
+        assert!(!m.is_blocked(&c1) && m.is_blocked(&c2));
+        // seq 1 (périmé) ignoré.
+        assert!(matches!(
+            m.apply_list(&list(&a, 1, &[c1], &[])).unwrap(),
+            Applied::Stale
+        ));
+        assert!(!m.is_blocked(&c1));
+        let s = m.source(&a.public().to_peer_id()).unwrap();
+        assert_eq!((s.seq, s.entry_count, s.key_count), (2, 1, 0));
+    }
+
+    #[test]
+    fn entry_shared_by_two_issuers_survives_one_removal() {
+        let a = Keypair::generate_ed25519();
+        let b = Keypair::generate_ed25519();
+        let bad = PeerId::from(Keypair::generate_ed25519().public());
+        let mut m = Moderation::new();
+        m.apply_list(&list(&a, 1, &[], &[bad])).unwrap();
+        m.apply_list(&list(&b, 1, &[], &[bad])).unwrap();
+        assert!(m.remove_issuer(&a.public().to_peer_id()));
+        assert!(m.is_blocked_key(&bad), "encore portée par b");
+        assert!(m.remove_issuer(&b.public().to_peer_id()));
+        assert!(!m.is_blocked_key(&bad));
+        assert!(!m.remove_issuer(&a.public().to_peer_id()), "déjà retiré");
+    }
+
+    #[test]
+    fn cache_roundtrip_and_corrupt_file_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Keypair::generate_ed25519();
+        let l = list(&a, 3, &[cid_for(b"x")], &[]);
+        save_cached_list(dir.path(), &l).unwrap();
+        std::fs::write(
+            denylist_cache_dir(dir.path()).join("corrompu.json"),
+            b"{not json",
+        )
+        .unwrap();
+        let loaded = load_cached_lists(dir.path());
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].seq, 3);
+        remove_cached_list(dir.path(), &a.public().to_peer_id());
+        assert!(load_cached_lists(dir.path()).is_empty());
     }
 }
