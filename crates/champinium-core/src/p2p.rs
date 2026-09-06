@@ -918,11 +918,17 @@ impl Node {
         .await
     }
 
-    /// Récupère la denylist d'un éditeur depuis la DHT, la vérifie et
-    /// l'applique. Si elle est **plus récente** que celle déjà connue de cet
-    /// éditeur : mise en cache disque, purge rétroactive et tic de modération.
-    /// Une liste périmée (rejeu d'une version plus permissive) est renvoyée
-    /// telle quelle mais n'a aucun effet.
+    /// Récupère la denylist d'un éditeur depuis la DHT et la vérifie
+    /// (signature + correspondance clé/émetteur).
+    ///
+    /// Elle n'est **appliquée que si l'éditeur est souscrit** : mise en cache
+    /// disque, purge rétroactive et tic de modération, et seulement si son
+    /// `seq` est plus récent que celui déjà connu. Pour un éditeur non
+    /// souscrit, la liste vérifiée est renvoyée sans aucun effet — c'est ce qui
+    /// permet de la prévisualiser avant de décider de suivre l'éditeur, sans
+    /// subir une purge de blocs irréversible dont l'effet en mémoire
+    /// disparaîtrait au prochain démarrage. Une liste périmée (rejeu d'une
+    /// version plus permissive) est renvoyée telle quelle, sans effet non plus.
     pub async fn fetch_denylist(&self, issuer: PeerId) -> CoreResult<Option<Denylist>> {
         fetch_denylist_inner(&self.moderation_state(), issuer).await
     }
@@ -941,6 +947,10 @@ impl Node {
             issuers.insert(issuer);
             save_denylist_issuers(&self.blockstore, &issuers)?;
         }
+        // La liste des éditeurs a changé : un front qui affiche « mes listes »
+        // doit se rafraîchir tout de suite, sans attendre la première liste
+        // effectivement récupérée (qui émettra son propre tic).
+        let _ = self.moderation_events.send(());
         let state = self.moderation_state();
         tokio::spawn(async move {
             if let Err(e) = fetch_denylist_inner(&state, issuer).await {
@@ -974,14 +984,14 @@ impl Node {
             save_denylist_issuers(&self.blockstore, &issuers)?;
         }
         crate::moderation::remove_cached_list(self.blockstore.root(), &issuer);
-        let removed = self
-            .moderation
+        self.moderation
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove_issuer(&issuer);
-        if removed {
-            let _ = self.moderation_events.send(());
-        }
+        // Tic inconditionnel : même si aucune liste de cet éditeur n'avait
+        // encore été récupérée (donc `remove_issuer` sans effet), la liste des
+        // éditeurs suivis a changé et les fronts l'affichent.
+        let _ = self.moderation_events.send(());
         Ok(())
     }
 
@@ -2742,6 +2752,21 @@ async fn fetch_denylist_inner(
     let Some(list) = fetch_verified_denylist_from_dht(&state.cmd_tx, issuer).await? else {
         return Ok(None);
     };
+    // Seul un éditeur SOUSCRIT a un effet. Sans ce garde, un appel isolé
+    // appliquerait une liste qui disparaîtrait du moteur au redémarrage (le
+    // constructeur ne recharge que le cache des éditeurs souscrits) alors que
+    // sa purge de blocs, elle, est irréversible — et laisserait une entrée de
+    // cache orpheline que `republish_known_feeds` ignore de son côté. La liste
+    // vérifiée est tout de même renvoyée : c'est ce qui permet de PRÉVISUALISER
+    // un éditeur avant de le suivre, sans rien subir de sa liste.
+    let subscribed = state
+        .denylist_issuers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&issuer);
+    if !subscribed {
+        return Ok(Some(list));
+    }
     // Verrou pris et relâché avant tout `.await` (la purge en fait plusieurs).
     let applied = {
         let mut guard = state
@@ -4185,6 +4210,7 @@ mod tests {
 
         let mut ticks = follower.subscribe_moderation();
         assert!(!follower.is_blocked(&bad), "rien de bloqué au départ");
+        follower.subscribe_denylist_issuer(editor_peer).unwrap();
 
         let fetched = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
@@ -4207,10 +4233,15 @@ mod tests {
             .denylist_source(&editor_peer)
             .expect("éditeur connu du moteur après application");
         assert_eq!((source.seq, source.entry_count), (3, 1));
-        assert!(
-            ticks.recv().await.is_ok(),
-            "un tic de modération est émis à l'application"
-        );
+        // Au moins un tic (souscription, puis application) ; on les draine tous
+        // pour que l'assertion « périmé = pas de tic » plus bas soit nette : le
+        // fetch immédiat lancé par `subscribe_denylist_issuer` peut avoir
+        // gagné la course avec celui de la boucle ci-dessus.
+        let mut seen = 0usize;
+        while ticks.try_recv().is_ok() {
+            seen += 1;
+        }
+        assert!(seen >= 1, "un tic de modération est émis à l'application");
         assert!(
             crate::moderation::denylist_cache_dir(follower.blockstore().root())
                 .join(format!("{editor_peer}.json"))
@@ -4226,6 +4257,66 @@ mod tests {
                 Err(tokio::sync::broadcast::error::TryRecvError::Empty)
             ),
             "une liste périmée ne doit pas réveiller les abonnés"
+        );
+    }
+
+    /// La liste d'un éditeur **non souscrit** est bien récupérée et vérifiée
+    /// (prévisualisation), mais n'a AUCUN effet : ni moteur, ni cache disque,
+    /// ni purge. Sans ce garde, un appel isolé infligerait une purge de blocs
+    /// irréversible dont l'effet en mémoire s'évaporerait au redémarrage — le
+    /// constructeur ne recharge que le cache des éditeurs souscrits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn denylist_of_unsubscribed_editor_is_returned_but_never_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let publisher = spawn_node(dir.path(), "dl_pub2").await;
+        let follower = spawn_node(dir.path(), "dl_fol2").await;
+
+        let addr = publisher
+            .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        follower
+            .add_address(publisher.peer_id(), addr.clone())
+            .await
+            .unwrap();
+        follower.dial(addr).await.unwrap();
+
+        let editor = Keypair::generate_ed25519();
+        let editor_peer = editor.public().to_peer_id();
+        let bad = cid_for(b"contenu d'un editeur non suivi");
+        let list = Denylist::build_signed("liste", "2026-09-06T00:00:00Z", &editor, 1, &[bad], &[])
+            .unwrap();
+        assert!(
+            !follower.denylist_issuers().contains(&editor_peer),
+            "éditeur volontairement non souscrit"
+        );
+
+        let fetched = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                publisher.publish_denylist(&list).await.unwrap();
+                if let Some(l) = follower.fetch_denylist(editor_peer).await.unwrap() {
+                    break l;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+        .await
+        .expect("la liste doit être récupérable pour prévisualisation");
+
+        assert_eq!(fetched.seq, 1, "la liste vérifiée est bien renvoyée");
+        assert!(
+            !follower.is_blocked(&bad),
+            "aucun effet sur le moteur sans souscription"
+        );
+        assert!(
+            follower.denylist_source(&editor_peer).is_none(),
+            "l'éditeur non souscrit n'entre pas dans le moteur"
+        );
+        assert!(
+            !crate::moderation::denylist_cache_dir(follower.blockstore().root())
+                .join(format!("{editor_peer}.json"))
+                .exists(),
+            "aucune entrée de cache orpheline n'est écrite"
         );
     }
 
