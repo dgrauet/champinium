@@ -70,6 +70,69 @@ const MAX_FEED_SIZE: usize = 4 * 1024 * 1024;
 const MAX_PROVIDED_KEYS: usize = 1_000_000;
 /// Nombre max de records DHT stockés localement (feeds d'autres créateurs).
 const MAX_DHT_RECORDS: usize = 100_000;
+
+/// Bootstraps compilés (ADR 0013). Le binaire est la confiance : liste non
+/// signée, vide tant qu'aucun bootstrap public n'existe.
+const DEFAULT_BOOTSTRAPS: &str = include_str!("../../../bootstrap/default.peers");
+/// Borne sur le nombre total de bootstraps (compilés + persistés) qu'un nœud
+/// retient — anti-DoS sur `add_bootstrap`, même patron que `MAX_DHT_RECORDS`.
+pub const MAX_BOOTSTRAPS: usize = 64;
+
+/// Parse une liste de multiaddrs bootstrap (une par ligne, `#` = commentaire,
+/// lignes vides ignorées). Une ligne invalide (multiaddr mal formée, ou sans
+/// composant `/p2p/<peerid>`) est journalée et ignorée plutôt que de faire
+/// échouer tout le chargement.
+fn parse_bootstrap_lines(raw: &str) -> Vec<Multiaddr> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| match l.parse::<Multiaddr>() {
+            Ok(a) if split_peer_id(a.clone()).is_ok() => Some(a),
+            _ => {
+                tracing::warn!("bootstrap ignoré (multiaddr invalide ou sans /p2p/): {l}");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Bootstraps compilés dans le binaire — voir [`bootstrap/README.md`]
+/// (hors crate) pour proposer un bootstrap public.
+pub fn compiled_bootstraps() -> Vec<Multiaddr> {
+    parse_bootstrap_lines(DEFAULT_BOOTSTRAPS)
+}
+
+/// Chemin des bootstraps ajoutés par l'utilisateur, à côté des blocs — même
+/// patron que `.subscriptions`.
+fn bootstraps_path(blockstore: &Blockstore) -> PathBuf {
+    blockstore.root().join(".bootstraps")
+}
+
+/// Charge les bootstraps persistés (vide si absent/illisible — un fichier
+/// corrompu ne doit pas empêcher le démarrage). Les entrées individuellement
+/// invalides sont ignorées plutôt que de faire échouer tout le chargement.
+fn load_bootstraps(blockstore: &Blockstore) -> BTreeSet<Multiaddr> {
+    std::fs::read_to_string(bootstraps_path(blockstore))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .map(|addrs| {
+            addrs
+                .into_iter()
+                .filter_map(|a| a.parse::<Multiaddr>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Persiste les bootstraps ajoutés par l'utilisateur (JSON `Vec<String>` trié
+/// — `BTreeSet` le garantit).
+fn save_bootstraps(blockstore: &Blockstore, set: &BTreeSet<Multiaddr>) -> CoreResult<()> {
+    let addrs: Vec<String> = set.iter().map(Multiaddr::to_string).collect();
+    let json = serde_json::to_string(&addrs)
+        .map_err(|e| CoreError::Network(format!("json bootstraps: {e}")))?;
+    std::fs::write(bootstraps_path(blockstore), json)?;
+    Ok(())
+}
 /// Intervalle du suivi actif périodique des channels souscrits (spec channels
 /// §2). Surchargeable en test via
 /// [`Node::with_moderation_and_follow_interval`] — **pas** via un setter
@@ -237,6 +300,17 @@ enum Command {
     StopProviding {
         key: RecordKey,
     },
+    /// Peuple la table de routage Kademlia depuis les pairs déjà connus
+    /// (`kademlia.bootstrap()`). `NoKnownPeers` (aucun pair ajouté au
+    /// préalable, ex. liste de bootstraps vide) est renvoyé comme `Err` ici
+    /// mais n'est pas propagé par [`Node::bootstrap`] (journalisé seulement).
+    Bootstrap {
+        tx: oneshot::Sender<Result<(), String>>,
+    },
+    /// Nombre de pairs actuellement connectés (`Swarm::connected_peers`).
+    ConnectedPeers {
+        tx: oneshot::Sender<usize>,
+    },
 }
 
 /// Politique de stockage appliquée par [`Node::get_with`] lors d'une
@@ -272,6 +346,10 @@ pub struct Node {
     /// Abonnements locaux (channels suivis) — état **privé** du nœud, jamais
     /// publié sur le réseau (spec channels §2).
     subscriptions: Arc<Mutex<BTreeSet<PeerId>>>,
+    /// Bootstraps ajoutés par l'utilisateur, persistés `.bootstraps` — les
+    /// compilés ([`compiled_bootstraps`]) ne sont PAS stockés ici, seulement
+    /// ajoutés à la lecture par [`Node::bootstraps`].
+    bootstraps: Arc<Mutex<BTreeSet<Multiaddr>>>,
     /// Index de seed proactif (spec channels lot c) : publications retenues
     /// par émetteur, pins, quota — voir [`crate::seeding`].
     seed_index: Arc<Mutex<SeedIndex>>,
@@ -558,6 +636,9 @@ impl Node {
         // Abonnements locaux persistés (spec channels §2) : rechargés avant le
         // démarrage de la boucle de suivi pour que le passage initial les couvre.
         let subscriptions = Arc::new(Mutex::new(load_subscriptions(&blockstore)));
+        // Bootstraps persistés par l'utilisateur (les compilés ne sont pas
+        // stockés ici, voir la doc du champ `Node::bootstraps`).
+        let bootstraps = Arc::new(Mutex::new(load_bootstraps(&blockstore)));
         // Channels bloqués localement (tâche 3) : rechargés avant le démarrage
         // de la boucle de gossip (le check d'ingestion catalogue doit en tenir
         // compte dès le premier feed reçu).
@@ -707,6 +788,7 @@ impl Node {
             feed_seq,
             channel_profile,
             subscriptions,
+            bootstraps,
             seed_index,
             seed_quota,
             seed_events,
@@ -839,6 +921,75 @@ impl Node {
     /// Enregistre une adresse connue pour un pair (table de routage Kademlia).
     pub async fn add_address(&self, peer: PeerId, addr: Multiaddr) -> CoreResult<()> {
         self.send(Command::AddAddress { peer, addr }).await
+    }
+
+    /// Bootstraps connus : compilés ([`compiled_bootstraps`]) ∪ persistés par
+    /// l'utilisateur, dédupliqués et triés par chaîne (`BTreeSet<Multiaddr>`).
+    pub fn bootstraps(&self) -> Vec<Multiaddr> {
+        let mut all: BTreeSet<Multiaddr> = compiled_bootstraps().into_iter().collect();
+        all.extend(
+            self.bootstraps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .cloned(),
+        );
+        all.into_iter().collect()
+    }
+
+    /// Ajoute un bootstrap connu de l'utilisateur (persisté `.bootstraps`) :
+    /// `addr` doit porter un composant `/p2p/<peerid>`, sinon
+    /// `CoreError::Network`. Borné à [`MAX_BOOTSTRAPS`] (compilés + persistés
+    /// confondus) — anti-DoS, même patron que les autres ensembles persistés
+    /// (abonnements, éditeurs de denylist).
+    pub fn add_bootstrap(&self, addr: Multiaddr) -> CoreResult<()> {
+        let (peer, base) = split_peer_id(addr.clone())?;
+        let mut set = self
+            .bootstraps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !set.contains(&addr) && set.len() + compiled_bootstraps().len() >= MAX_BOOTSTRAPS {
+            return Err(CoreError::Network(format!(
+                "au plus {MAX_BOOTSTRAPS} bootstraps"
+            )));
+        }
+        set.insert(addr);
+        save_bootstraps(&self.blockstore, &set)?;
+        drop(set);
+        let cmd_tx = self.cmd_tx.clone();
+        tokio::spawn(async move {
+            let _ = cmd_tx.send(Command::AddAddress { peer, addr: base }).await;
+        });
+        Ok(())
+    }
+
+    /// Compose vers tous les bootstraps connus (best-effort) puis peuple la
+    /// table de routage (`kademlia.bootstrap()`). Renvoie le nombre de
+    /// bootstraps dont le dial a été accepté. Aucun effet si la liste est
+    /// vide (`kademlia.bootstrap()` renvoie alors `NoKnownPeers`, journalisé
+    /// mais pas propagé).
+    pub async fn bootstrap(&self) -> CoreResult<usize> {
+        let mut joined = 0usize;
+        for addr in self.bootstraps() {
+            match self.connect(addr.clone()).await {
+                Ok(()) => joined += 1,
+                Err(e) => tracing::warn!("bootstrap {addr} injoignable: {e}"),
+            }
+        }
+        let (tx, rx) = oneshot::channel();
+        self.send(Command::Bootstrap { tx }).await?;
+        if let Err(e) = rx.await.map_err(|_| CoreError::Shutdown)? {
+            // NoKnownPeers quand la liste est vide : pas une erreur applicative.
+            tracing::debug!("kademlia.bootstrap: {e}");
+        }
+        Ok(joined)
+    }
+
+    /// Nombre de pairs actuellement connectés.
+    pub async fn connected_peers(&self) -> CoreResult<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Command::ConnectedPeers { tx }).await?;
+        rx.await.map_err(|_| CoreError::Shutdown)
     }
 
     /// Indique si un CID est actuellement bloqué par la modération.
@@ -3924,6 +4075,16 @@ impl EventLoop {
             Command::AddAddress { peer, addr } => {
                 self.swarm.behaviour_mut().kademlia.add_address(&peer, addr);
             }
+            Command::Bootstrap { tx } => {
+                let res = match self.swarm.behaviour_mut().kademlia.bootstrap() {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(e.to_string()),
+                };
+                let _ = tx.send(res);
+            }
+            Command::ConnectedPeers { tx } => {
+                let _ = tx.send(self.swarm.connected_peers().count());
+            }
             Command::Provide { key, tx } => {
                 match self.swarm.behaviour_mut().kademlia.start_providing(key) {
                     Ok(qid) => {
@@ -4369,6 +4530,68 @@ mod tests {
             .map(|p| p.to_string())
             .collect();
         assert_eq!(names, vec![KAD_PROTOCOL.to_string()]);
+    }
+
+    #[test]
+    fn compiled_bootstraps_parse_and_ignore_invalid_lines() {
+        // Le fichier livré est vide (aucun bootstrap public) : aucune entrée.
+        assert!(compiled_bootstraps().is_empty());
+        assert_eq!(parse_bootstrap_lines("# c\n\n/ip4/1.2.3.4/tcp/4101/p2p/12D3KooWJtMRdnYaZgSyi3KTLaa5DN6mCAcpfwaTXgD1PHo997ej\nnimporte quoi\n").len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn add_bootstrap_requires_peer_id_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).await.unwrap();
+        assert!(node
+            .add_bootstrap("/ip4/127.0.0.1/tcp/4101".parse().unwrap())
+            .is_err());
+        let addr: Multiaddr =
+            "/ip4/127.0.0.1/tcp/4101/p2p/12D3KooWJtMRdnYaZgSyi3KTLaa5DN6mCAcpfwaTXgD1PHo997ej"
+                .parse()
+                .unwrap();
+        node.add_bootstrap(addr.clone()).unwrap();
+        assert!(node.bootstraps().contains(&addr));
+        drop(node);
+        let node = Node::open(dir.path()).await.unwrap();
+        assert!(
+            node.bootstraps().contains(&addr),
+            "persisté dans .bootstraps"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bootstrap_joins_peer_and_populates_routing_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = Node::open(&dir.path().join("b")).await.unwrap();
+        let addr_b = b
+            .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        let cid = b.add(b"bloc de b").await.unwrap();
+        let a = Node::open(&dir.path().join("a")).await.unwrap();
+        a.listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        let full: Multiaddr = format!("{addr_b}/p2p/{}", b.peer_id()).parse().unwrap();
+        a.add_bootstrap(full).unwrap();
+        assert_eq!(a.bootstrap().await.unwrap(), 1);
+        // Sans aucun `connect` manuel : la table de routage connaît B.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if a.connected_peers().await.unwrap() >= 1
+                    && a.get_providers(cid)
+                        .await
+                        .map(|p| p.contains(&b.peer_id()))
+                        .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .expect("A doit joindre B par bootstrap");
     }
 
     /// Le point de commit du seed ne retient une publication que si l'émetteur
