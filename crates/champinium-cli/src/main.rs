@@ -102,6 +102,13 @@ enum Cmd {
         /// Tag du contenu (répétable ; normalisé en minuscules, cherchable).
         #[arg(long = "tag")]
         tags: Vec<String>,
+        /// Déclaration de provenance (obligatoire, signée avec le feed) :
+        /// generated | assisted | captured | undeclared.
+        #[arg(long, value_parser = parse_provenance_mode)]
+        provenance: champinium_core::feed::ProvenanceMode,
+        /// Outil ou modèle utilisé (répétable, ≤ 8 ; normalisé, cherchable).
+        #[arg(long = "tool")]
+        tools: Vec<String>,
     },
     /// Recherche locale (titres/tags du catalogue reconstruit en écoutant).
     Search {
@@ -310,8 +317,17 @@ async fn main() -> Result<()> {
             } else {
                 for e in entries {
                     println!("créateur {} (seq {}) :", e.issuer, e.seq);
-                    for c in e.cids {
-                        println!("  {c}");
+                    for item in &e.items {
+                        let title = if item.title.is_empty() {
+                            "(sans titre)"
+                        } else {
+                            &item.title
+                        };
+                        println!(
+                            "  {} {title} — {}",
+                            provenance_label(&item.provenance),
+                            item.cid
+                        );
                     }
                 }
             }
@@ -337,7 +353,15 @@ async fn main() -> Result<()> {
             listen,
             title,
             tags,
+            provenance,
+            tools,
         } => {
+            if tools.len() > champinium_core::feed::MAX_TOOLS_PER_ENTRY {
+                anyhow::bail!(
+                    "au plus {} outils",
+                    champinium_core::feed::MAX_TOOLS_PER_ENTRY
+                );
+            }
             let node = build_node(&cli.data_dir, &cli.denylist).await?;
             let addr = node
                 .listen(listen.parse().context("multiaddr d'écoute invalide")?)
@@ -348,6 +372,10 @@ async fn main() -> Result<()> {
                 cid: manifest_cid.to_string(),
                 title,
                 tags,
+                provenance: champinium_core::feed::Provenance {
+                    mode: provenance,
+                    tools,
+                },
             };
             node.publish_feed_with(std::slice::from_ref(&entry)).await?;
             spawn_feed_republisher_with(node.clone(), vec![entry]);
@@ -595,6 +623,30 @@ fn spawn_feed_republisher_with(node: Node, entries: Vec<champinium_core::feed::F
     });
 }
 
+fn parse_provenance_mode(s: &str) -> Result<champinium_core::feed::ProvenanceMode, String> {
+    champinium_core::feed::ProvenanceMode::parse(s).ok_or_else(|| {
+        format!(
+            "provenance invalide '{s}' (attendu : generated | assisted | captured | undeclared)"
+        )
+    })
+}
+
+/// Préfixe court d'affichage d'un mode de provenance.
+fn provenance_label(p: &champinium_core::feed::Provenance) -> String {
+    use champinium_core::feed::ProvenanceMode as M;
+    let mode = match p.mode {
+        M::Generated => "IA",
+        M::Assisted => "IA assistée",
+        M::Captured => "capturé",
+        M::Undeclared => "non déclaré",
+    };
+    if p.tools.is_empty() {
+        format!("[{mode}]")
+    } else {
+        format!("[{mode} · {}]", p.tools.join(", "))
+    }
+}
+
 /// Affiche des résultats de recherche.
 fn print_hits(hits: &[champinium_core::catalog::SearchHit]) {
     if hits.is_empty() {
@@ -608,7 +660,8 @@ fn print_hits(hits: &[champinium_core::catalog::SearchHit]) {
             &h.title
         };
         println!(
-            "{title} — {} (créateur {}) [{}]",
+            "{} {title} — {} (créateur {}) [{}]",
+            provenance_label(&h.provenance),
             h.cid,
             h.issuer,
             h.tags.join(", ")
