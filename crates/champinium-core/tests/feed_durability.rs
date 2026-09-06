@@ -169,19 +169,27 @@ async fn republish_known_feeds_skips_blocked_issuer() {
     // intact (`purge_blocked_issuer` ne touche pas `subscriptions`).
     let signer = Keypair::generate_ed25519();
     let list =
-        Denylist::build_signed("test-list", "2026-07-23", &signer, &[], &[victim_peer]).unwrap();
+        Denylist::build_signed("test-list", "2026-07-23", &signer, 1, &[], &[victim_peer]).unwrap();
     node.subscribe_denylist(&list).await.unwrap();
 
-    // Réinjection directe du feed au catalogue (test uniquement, bypasse la
-    // modération à l'ingestion) pour isoler le filtre de
-    // `republish_known_feeds` de celui, déjà couvert ailleurs, de
-    // `Catalog::apply`/`fetch_feed_inner`.
+    // Réinjection directe du feed au catalogue via `apply_feed_unchecked_for_tests`
+    // (bypasse délibérément le checkpoint de modération à l'ingestion, contrairement
+    // à `apply_feed_for_tests`) pour isoler le filtre de `republish_known_feeds` de
+    // celui, déjà couvert ailleurs, de `Catalog::apply`/`fetch_feed_inner`.
     let feed = Feed::build_signed(&victim, 1, &[cid_for(b"blocked")]).unwrap();
-    node.apply_feed_for_tests(feed).unwrap();
+    node.apply_feed_unchecked_for_tests(feed).unwrap();
 
+    // `subscribe_denylist` inscrit désormais son éditeur dans
+    // `.denylist_issuers` (finding I2, revue finale 2026-09-06) : `signer` est
+    // donc lui-même un éditeur souscrit, et sa liste en cache est légitimement
+    // republiée. Seul le feed de `victim` (le compte BANNI) doit rester exclu
+    // — d'où un `count` de 1 (la liste de `signer`) et non 0.
+    assert!(node
+        .denylist_issuers()
+        .contains(&signer.public().to_peer_id()));
     let count = node.republish_known_feeds().await.unwrap();
     assert_eq!(
-        count, 0,
-        "un émetteur souscrit mais banni ne doit jamais être republié"
+        count, 1,
+        "seule la liste de l'éditeur (signer) est republiée ; le feed de l'émetteur banni (victim) ne doit jamais l'être"
     );
 }

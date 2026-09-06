@@ -157,11 +157,15 @@ fn build_ui(app: &Application) {
     // Réglages : liste des channels bloqués localement (tâche d/6) — même
     // patron de popup dédiée que "Réglages de seed".
     let blocked_channels_btn = Button::with_label("Channels bloqués");
+    // Listes de modération (denylists souscrites) — même patron de popup
+    // dédiée que "Channels bloqués".
+    let moderation_lists_btn = Button::with_label("Listes de modération");
     let header_bar = GtkBox::new(Orientation::Horizontal, 8);
     header_bar.append(&status);
     header_bar.append(&stream_progress);
     header_bar.append(&seed_settings_btn);
     header_bar.append(&blocked_channels_btn);
+    header_bar.append(&moderation_lists_btn);
     *ui.stream_progress.borrow_mut() = Some(stream_progress);
 
     let peer_entry = Entry::builder()
@@ -281,6 +285,7 @@ fn build_ui(app: &Application) {
         let search_entry = search_entry.clone();
         let channel_entry = channel_entry.clone();
         let preview_link_btn = preview_link_btn.clone();
+        let window = window.clone();
         glib::spawn_future_local(async move {
             match open_node(&ui.rt).await {
                 Ok(node) => {
@@ -288,18 +293,30 @@ fn build_ui(app: &Application) {
                     let mut events = node.subscribe_catalog();
                     let mut seed_events = node.subscribe_seed();
                     let mut stream_events = node.subscribe_stream();
+                    let mut moderation_events = node.subscribe_moderation();
                     *ui.node.borrow_mut() = Some(node);
                     // Le nœud est prêt : router les liens champinium:// vers
                     // le chemin du bouton « Aperçu » (rejoue spinner +
-                    // résolution + feuille + erreurs, aucune duplication),
+                    // résolution + feuille + erreurs, aucune duplication) —
+                    // sauf un lien d'éditeur de denylist, qui ouvre le volet
+                    // « Listes de modération » avec le champ prérempli, SANS
+                    // souscrire (l'utilisateur décide depuis la fenêtre) —
                     // puis consommer un éventuel lien reçu avant ce point
                     // (démarrage à froid via `connect_open`).
-                    LINK_HANDLER.with(|h| {
-                        *h.borrow_mut() = Some(Box::new(move |uri: &str| {
-                            channel_entry.set_text(uri);
-                            preview_link_btn.emit_clicked();
-                        }));
-                    });
+                    {
+                        let ui = ui.clone();
+                        let window = window.clone();
+                        LINK_HANDLER.with(|h| {
+                            *h.borrow_mut() = Some(Box::new(move |uri: &str| {
+                                if uri.starts_with("champinium://denylist/") {
+                                    open_moderation_lists(&ui, &window, Some(uri));
+                                } else {
+                                    channel_entry.set_text(uri);
+                                    preview_link_btn.emit_clicked();
+                                }
+                            }));
+                        });
+                    }
                     if let Some(uri) = PENDING_LINK.with(|p| p.borrow_mut().take()) {
                         dispatch_link(&uri);
                     }
@@ -321,6 +338,31 @@ fn build_ui(app: &Application) {
                         let search_entry = search_entry.clone();
                         glib::spawn_future_local(async move {
                             while let Ok(()) | Err(RecvError::Lagged(_)) = seed_events.recv().await
+                            {
+                                refresh_lists(
+                                    &ui,
+                                    &status,
+                                    &subs_list,
+                                    &explorer_list,
+                                    &search_entry,
+                                );
+                            }
+                        });
+                    }
+
+                    // Boucle de modération : une denylist appliquée ou un
+                    // éditeur retiré peut purger des entrées du catalogue
+                    // (checkpoint modération) — même patron que la boucle de
+                    // seed ci-dessus, sur un canal séparé.
+                    {
+                        let ui = ui.clone();
+                        let status = status.clone();
+                        let subs_list = subs_list.clone();
+                        let explorer_list = explorer_list.clone();
+                        let search_entry = search_entry.clone();
+                        glib::spawn_future_local(async move {
+                            while let Ok(()) | Err(RecvError::Lagged(_)) =
+                                moderation_events.recv().await
                             {
                                 refresh_lists(
                                     &ui,
@@ -385,10 +427,16 @@ fn build_ui(app: &Application) {
                         let status = status.clone();
                         LINK_HANDLER.with(|h| {
                             *h.borrow_mut() = Some(Box::new(move |uri: &str| {
-                                channel_entry.set_text(uri);
-                                status.set_text(
-                                    "nœud non ouvert — lien conservé, réessayez avec « Aperçu »",
-                                );
+                                if uri.starts_with("champinium://denylist/") {
+                                    status.set_text(
+                                        "nœud non ouvert — lien de denylist reçu, réessayez une fois le nœud prêt",
+                                    );
+                                } else {
+                                    channel_entry.set_text(uri);
+                                    status.set_text(
+                                        "nœud non ouvert — lien conservé, réessayez avec « Aperçu »",
+                                    );
+                                }
                             }));
                         });
                     }
@@ -416,6 +464,16 @@ fn build_ui(app: &Application) {
         let window = window.clone();
         blocked_channels_btn.connect_clicked(move |_| {
             open_blocked_channels(&ui, &window);
+        });
+    }
+
+    // Listes de modération : popup dédiée listant les éditeurs de denylist
+    // souscrits + suivi par lien/PeerId.
+    {
+        let ui = ui.clone();
+        let window = window.clone();
+        moderation_lists_btn.connect_clicked(move |_| {
+            open_moderation_lists(&ui, &window, None);
         });
     }
 
@@ -1248,6 +1306,225 @@ fn populate_blocked_channels(ui: &Rc<Ui>, win: &gtk::Window, list: &ListBox) {
     }
 }
 
+/// Popup des listes de modération (denylists souscrites) — même patron de
+/// fenêtre dédiée que `open_blocked_channels`. `prefill`, quand présent (lien
+/// `champinium://denylist/…` reçu par le scheme OS), pré-remplit le champ de
+/// suivi SANS souscrire — c'est à l'utilisateur de cliquer « Suivre ».
+fn open_moderation_lists(ui: &Rc<Ui>, parent: &ApplicationWindow, prefill: Option<&str>) {
+    let Some(node) = ui.node.borrow().clone() else {
+        return;
+    };
+
+    let win = gtk::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .title("Listes de modération")
+        .default_width(360)
+        .build();
+
+    let content = GtkBox::new(Orientation::Vertical, 8);
+    content.set_margin_top(12);
+    content.set_margin_bottom(12);
+    content.set_margin_start(12);
+    content.set_margin_end(12);
+
+    let title = Label::new(Some("Listes de modération"));
+    title.set_xalign(0.0);
+    title.add_css_class("heading");
+
+    let list = ListBox::new();
+    let scroller = ScrolledWindow::builder()
+        .child(&list)
+        .min_content_height(160)
+        .build();
+
+    let entry = Entry::builder()
+        .placeholder_text("champinium://denylist/… ou PeerId")
+        .hexpand(true)
+        .build();
+    if let Some(text) = prefill {
+        entry.set_text(text);
+    }
+    let follow_btn = Button::with_label("Suivre");
+    let follow_row = GtkBox::new(Orientation::Horizontal, 8);
+    follow_row.append(&entry);
+    follow_row.append(&follow_btn);
+
+    let status_label = Label::new(None);
+    status_label.set_xalign(0.0);
+
+    content.append(&title);
+    content.append(&scroller);
+    content.append(&follow_row);
+    content.append(&status_label);
+    win.set_child(Some(&content));
+
+    populate_moderation_lists(ui, &win, &list, &status_label);
+
+    // Suivre un nouvel éditeur : parse (lien de denylist ou PeerId nu, jamais
+    // un lien de channel — `parse_denylist` le refuse), puis souscrit sur le
+    // runtime tokio (écriture disque + tâche de fond, jamais sur le thread
+    // GTK).
+    {
+        let ui = ui.clone();
+        let win = win.clone();
+        let list = list.clone();
+        let entry = entry.clone();
+        let status_label = status_label.clone();
+        follow_btn.connect_clicked(move |btn| {
+            let text = entry.text().to_string();
+            let issuer = match channel_link::parse_denylist(&text) {
+                Ok(peer) => peer,
+                Err(e) => {
+                    status_label.set_text(&describe_core_error(&e, "lien de denylist"));
+                    return;
+                }
+            };
+            let Some(node) = ui.node.borrow().clone() else {
+                status_label.set_text("nœud pas encore prêt");
+                return;
+            };
+            let rt = ui.rt.clone();
+            let ui = ui.clone();
+            let win = win.clone();
+            let list = list.clone();
+            let entry = entry.clone();
+            let status_label = status_label.clone();
+            let btn = btn.clone();
+            btn.set_sensitive(false);
+            glib::spawn_future_local(async move {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                rt.spawn(async move {
+                    let _ = tx.send(subscribe_denylist_inner(&node, issuer).await);
+                });
+                let result = rx.await;
+                btn.set_sensitive(true);
+                match result {
+                    Ok(Ok(())) => {
+                        status_label.set_text("suivi ajouté");
+                        entry.set_text("");
+                        populate_moderation_lists(&ui, &win, &list, &status_label);
+                    }
+                    Ok(Err(e)) => status_label.set_text(&describe_core_error(&e, "suivi")),
+                    Err(_) => status_label.set_text("tâche annulée"),
+                }
+            });
+        });
+    }
+
+    // Rafraîchissement réactif sur les tics de modération (souscription
+    // récupérée/appliquée, éditeur retiré) — s'arrête quand la fenêtre est
+    // détruite (référence faible : pas de fuite, pas d'accès après
+    // destruction).
+    {
+        let ui = ui.clone();
+        let list = list.clone();
+        let status_label = status_label.clone();
+        let weak_win = gtk::prelude::ObjectExt::downgrade(&win);
+        let mut events = node.subscribe_moderation();
+        glib::spawn_future_local(async move {
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                match events.recv().await {
+                    Ok(()) | Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => break,
+                }
+                let Some(win) = weak_win.upgrade() else {
+                    break;
+                };
+                populate_moderation_lists(&ui, &win, &list, &status_label);
+            }
+        });
+    }
+
+    win.present();
+}
+
+/// (Re)construit la liste des sources de modération dans la popup — appelée
+/// à l'ouverture, après un suivi/retrait réussi et sur chaque tic de
+/// modération. Éditeur projet en tête (`node.denylist_issuers()` le garantit
+/// déjà) : cadenas + libellé non retirable au lieu du bouton « Retirer ».
+fn populate_moderation_lists(ui: &Rc<Ui>, win: &gtk::Window, list: &ListBox, status: &Label) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+    let Some(node) = ui.node.borrow().clone() else {
+        return;
+    };
+    let issuers = node.denylist_issuers();
+    if issuers.is_empty() {
+        let empty = Label::new(Some("aucune liste suivie"));
+        empty.set_xalign(0.0);
+        empty.add_css_class("dim-label");
+        list.append(&empty);
+        return;
+    }
+    let project_issuer = node.project_issuer();
+    for issuer in issuers {
+        let source = node.denylist_source(&issuer);
+        let primary = source
+            .as_ref()
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| truncate_peer_id(&issuer.to_string()));
+        let secondary = match &source {
+            Some(s) => format!(
+                "{} CIDs · {} clés · {}",
+                s.entry_count, s.key_count, s.updated
+            ),
+            None => "jamais récupérée".to_string(),
+        };
+
+        let row = GtkBox::new(Orientation::Horizontal, 8);
+        let labels = GtkBox::new(Orientation::Vertical, 2);
+        let primary_label = Label::new(Some(&primary));
+        primary_label.set_xalign(0.0);
+        let secondary_label = Label::new(Some(&secondary));
+        secondary_label.set_xalign(0.0);
+        secondary_label.add_css_class("dim-label");
+        labels.append(&primary_label);
+        labels.append(&secondary_label);
+        labels.set_hexpand(true);
+        row.append(&labels);
+
+        if Some(issuer) == project_issuer {
+            let lock = gtk::Image::from_icon_name("changes-prevent-symbolic");
+            row.append(&lock);
+            let project_label = Label::new(Some("Liste projet — ne peut pas être retirée"));
+            project_label.add_css_class("dim-label");
+            row.append(&project_label);
+        } else {
+            let remove_btn = Button::with_label("Retirer");
+            let ui = ui.clone();
+            let win = win.clone();
+            let list_for_closure = list.clone();
+            let status = status.clone();
+            remove_btn.connect_clicked(move |_| {
+                let Some(node) = ui.node.borrow().clone() else {
+                    return;
+                };
+                let rt = ui.rt.clone();
+                let ui = ui.clone();
+                let win = win.clone();
+                let list = list_for_closure.clone();
+                let status = status.clone();
+                glib::spawn_future_local(async move {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    rt.spawn(async move {
+                        let _ = tx.send(unsubscribe_denylist_inner(&node, issuer).await);
+                    });
+                    match rx.await {
+                        Ok(Ok(())) => populate_moderation_lists(&ui, &win, &list, &status),
+                        Ok(Err(e)) => status.set_text(&describe_core_error(&e, "retrait")),
+                        Err(_) => status.set_text("tâche annulée"),
+                    }
+                });
+            });
+            row.append(&remove_btn);
+        }
+        list.append(&row);
+    }
+}
+
 /// Feuille d'aperçu d'un channel résolu par lien/PeerId (tâche 3) — même
 /// patron de fenêtre dédiée que `open_seed_settings`/`open_blocked_channels`.
 /// En-tête (nom/description, avatar si présent — sinon rien, pas de
@@ -1506,6 +1783,18 @@ async fn resolve_channel_inner(node: &Node, issuer: PeerId) -> Result<ChannelPre
 /// contrainte que `unsubscribe_inner`.
 async fn unblock_channel_inner(node: &Node, issuer: PeerId) -> Result<(), CoreError> {
     node.unblock_channel(issuer)
+}
+
+/// Souscrit à un éditeur de denylist — appel sync du core (écriture disque +
+/// tâche de fond `tokio::spawn`), même contrainte que `subscribe_inner`.
+async fn subscribe_denylist_inner(node: &Node, issuer: PeerId) -> Result<(), CoreError> {
+    node.subscribe_denylist_issuer(issuer)
+}
+
+/// Retire un éditeur de denylist souscrit — appel réellement async côté
+/// core (garde-fou : refuse l'éditeur projet).
+async fn unsubscribe_denylist_inner(node: &Node, issuer: PeerId) -> Result<(), CoreError> {
+    node.unsubscribe_denylist_issuer(issuer).await
 }
 
 /// Épingle un manifeste (écriture disque du `SeedIndex`) — même contrainte

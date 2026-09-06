@@ -15,7 +15,7 @@ UI. Consomme les bindings Swift générés à partir du contrat UniFFI.
 ## Interfaces
 
 - **Consomme** : module Swift `ChampiniumCore` + `ChampiniumCoreFFI.xcframework`
-  générés par `just macos-prepare` (**non commités**). Contrat actuel **v12** :
+  générés par `just macos-prepare` (**non commités**). Contrat actuel **v13** :
   objet `ChampiniumNode` (`openNode`, `listen`, `connect`, `catalog`,
   `ingestFile`, `publishFeedWith`, `openStream`/`closeStream`/`streamStatus`,
   `setStreamListener`, …) + record `FfiCatalogEntry`. `fetchHls` a été retiré
@@ -25,6 +25,9 @@ UI. Consomme les bindings Swift générés à partir du contrat UniFFI.
   (« IA / Assisté IA / Capturé / Non déclaré » + outils), sans champ de
   saisie — la publication reste CLI-only.
 - **Produit** : rien pour les autres agents (feuille de l'arbre).
+
+Contrat FFI v13 (ADR 0011) : volet « Listes de modération » (`denylistSources`,
+`subscribeDenylistIssuer`/`unsubscribeDenylistIssuer`, `ModerationListener`).
 
 ## Definition of Done — Phase 3 (MVP macOS)
 

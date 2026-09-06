@@ -61,6 +61,10 @@ progression affiche « segments : x/y » et **Arrêter**/fermeture appelle
 déclarée (« IA / Assisté IA / Capturé / Non déclaré » + outils, ADR 0010) —
 pas de champ de saisie, la publication reste CLI-only.
 
+Un volet **« Listes de modération »** (liste projet verrouillée, champ de
+collage + « Suivre » pour un éditeur tiers, état « jamais récupérée » tant que
+rien n'est en cache) couvre les denylists distribuées par le réseau (ADR 0011).
+
 ## Vérification de compilation — IMPORTANT
 
 Ce front a été écrit **sur un poste de dev macOS**, où ni le SDK .NET Windows ni

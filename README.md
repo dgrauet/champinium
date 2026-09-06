@@ -27,7 +27,7 @@ crates/champinium-cli/    outil debug
 infra/bootstrap/          nœud rendez-vous stateless
 infra/relay/              relay NAT stateless
 apps/{macos,windows,linux}/  fronts natifs (présentation uniquement)
-deny/                     denylist par défaut (modération)
+deny/                     ancre de confiance de modération (clé projet compilée)
 ```
 
 ## Build
@@ -67,8 +67,10 @@ en plus à du contenu provenant de pairs non-Champinium.
 **Notre réponse de design : la modération côté nœud, active par défaut.**
 - Hash-matching local contre des bases de contenus illégaux connus, **à
   l'ingestion** ET **à la réception avant tout reseed**.
-- **Denylists signées** souscrites (modèle fédéré), avec une liste par défaut
-  active à l'installation et **non désactivable** (voir [`deny/`](deny/)).
+- **Denylists signées**, distribuées par le réseau (modèle fédéré) : le
+  binaire embarque uniquement une **clé d'éditeur de confiance non
+  désactivable** ([`deny/`](deny/)), la liste elle-même est récupérée et mise
+  à jour sans nouvelle release.
 - Refus de seeder tout contenu matché ; procédure de signalement P2P.
 
 Cela **réduit** la circulation de contenu connu comme illégal sur les nœuds
@@ -89,6 +91,10 @@ conformes ; cela **ne l'élimine pas** et ne peut pas l'éliminer.
   facilitent la mise en relation.
 - **Utilisateur / seeder** : reseeder du contenu, c'est le rediffuser. La
   responsabilité de ce que vous seedez vous incombe.
+- **Éditeur d'une liste de modération** (dont l'éditeur de la liste projet,
+  ancrée par la clé compilée `deny/project.issuer`) : publier une denylist
+  signée engage sa responsabilité sur les entrées qu'elle contient — bannir
+  une clé ou un CID est un acte nommé et vérifiable, pas anonyme.
 
 **Ceci n'est pas un avis juridique.** Avant tout déploiement public ou toute
 opération de bootstrap/relay, consultez un conseil compétent dans votre

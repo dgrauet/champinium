@@ -112,6 +112,27 @@ public sealed class BlockedChannel
     public string DisplayText => PeerId.Length > 14 ? $"{PeerId[..8]}…{PeerId[^4..]}" : PeerId;
 }
 
+/// <summary>Une source de denylist suivie par ce nœud (panneau « Listes de
+/// modération ») — jointure locale d'affichage sur le record généré par
+/// uniffi-bindgen-cs (<c>FfiDenylistSource</c>, <c>internal</c>, jamais exposé
+/// tel quel sur une propriété publique du VM, même piège CS0053 que
+/// <see cref="ChannelPreviewInfo"/>).</summary>
+public sealed class DenylistSourceVm
+{
+    public string PeerId { get; init; } = "";
+    public string Display { get; init; } = "";
+    public string Detail { get; init; } = "";
+    public bool Locked { get; init; }
+    public bool Fetched { get; init; }
+
+    /// <summary>Libellé du cadenas — vide (donc invisible) pour une source suivie
+    /// librement, non vide pour la denylist projet (verrouillée, non retirable).</summary>
+    public string LockLabel => Locked ? "Liste projet — ne peut pas être retirée" : "";
+
+    /// <summary>Vrai si le bouton « Retirer » doit être affiché pour cette ligne.</summary>
+    public bool CanRemove => !Locked;
+}
+
 /// <summary>Une publication listée dans la feuille d'aperçu d'un channel
 /// (tâche 3) — même forme que <see cref="CatalogCid"/> mais sans les champs
 /// de pin (non pertinents avant abonnement).</summary>
@@ -177,6 +198,18 @@ public sealed class NodeViewModel : INotifyPropertyChanged
         public void OnSeedUpdated() => _onUpdate();
     }
 
+    /// <summary>Pont vers le callback de modération (sources de denylist suivies) —
+    /// même patron que <see cref="SeedRefresher"/> : re-dispatch, puis le VM relit
+    /// `DenylistSources()`.</summary>
+    private sealed class ModerationRefresher : ModerationListener
+    {
+        private readonly Action _onUpdate;
+
+        public ModerationRefresher(Action onUpdate) => _onUpdate = onUpdate;
+
+        public void OnModerationUpdated() => _onUpdate();
+    }
+
     /// <summary>Pont vers le callback de session de lecture progressive — même
     /// patron que <see cref="SeedRefresher"/> : re-dispatch, puis le VM relit
     /// `StreamStatus(id)`.</summary>
@@ -193,6 +226,7 @@ public sealed class NodeViewModel : INotifyPropertyChanged
     private Microsoft.UI.Dispatching.DispatcherQueue? _dispatcher;
     private CatalogRefresher? _listener;
     private SeedRefresher? _seedListener;
+    private ModerationRefresher? _moderationListener;
     private StreamListener? _streamListener;
 
     /// <summary>Identifiant de la session de lecture progressive en cours (ou
@@ -261,6 +295,28 @@ public sealed class NodeViewModel : INotifyPropertyChanged
     /// <summary>Channels bloqués localement (PeerIds triés, `blocked_channels()`) —
     /// préférence privée de ce nœud, jamais publiée (contrat v8).</summary>
     public ObservableCollection<BlockedChannel> BlockedChannels { get; } = new();
+
+    /// <summary>Sources de denylist suivies par ce nœud (`denylist_sources()`) —
+    /// panneau « Listes de modération », aucun tri/filtrage côté C#.</summary>
+    public ObservableCollection<DenylistSourceVm> DenylistSources { get; } = new();
+
+    /// <summary>Lien ou PeerId saisi pour suivre une nouvelle source de denylist
+    /// (liaison TextBox, panneau « Listes de modération »).</summary>
+    private string _denylistField = "";
+    public string DenylistField
+    {
+        get => _denylistField;
+        set => Set(ref _denylistField, value);
+    }
+
+    /// <summary>Vrai pendant l'appel `SubscribeDenylistIssuer` — désactive le bouton
+    /// « Suivre » (évite un double envoi sur double-clic).</summary>
+    private bool _isFollowingDenylist;
+    public bool IsFollowingDenylist
+    {
+        get => _isFollowingDenylist;
+        private set => Set(ref _isFollowingDenylist, value);
+    }
 
     /// <summary>Requête de recherche locale (liaison TextBox) ; vide = catalogues normaux.</summary>
     private string _searchQuery = "";
@@ -430,12 +486,21 @@ public sealed class NodeViewModel : INotifyPropertyChanged
                 () => _dispatcher?.TryEnqueue(RefreshCatalog));
             await node.SetSeedListener(_seedListener);
 
+            _moderationListener = new ModerationRefresher(
+                () => _dispatcher?.TryEnqueue(() =>
+                {
+                    RefreshModeration();
+                    RefreshCatalog();
+                }));
+            await node.SetModerationListener(_moderationListener);
+
             _streamListener = new StreamRefresher(
                 id => _dispatcher?.TryEnqueue(() => RefreshStream(id)));
             await node.SetStreamListener(_streamListener);
 
             Status = "nœud en ligne";
             RefreshCatalog();
+            RefreshModeration();
             QuotaField = GigabytesText(_storageStats.quotaBytes);
         }
         catch (Exception ex)
@@ -686,6 +751,83 @@ public sealed class NodeViewModel : INotifyPropertyChanged
             await _node.UnblockChannel(peerId);
             SubscriptionStatus = "channel débloqué";
             RefreshCatalog();
+        }
+        catch (Exception ex)
+        {
+            SubscriptionStatus = DescribeSubscriptionError(ex);
+        }
+    }
+
+    /// <summary>Recharge le panneau « Listes de modération » depuis le noyau —
+    /// aucun tri/filtrage côté C#, `denylist_sources()` vient déjà prêt.</summary>
+    public void RefreshModeration()
+    {
+        if (_node is null)
+        {
+            return;
+        }
+
+        DenylistSources.Clear();
+        foreach (var source in _node.DenylistSources())
+        {
+            DenylistSources.Add(new DenylistSourceVm
+            {
+                PeerId = source.peerId,
+                Display = source.fetched ? source.name : Truncate(source.peerId),
+                Detail = source.fetched
+                    ? $"{source.entryCount} CIDs · {source.keyCount} clés · {source.updated}"
+                    : "jamais récupérée",
+                Locked = source.locked,
+                Fetched = source.fetched,
+            });
+        }
+    }
+
+    /// <summary>Suit une nouvelle source de denylist par lien ou PeerId (bouton
+    /// « Suivre », panneau « Listes de modération »).</summary>
+    public async Task FollowDenylistAsync()
+    {
+        if (_node is null || string.IsNullOrWhiteSpace(DenylistField))
+        {
+            return;
+        }
+
+        IsFollowingDenylist = true;
+        try
+        {
+            await _node.SubscribeDenylistIssuer(DenylistField);
+            DenylistField = "";
+            SubscriptionStatus = "liste de modération suivie";
+            RefreshModeration();
+        }
+        catch (FfiException.InvalidInput)
+        {
+            SubscriptionStatus = "lien ou PeerId invalide";
+        }
+        catch (Exception ex)
+        {
+            SubscriptionStatus = DescribeSubscriptionError(ex);
+        }
+        finally
+        {
+            IsFollowingDenylist = false;
+        }
+    }
+
+    /// <summary>Retire le suivi d'une source de denylist (bouton « Retirer »,
+    /// masqué pour les sources verrouillées — voir <see cref="DenylistSourceVm.CanRemove"/>).</summary>
+    public async Task UnfollowDenylistAsync(string peerId)
+    {
+        if (_node is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await _node.UnsubscribeDenylistIssuer(peerId);
+            SubscriptionStatus = "liste de modération retirée";
+            RefreshModeration();
         }
         catch (Exception ex)
         {

@@ -19,7 +19,7 @@ use crate::error::{CoreError, Result as CoreResult};
 use crate::feed::{ChannelMeta, Feed, FeedEntry};
 use crate::identity;
 use crate::ingest::{self, HlsManifest, HlsSegment};
-use crate::moderation::{Denylist, Moderation};
+use crate::moderation::{Applied, Denylist, Moderation};
 use crate::report::{Report, ReportBook};
 use crate::seeding::{self, eviction_order, SeedIndex, SeededPublication};
 use crate::stream::{self, StreamSession, StreamSessionInfo, StreamStatus};
@@ -224,7 +224,7 @@ enum Command {
         tx: oneshot::Sender<CoreResult<()>>,
     },
     /// Arrête d'annoncer ce nœud comme fournisseur d'un CID (purge de
-    /// modération par clé, tâche d/2 — voir `Node::stop_providing`).
+    /// modération par clé, tâche d/2 — voir `stop_providing_inner`).
     /// Fire-and-forget : pas de réponse attendue, best-effort comme
     /// `Provide`/`Command::Provide` côté annonce.
     StopProviding {
@@ -283,6 +283,21 @@ pub struct Node {
     /// bannies par denylist (`Moderation::is_blocked_key`) pour l'enforcement
     /// aux mêmes checkpoints (voir `is_key_blocked_inner`).
     blocked_channels: Arc<Mutex<BTreeSet<PeerId>>>,
+    /// Éditeurs de denylist souscrits (spec 2026-09-06), persistés
+    /// `.denylist_issuers`. Contrairement aux abonnements de channel, cet
+    /// ensemble contient toujours l'éditeur projet quand il est connu
+    /// (`project_issuer`), réinséré à chaque construction.
+    denylist_issuers: Arc<Mutex<BTreeSet<PeerId>>>,
+    /// Éditeur de la liste de modération PROJET, compilé dans le binaire
+    /// (`moderation::project_issuer`). `None` pour les constructeurs
+    /// `with_moderation*` (tests et opérateurs qui composent leur propre
+    /// modération) ; `Some` pour `Node::new`/`Node::open`, où il est
+    /// **non retirable** — c'est le garde-fou non désactivable.
+    project_issuer: Option<PeerId>,
+    /// Tic « la modération a changé » (liste appliquée plus récente, ou
+    /// éditeur retiré) — distinct de `catalog_events` : un front peut vouloir
+    /// rafraîchir l'état des listes sans qu'un feed ait bougé.
+    moderation_events: tokio::sync::broadcast::Sender<()>,
     /// Marqueur de vivacité : la tâche de suivi périodique n'en tient qu'un
     /// [`Weak`], ce qui lui permet de s'arrêter dès que toutes les poignées
     /// `Node` (qui clonent ce `Arc`) sont tombées, sans jamais retenir un
@@ -403,14 +418,32 @@ fn catalog_items_from_feed(feed: &Feed) -> Vec<CatalogItem> {
 }
 
 impl Node {
-    /// Construit un nœud avec la modération par défaut active (non désactivable).
+    /// Construit un nœud avec un moteur de modération vide, **souscrit à
+    /// l'éditeur de la liste projet** compilé dans le binaire
+    /// ([`crate::moderation::project_issuer`]) : c'est le garde-fou par défaut,
+    /// non désactivable (voir [`Node::unsubscribe_denylist_issuer`]). Le moteur
+    /// démarre vide, puis se remplit depuis le cache disque et la DHT.
+    ///
+    /// Une valeur `deny/project.issuer` invalide fait échouer la construction :
+    /// démarrer sans savoir quelle clé fait autorité reviendrait à démarrer
+    /// sans garde-fou.
     pub async fn new(keypair: Keypair, blockstore: Blockstore) -> CoreResult<Self> {
-        Self::with_moderation(keypair, blockstore, Moderation::with_default()?).await
+        Self::with_moderation_and_intervals(
+            keypair,
+            blockstore,
+            Moderation::new(),
+            FOLLOW_INTERVAL,
+            SEED_INTERVAL,
+            Some(crate::moderation::project_issuer()?),
+        )
+        .await
     }
 
     /// Ouvre (ou crée) un nœud sous `data_dir` : identité Ed25519 persistée +
-    /// magasin de blocs, avec la modération par défaut active. Point d'entrée
-    /// commun aux fronts (via FFI) et aux consommateurs Rust directs (GTK).
+    /// magasin de blocs, **souscrit à l'éditeur de la liste projet** comme
+    /// [`Node::new`] : les listes déjà en cache sont appliquées avant tout
+    /// réseau, puis rafraîchies depuis la DHT. Point d'entrée commun aux
+    /// fronts (via FFI) et aux consommateurs Rust directs (GTK).
     pub async fn open(data_dir: &Path) -> CoreResult<Self> {
         let keypair = identity::load_or_generate(data_dir.join("node.key"))?;
         let blockstore = Blockstore::open(data_dir.join("blocks"))?;
@@ -456,6 +489,7 @@ impl Node {
             moderation,
             follow_interval,
             SEED_INTERVAL,
+            None,
         )
         .await
     }
@@ -469,6 +503,11 @@ impl Node {
     /// correspondante — voir le commentaire sur `FOLLOW_INTERVAL`), les deux
     /// intervalles sont effectifs **avant** le `tokio::spawn` de leur boucle,
     /// donc sans course possible.
+    ///
+    /// `project_issuer` est l'éditeur de denylist non retirable de ce nœud :
+    /// `Some(_)` pour [`Node::new`]/[`Node::open`] (clé projet compilée),
+    /// `None` pour les autres constructeurs, qui composent leur modération
+    /// eux-mêmes (tests, opérateurs).
     #[doc(hidden)]
     pub async fn with_moderation_and_intervals(
         keypair: Keypair,
@@ -476,6 +515,7 @@ impl Node {
         moderation: Moderation,
         follow_interval: Duration,
         seed_interval: Duration,
+        project_issuer: Option<PeerId>,
     ) -> CoreResult<Self> {
         let peer_id = identity::peer_id(&keypair);
         let mut swarm = build_swarm(keypair.clone())?;
@@ -505,6 +545,38 @@ impl Node {
         // de la boucle de gossip (le check d'ingestion catalogue doit en tenir
         // compte dès le premier feed reçu).
         let blocked_channels = Arc::new(Mutex::new(load_blocked_channels(&blockstore)));
+
+        // Éditeurs de denylist souscrits (spec 2026-09-06) : l'éditeur projet
+        // est réinséré ici même si le fichier persisté ne le contient pas
+        // (fichier absent, effacé à la main, ou écrit par une version
+        // antérieure) — c'est ce qui rend le garde-fou non désactivable.
+        let mut issuers = load_denylist_issuers(&blockstore);
+        if let Some(p) = project_issuer {
+            issuers.insert(p);
+        }
+        // Cache disque AVANT tout réseau : la protection d'hier survit à un
+        // démarrage hors ligne, plutôt que de laisser une fenêtre non modérée
+        // jusqu'à la première réponse de la DHT. Seules les listes d'un
+        // éditeur encore souscrit sont appliquées (un cache orphelin ne doit
+        // pas ressusciter une souscription retirée).
+        {
+            let mut guard = moderation
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for list in crate::moderation::load_cached_lists(blockstore.root()) {
+                match list.issuer_peer_id() {
+                    Ok(issuer) if issuers.contains(&issuer) => {
+                        if let Err(e) = guard.apply_list(&list) {
+                            tracing::warn!("denylist en cache ignorée ({issuer}): {e}");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let denylist_issuers = Arc::new(Mutex::new(issuers));
+        let (moderation_events, _) = tokio::sync::broadcast::channel(64);
+
         // Canal d'événements « catalogue mis à jour » : capacité large car un
         // abonné lent ne doit pas perdre le signal (les tics sont fusionnables :
         // rater un tic mais en recevoir un plus tard suffit à se resynchroniser).
@@ -552,12 +624,19 @@ impl Node {
         // [`FOLLOW_INTERVAL`] pour la course que ça évite.
         tokio::spawn(follow_loop(
             Arc::downgrade(&alive),
-            cmd_tx.clone(),
-            catalog.clone(),
-            catalog_events.clone(),
+            ModerationState {
+                cmd_tx: cmd_tx.clone(),
+                blockstore: blockstore.clone(),
+                moderation: moderation.clone(),
+                catalog: catalog.clone(),
+                catalog_events: catalog_events.clone(),
+                seed_index: seed_index.clone(),
+                seed_events: seed_events.clone(),
+                blocked_channels: blocked_channels.clone(),
+                denylist_issuers: denylist_issuers.clone(),
+                moderation_events: moderation_events.clone(),
+            },
             subscriptions.clone(),
-            moderation.clone(),
-            blocked_channels.clone(),
             follow_interval,
         ));
 
@@ -616,6 +695,9 @@ impl Node {
             seed_events,
             seed_wake,
             blocked_channels,
+            denylist_issuers,
+            project_issuer,
+            moderation_events,
             alive,
             cmd_tx,
             #[cfg(feature = "cold-storage")]
@@ -766,46 +848,219 @@ impl Node {
     ///   son entrée de catalogue, ses publications retenues (SeedIndex —
     ///   modération prime sur les pins, `keep_pinned=false`) et leurs blocs
     ///   sont purgés, et le nœud arrête d'en annoncer chacun comme
-    ///   fournisseur (`Node::stop_providing`).
+    ///   fournisseur (`stop_providing_inner`).
     ///
     /// Renvoie le nombre total de blocs supprimés du magasin.
+    ///
+    /// Chemin **manuel** (liste signée déjà en main) : aucun réseau. Inscrit
+    /// aussi son éditeur dans `.denylist_issuers` (finding I2, revue finale
+    /// 2026-09-06) — sans quoi cette entrée serait un **orphelin** que ni la
+    /// republication ni le rechargement au démarrage ne regardent (même
+    /// raisonnement que le garde `subscribed` de `fetch_denylist_inner`),
+    /// alors que la purge de blocs, elle, est irréversible. Utilisé par les
+    /// tests et les opérateurs qui ont déjà une liste signée en main ; le
+    /// chemin réseau ([`Node::fetch_denylist`]) applique exactement la même
+    /// purge, via la même fonction libre.
     pub async fn subscribe_denylist(&self, list: &Denylist) -> CoreResult<usize> {
-        {
+        let issuer = list.issuer_peer_id()?;
+        let state = self.moderation_state();
+        let applied = {
             let mut mod_guard = self
                 .moderation
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            mod_guard.subscribe(list)?;
+            mod_guard.apply_list(list)?
+        };
+        {
+            let mut issuers = self
+                .denylist_issuers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            issuers.insert(issuer);
+            save_denylist_issuers(&self.blockstore, &issuers)?;
         }
-
-        // --- Purge par CLÉ (finding M2) : toute entrée de catalogue dont
-        // l'émetteur est désormais bloqué — pas seulement les clés de CETTE
-        // liste : une clé a pu être bloquée par une souscription antérieure
-        // dont le catalogue vient tout juste d'être peuplé.
-        let mut purged = 0usize;
-        let blocked_entries: Vec<CatalogEntry> = self
-            .catalog_entries()
-            .into_iter()
-            .filter(|e| is_key_blocked_inner(&self.moderation, &self.blocked_channels, &e.issuer))
-            .collect();
-        for entry in &blocked_entries {
-            purged += self.purge_blocked_issuer(entry.issuer, &entry.cids).await;
-        }
-        if !blocked_entries.is_empty() {
-            let _ = self.catalog_events.send(());
-        }
-
-        // --- Purge par CID (comportement historique, v1/v2) : les blocs
-        // encore présents et directement listés (les blocs d'émetteurs
-        // bloqués ci-dessus ont déjà été retirés, donc jamais recomptés ici).
-        for cid in self.blockstore.list()? {
-            if self.is_blocked(&cid) {
-                self.blockstore.remove(&cid)?;
-                self.stop_providing(cid).await;
-                purged += 1;
+        // La purge reste inconditionnelle (comportement historique : elle
+        // rattrape aussi les blocages posés par une souscription antérieure
+        // dont le catalogue vient d'être peuplé), mais cache et tic ne sont
+        // dus qu'à un changement réel.
+        let purged = purge_after_denylist_inner(&state).await?;
+        if !matches!(applied, Applied::Stale) {
+            if let Err(e) = crate::moderation::save_cached_list(self.blockstore.root(), list) {
+                tracing::warn!("mise en cache de la denylist échouée: {e}");
             }
         }
+        // Tic inconditionnel : la liste des éditeurs suivis a changé même si
+        // le contenu appliqué était périmé.
+        let _ = self.moderation_events.send(());
         Ok(purged)
+    }
+
+    /// Rassemble les `Arc` de modération dans un [`ModerationState`] — jamais
+    /// un `Node` cloné, cf. sa doc.
+    fn moderation_state(&self) -> ModerationState {
+        ModerationState {
+            cmd_tx: self.cmd_tx.clone(),
+            blockstore: self.blockstore.clone(),
+            moderation: self.moderation.clone(),
+            catalog: self.catalog.clone(),
+            catalog_events: self.catalog_events.clone(),
+            seed_index: self.seed_index.clone(),
+            seed_events: self.seed_events.clone(),
+            blocked_channels: self.blocked_channels.clone(),
+            denylist_issuers: self.denylist_issuers.clone(),
+            moderation_events: self.moderation_events.clone(),
+        }
+    }
+
+    /// Publie une denylist signée dans la DHT sous `/champinium/denylist/
+    /// <peerid de l'éditeur>` (outil d'éditeur — spec 2026-09-06). La
+    /// signature est vérifiée avant l'envoi : publier une liste qu'on ne peut
+    /// pas valider soi-même serait au mieux inutile (les stockeurs la
+    /// refuseraient, cf. `is_valid_denylist_record`). Best-effort comme
+    /// `publish_feed_with` : le PUT est envoyé à la boucle réseau, pas attendu.
+    pub async fn publish_denylist(&self, list: &Denylist) -> CoreResult<()> {
+        list.verify()?;
+        let issuer = list.issuer_peer_id()?;
+        let value = serde_json::to_vec(list)
+            .map_err(|e| CoreError::Moderation(format!("json denylist: {e}")))?;
+        if value.len() > crate::moderation::MAX_DENYLIST_SIZE {
+            return Err(CoreError::Moderation("denylist trop volumineuse".into()));
+        }
+        let (tx, _rx) = oneshot::channel();
+        self.send(Command::PutRecord {
+            key: denylist_record_key(&issuer),
+            value,
+            tx,
+        })
+        .await
+    }
+
+    /// Récupère la denylist d'un éditeur depuis la DHT et la vérifie
+    /// (signature + correspondance clé/émetteur).
+    ///
+    /// Elle n'est **appliquée que si l'éditeur est souscrit** : mise en cache
+    /// disque, purge rétroactive et tic de modération, et seulement si son
+    /// `seq` est plus récent que celui déjà connu. Pour un éditeur non
+    /// souscrit, la liste vérifiée est renvoyée sans aucun effet — c'est ce qui
+    /// permet de la prévisualiser avant de décider de suivre l'éditeur, sans
+    /// subir une purge de blocs irréversible dont l'effet en mémoire
+    /// disparaîtrait au prochain démarrage. Une liste périmée (rejeu d'une
+    /// version plus permissive) est renvoyée telle quelle, sans effet non plus.
+    pub async fn fetch_denylist(&self, issuer: PeerId) -> CoreResult<Option<Denylist>> {
+        fetch_denylist_inner(&self.moderation_state(), issuer).await
+    }
+
+    /// Souscrit à un **éditeur** de denylist : persiste immédiatement
+    /// (`.denylist_issuers`) puis déclenche un `fetch_denylist` best-effort en
+    /// tâche de fond — la boucle de suivi prendra le relais si ce coup d'essai
+    /// échoue. Souscrire, c'est suivre la clé : les mises à jour ultérieures
+    /// de sa liste sont appliquées automatiquement, sans nouvelle release.
+    pub fn subscribe_denylist_issuer(&self, issuer: PeerId) -> CoreResult<()> {
+        {
+            let mut issuers = self
+                .denylist_issuers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            issuers.insert(issuer);
+            save_denylist_issuers(&self.blockstore, &issuers)?;
+        }
+        // La liste des éditeurs a changé : un front qui affiche « mes listes »
+        // doit se rafraîchir tout de suite, sans attendre la première liste
+        // effectivement récupérée (qui émettra son propre tic).
+        let _ = self.moderation_events.send(());
+        let state = self.moderation_state();
+        tokio::spawn(async move {
+            if let Err(e) = fetch_denylist_inner(&state, issuer).await {
+                tracing::debug!("fetch immédiat de la denylist de {issuer} échoué: {e}");
+            }
+        });
+        Ok(())
+    }
+
+    /// Se désabonne d'un éditeur de denylist : retire ses entrées du moteur
+    /// (les CIDs/clés encore portés par un AUTRE éditeur restent bloqués, cf.
+    /// [`Moderation::remove_issuer`]), supprime sa liste du cache disque et
+    /// émet le tic de modération.
+    ///
+    /// **L'éditeur projet ne peut pas être retiré** : la denylist par défaut
+    /// est un garde-fou non désactivable (CLAUDE.md, ADR 0011). La demande est
+    /// refusée par `CoreError::Moderation` — un refus de format/politique, pas
+    /// un refus de contenu (qui serait `Moderated`).
+    pub async fn unsubscribe_denylist_issuer(&self, issuer: PeerId) -> CoreResult<()> {
+        if self.project_issuer == Some(issuer) {
+            return Err(CoreError::Moderation(
+                "l'éditeur projet ne peut pas être retiré".into(),
+            ));
+        }
+        {
+            let mut issuers = self
+                .denylist_issuers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            issuers.remove(&issuer);
+            save_denylist_issuers(&self.blockstore, &issuers)?;
+        }
+        crate::moderation::remove_cached_list(self.blockstore.root(), &issuer);
+        self.moderation
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove_issuer(&issuer);
+        // Tic inconditionnel : même si aucune liste de cet éditeur n'avait
+        // encore été récupérée (donc `remove_issuer` sans effet), la liste des
+        // éditeurs suivis a changé et les fronts l'affichent.
+        let _ = self.moderation_events.send(());
+        Ok(())
+    }
+
+    /// Éditeurs de denylist souscrits, **projet d'abord** puis triés
+    /// (stabilité d'affichage : la liste non retirable est en tête).
+    pub fn denylist_issuers(&self) -> Vec<PeerId> {
+        let issuers = self
+            .denylist_issuers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut out: Vec<PeerId> = Vec::with_capacity(issuers.len());
+        if let Some(p) = self.project_issuer {
+            if issuers.contains(&p) {
+                out.push(p);
+            }
+        }
+        out.extend(
+            issuers
+                .iter()
+                .copied()
+                .filter(|i| Some(*i) != self.project_issuer),
+        );
+        out
+    }
+
+    /// Éditeur de la liste projet, s'il y en a un (`None` pour les
+    /// constructeurs `with_moderation*`).
+    pub fn project_issuer(&self) -> Option<PeerId> {
+        self.project_issuer
+    }
+
+    /// Instantané des entrées connues pour un éditeur souscrit (nom, `seq`,
+    /// compteurs) — `None` si aucune liste de cet éditeur n'a encore été
+    /// appliquée.
+    pub fn denylist_source(&self, issuer: &PeerId) -> Option<crate::moderation::DenylistSource> {
+        self.moderation
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .source(issuer)
+    }
+
+    /// Tic à chaque changement effectif de modération (liste plus récente
+    /// appliquée, éditeur retiré) — pendant de [`Node::subscribe_catalog`].
+    pub fn subscribe_moderation(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.moderation_events.subscribe()
+    }
+
+    /// Vrai si tout contenu de cette clé est refusé : par **denylist**
+    /// souscrite OU par **blocage local** de channel — la même union que celle
+    /// appliquée aux checkpoints (`is_key_blocked_inner`).
+    pub fn is_key_blocked(&self, peer: &PeerId) -> bool {
+        is_key_blocked_inner(&self.moderation, &self.blocked_channels, peer)
     }
 
     /// Purge toutes les traces locales ATTRIBUÉES à un émetteur devenu bloqué
@@ -826,103 +1081,12 @@ impl Node {
     /// AUTRE émetteur (segment partagé, cf. lot c) survit — la suppression
     /// passe par [`remove_unshared_blocks`], la même garde que `unsubscribe`.
     /// Renvoie le nombre de blocs effectivement supprimés du magasin.
+    ///
+    /// Corps extrait en fonction libre ([`purge_blocked_issuer_inner`]) pour
+    /// que la boucle de suivi des denylists puisse purger sans détenir un
+    /// `Node` (qui empêcherait l'arrêt de la boucle d'évènements).
     async fn purge_blocked_issuer(&self, issuer: PeerId, entry_cids: &[Cid]) -> usize {
-        self.catalog
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove_issuer(&issuer);
-
-        let evicted = {
-            let mut idx = self
-                .seed_index
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let evicted = idx.purge_issuer(&issuer.to_string(), false);
-            if !evicted.is_empty() {
-                if let Err(e) = seeding::save_seed_index(&self.blockstore, &idx) {
-                    tracing::warn!("persistance de l'index de seed échouée: {e}");
-                }
-            }
-            evicted
-        };
-
-        // Candidats à la purge : les publications retenues par le SeedIndex
-        // (manifeste + segments) ET les CIDs connus du catalogue au moment de
-        // l'appel (le feed peut référencer un manifeste jamais réellement
-        // seedé chez ce nœud) — tous deux strictement ATTRIBUÉS à `issuer`.
-        let mut publications = evicted.clone();
-        for cid in entry_cids {
-            let manifest_cid = cid.to_string();
-            if !publications.iter().any(|p| p.manifest_cid == manifest_cid) {
-                publications.push(SeededPublication {
-                    manifest_cid,
-                    segment_cids: Vec::new(),
-                    total_bytes: 0,
-                    order: 0,
-                });
-            }
-        }
-
-        // Instantané post-retrait du SeedIndex : un CID encore dedans
-        // appartient à une publication d'un AUTRE émetteur (partagée) et ne
-        // doit ni être purgé, ni voir son annonce de fourniture arrêtée —
-        // aucun `.await` entre cette lecture et `remove_unshared_blocks`
-        // ci-dessous, qui relit le même état : pas de course possible.
-        let remaining: HashSet<String> = self
-            .seed_index
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .all_cids()
-            .into_iter()
-            .collect();
-        let mut candidate_cids: HashSet<Cid> = HashSet::new();
-        for p in &publications {
-            if let Ok(cid) = p.manifest_cid.parse::<Cid>() {
-                candidate_cids.insert(cid);
-            }
-            for seg in &p.segment_cids {
-                if let Ok(cid) = seg.parse::<Cid>() {
-                    candidate_cids.insert(cid);
-                }
-            }
-        }
-        let mut count = 0usize;
-        for cid in &candidate_cids {
-            if remaining.contains(&cid.to_string()) {
-                continue; // partagé avec un émetteur non bloqué : on ne purge pas.
-            }
-            if self.blockstore.has(cid) {
-                count += 1;
-            }
-            // Retrait passif de l'annonce de fourniture (M3) : ce nœud
-            // arrête simplement de se déclarer fournisseur DHT de ce CID —
-            // aucune émission réseau, aucun rapport, rien de signalé aux
-            // pairs (cohérent avec le caractère strictement local du
-            // blocage tâche 3, et sobre pour la tâche 2).
-            self.stop_providing(*cid).await;
-        }
-        remove_unshared_blocks(&self.blockstore, &self.seed_index, &publications);
-
-        if !evicted.is_empty() {
-            let _ = self.seed_events.send(());
-        }
-        count
-    }
-
-    /// Arrête d'annoncer ce nœud comme fournisseur d'un CID (purge de
-    /// modération, tâches 2/3). `libp2p-kad` 0.48 (utilisé par libp2p 0.56)
-    /// expose `Behaviour::stop_providing` : le provider record LOCAL est
-    /// retiré immédiatement. Limite assumée : les copies déjà propagées chez
-    /// des pairs distants ne sont pas rappelées — elles s'éteignent à leur
-    /// propre expiration TTL (mêmes garanties best-effort que `provide`/
-    /// `Command::Provide`, pas de garantie de retrait réseau instantané).
-    async fn stop_providing(&self, cid: Cid) {
-        let _ = self
-            .cmd_tx
-            .send(Command::StopProviding {
-                key: RecordKey::new(&cid.to_bytes()),
-            })
-            .await;
+        purge_blocked_issuer_inner(&self.moderation_state(), issuer, entry_cids).await
     }
 
     /// Publie un feed signé listant `cids` (sans métadonnées) : voir
@@ -1750,9 +1914,38 @@ impl Node {
 
     /// Injecte un feed tiers directement dans le catalogue local, hors réseau
     /// (tests uniquement : simule la réception d'un feed sans dépendre du
-    /// gossip ou de la DHT).
+    /// gossip ou de la DHT). Applique le même CHECKPOINT MODÉRATION que les
+    /// vrais chemins d'ingestion (`handle_feed_message`/`fetch_feed_inner`) :
+    /// signature vérifiée en premier, puis un émetteur bloqué (denylist ou
+    /// blocage local de channel) est refusé AVANT `Catalog::apply` — sinon ce
+    /// raccourci de test prouverait l'inverse de ce que le checkpoint
+    /// garantit en production.
     #[doc(hidden)]
     pub fn apply_feed_for_tests(&self, feed: Feed) -> CoreResult<bool> {
+        feed.verify()?;
+        let issuer = feed.issuer_peer_id()?;
+        if is_key_blocked_inner(&self.moderation, &self.blocked_channels, &issuer) {
+            return Err(CoreError::Moderated("émetteur banni".into()));
+        }
+        let subs = self.subscriptions_snapshot();
+        let changed = self
+            .catalog
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .apply(feed, &subs)?;
+        if changed {
+            let _ = self.catalog_events.send(());
+        }
+        Ok(changed)
+    }
+
+    /// Comme [`Node::apply_feed_for_tests`] mais SANS le checkpoint par clé —
+    /// contournement explicite, réservé aux tests qui doivent construire un
+    /// état « feed d'un émetteur banni présent au catalogue » pour éprouver un
+    /// filtre défensif en aval (`republish_known_feeds`). Ne jamais l'utiliser
+    /// pour autre chose.
+    #[doc(hidden)]
+    pub fn apply_feed_unchecked_for_tests(&self, feed: Feed) -> CoreResult<bool> {
         let subs = self.subscriptions_snapshot();
         let changed = self
             .catalog
@@ -1902,6 +2095,38 @@ impl Node {
                 .send(Command::PutRecord {
                     key: feed_record_key(&issuer),
                     value: data,
+                    tx,
+                })
+                .await;
+            count += 1;
+        }
+
+        // Denylists : même problème de durabilité que les feeds (le record
+        // Kademlia d'un éditeur hors ligne s'éteint à son TTL), même remède —
+        // chaque nœud qui suit un éditeur reprovisionne sa liste. Seules les
+        // listes en cache d'un éditeur ENCORE souscrit sont republiées : un
+        // cache orphelin ne doit pas être réinjecté dans le réseau.
+        let subscribed_editors: BTreeSet<PeerId> = self
+            .denylist_issuers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for list in crate::moderation::load_cached_lists(self.blockstore.root()) {
+            let Ok(issuer) = list.issuer_peer_id() else {
+                continue;
+            };
+            if !subscribed_editors.contains(&issuer) {
+                continue;
+            }
+            let Ok(value) = serde_json::to_vec(&list) else {
+                continue;
+            };
+            let (tx, _rx) = oneshot::channel();
+            let _ = self
+                .cmd_tx
+                .send(Command::PutRecord {
+                    key: denylist_record_key(&issuer),
+                    value,
                     tx,
                 })
                 .await;
@@ -2100,6 +2325,37 @@ fn save_subscriptions(blockstore: &Blockstore, subs: &BTreeSet<PeerId>) -> CoreR
     Ok(())
 }
 
+/// Chemin des éditeurs de denylist souscrits (spec 2026-09-06), à côté des
+/// blocs — même patron que `.subscriptions`.
+fn denylist_issuers_path(blockstore: &Blockstore) -> PathBuf {
+    blockstore.root().join(".denylist_issuers")
+}
+
+/// Charge les éditeurs de denylist souscrits (vide si absent/illisible — un
+/// fichier corrompu ne doit pas empêcher le démarrage ; l'éditeur projet est
+/// de toute façon réinséré par le constructeur). Les entrées individuellement
+/// invalides sont ignorées.
+fn load_denylist_issuers(blockstore: &Blockstore) -> BTreeSet<PeerId> {
+    std::fs::read_to_string(denylist_issuers_path(blockstore))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .map(|ids| {
+            ids.into_iter()
+                .filter_map(|s| s.parse::<PeerId>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Persiste les éditeurs de denylist souscrits (JSON `Vec<String>` trié).
+fn save_denylist_issuers(blockstore: &Blockstore, issuers: &BTreeSet<PeerId>) -> CoreResult<()> {
+    let ids: Vec<String> = issuers.iter().map(PeerId::to_string).collect();
+    let json = serde_json::to_string(&ids)
+        .map_err(|e| CoreError::Network(format!("json éditeurs de denylist: {e}")))?;
+    std::fs::write(denylist_issuers_path(blockstore), json)?;
+    Ok(())
+}
+
 /// Chemin du débrayage de repli froid persisté (CS-a tâche 3), à côté des
 /// blocs — même patron que `.subscriptions`/`.seed_quota`. Ungaté (tâche
 /// CS-b 1) : le dotfile est lu/écrit quelle que soit la feature de build.
@@ -2262,19 +2518,22 @@ async fn fetch_feed_inner(
 /// mutable après coup : voir le commentaire sur `FOLLOW_INTERVAL` pour la
 /// course qu'un tel setter causerait avec cette toute première itération.
 ///
+/// La même boucle suit aussi les **éditeurs de denylist** souscrits (spec
+/// 2026-09-06) : une liste de modération est un record DHT comme un feed, et
+/// la rafraîchir relève exactement du même besoin (récupérer la version
+/// courante d'une clé qu'on suit). Mutualiser la boucle évite une seconde
+/// tâche de fond et garantit le même patron de vivacité.
+///
 /// Ne détient qu'un [`Weak`] marqueur de vivacité : dès que toutes les
 /// poignées `Node` sont tombées (donc `alive.upgrade()` échoue), la boucle
 /// s'arrête et relâche son clone de `cmd_tx` — sinon la boucle d'évènements ne
 /// s'arrêterait jamais (`cmd_rx.recv()` attend que tous les émetteurs tombent).
-#[allow(clippy::too_many_arguments)]
+/// C'est la raison pour laquelle elle reçoit un [`ModerationState`] (des `Arc`
+/// isolés) et **jamais** un `Node` cloné, qui créerait ce cycle.
 async fn follow_loop(
     alive: Weak<()>,
-    cmd_tx: mpsc::Sender<Command>,
-    catalog: Arc<Mutex<Catalog>>,
-    catalog_events: tokio::sync::broadcast::Sender<()>,
+    state: ModerationState,
     subscriptions: Arc<Mutex<BTreeSet<PeerId>>>,
-    moderation: Arc<RwLock<Moderation>>,
-    blocked_channels: Arc<Mutex<BTreeSet<PeerId>>>,
     follow_interval: Duration,
 ) {
     loop {
@@ -2289,12 +2548,12 @@ async fn follow_loop(
             .collect();
         for issuer in issuers {
             if let Err(e) = fetch_feed_inner(
-                &cmd_tx,
-                &catalog,
-                &catalog_events,
+                &state.cmd_tx,
+                &state.catalog,
+                &state.catalog_events,
                 &subscriptions,
-                &moderation,
-                &blocked_channels,
+                &state.moderation,
+                &state.blocked_channels,
                 issuer,
             )
             .await
@@ -2302,8 +2561,284 @@ async fn follow_loop(
                 tracing::debug!("suivi périodique de {issuer} échoué: {e}");
             }
         }
+        // Passe de suivi des éditeurs de denylist souscrits : la liste projet
+        // en fait partie (réinsérée à chaque construction), donc la protection
+        // par défaut se met à jour sans release.
+        let editors: Vec<PeerId> = state
+            .denylist_issuers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .copied()
+            .collect();
+        for issuer in editors {
+            if let Err(e) = fetch_denylist_inner(&state, issuer).await {
+                tracing::debug!("suivi de la denylist de {issuer} échoué: {e}");
+            }
+        }
         tokio::time::sleep(follow_interval).await;
     }
+}
+
+/// Tout ce qu'il faut pour appliquer, purger et suivre des denylists **sans**
+/// détenir une poignée `Node`. Même raison d'être que [`Fetcher`] et
+/// [`SeedLoopState`] : une tâche de fond qui cloneraient un `Node` retiendrait
+/// son `cmd_tx` fort et la boucle d'évènements ne s'arrêterait jamais (voir le
+/// commentaire sur `Node::alive`). `Node` en fabrique un à la demande
+/// (`Node::moderation_state`) et les méthodes publiques délèguent ici : aucune
+/// logique de purge dupliquée entre le chemin manuel et le chemin réseau.
+#[derive(Clone)]
+struct ModerationState {
+    cmd_tx: mpsc::Sender<Command>,
+    blockstore: Blockstore,
+    moderation: Arc<RwLock<Moderation>>,
+    catalog: Arc<Mutex<Catalog>>,
+    catalog_events: tokio::sync::broadcast::Sender<()>,
+    seed_index: Arc<Mutex<SeedIndex>>,
+    seed_events: tokio::sync::broadcast::Sender<()>,
+    blocked_channels: Arc<Mutex<BTreeSet<PeerId>>>,
+    /// Éditeurs de denylist souscrits (persistés `.denylist_issuers`).
+    denylist_issuers: Arc<Mutex<BTreeSet<PeerId>>>,
+    /// Tic « la modération a effectivement changé » (listes appliquées ou
+    /// retirées) — n'est émis qu'après un changement réel, jamais sur une
+    /// liste périmée.
+    moderation_events: tokio::sync::broadcast::Sender<()>,
+}
+
+/// Arrête d'annoncer ce nœud comme fournisseur d'un CID (purge de modération).
+/// `libp2p-kad` 0.48 (utilisé par libp2p 0.56) expose
+/// `Behaviour::stop_providing` : le provider record LOCAL est retiré
+/// immédiatement. Limite assumée : les copies déjà propagées chez des pairs
+/// distants ne sont pas rappelées — elles s'éteignent à leur propre expiration
+/// TTL (mêmes garanties best-effort que `provide`/`Command::Provide`, pas de
+/// garantie de retrait réseau instantané).
+async fn stop_providing_inner(cmd_tx: &mpsc::Sender<Command>, cid: Cid) {
+    let _ = cmd_tx
+        .send(Command::StopProviding {
+            key: RecordKey::new(&cid.to_bytes()),
+        })
+        .await;
+}
+
+/// Corps de [`Node::purge_blocked_issuer`] sans `self` (voir sa doc pour les
+/// invariants : purge de ce qui est ATTRIBUÉ à l'émetteur seulement, garde
+/// des blocs partagés, `stop_providing` sur chaque CID retiré).
+async fn purge_blocked_issuer_inner(
+    state: &ModerationState,
+    issuer: PeerId,
+    entry_cids: &[Cid],
+) -> usize {
+    state
+        .catalog
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove_issuer(&issuer);
+
+    let evicted = {
+        let mut idx = state
+            .seed_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let evicted = idx.purge_issuer(&issuer.to_string(), false);
+        if !evicted.is_empty() {
+            if let Err(e) = seeding::save_seed_index(&state.blockstore, &idx) {
+                tracing::warn!("persistance de l'index de seed échouée: {e}");
+            }
+        }
+        evicted
+    };
+
+    // Candidats à la purge : les publications retenues par le SeedIndex
+    // (manifeste + segments) ET les CIDs connus du catalogue au moment de
+    // l'appel (le feed peut référencer un manifeste jamais réellement
+    // seedé chez ce nœud) — tous deux strictement ATTRIBUÉS à `issuer`.
+    let mut publications = evicted.clone();
+    for cid in entry_cids {
+        let manifest_cid = cid.to_string();
+        if !publications.iter().any(|p| p.manifest_cid == manifest_cid) {
+            publications.push(SeededPublication {
+                manifest_cid,
+                segment_cids: Vec::new(),
+                total_bytes: 0,
+                order: 0,
+            });
+        }
+    }
+
+    // Instantané post-retrait du SeedIndex : un CID encore dedans
+    // appartient à une publication d'un AUTRE émetteur (partagée) et ne
+    // doit ni être purgé, ni voir son annonce de fourniture arrêtée —
+    // aucun `.await` entre cette lecture et `remove_unshared_blocks`
+    // ci-dessous, qui relit le même état : pas de course possible.
+    let remaining: HashSet<String> = state
+        .seed_index
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .all_cids()
+        .into_iter()
+        .collect();
+    let mut candidate_cids: HashSet<Cid> = HashSet::new();
+    for p in &publications {
+        if let Ok(cid) = p.manifest_cid.parse::<Cid>() {
+            candidate_cids.insert(cid);
+        }
+        for seg in &p.segment_cids {
+            if let Ok(cid) = seg.parse::<Cid>() {
+                candidate_cids.insert(cid);
+            }
+        }
+    }
+    let mut count = 0usize;
+    for cid in &candidate_cids {
+        if remaining.contains(&cid.to_string()) {
+            continue; // partagé avec un émetteur non bloqué : on ne purge pas.
+        }
+        if state.blockstore.has(cid) {
+            count += 1;
+        }
+        // Retrait passif de l'annonce de fourniture (M3) : ce nœud
+        // arrête simplement de se déclarer fournisseur DHT de ce CID —
+        // aucune émission réseau, aucun rapport, rien de signalé aux
+        // pairs (cohérent avec le caractère strictement local du
+        // blocage tâche 3, et sobre pour la tâche 2).
+        stop_providing_inner(&state.cmd_tx, *cid).await;
+    }
+    remove_unshared_blocks(&state.blockstore, &state.seed_index, &publications);
+
+    if !evicted.is_empty() {
+        let _ = state.seed_events.send(());
+    }
+    count
+}
+
+/// Purge rétroactive à appliquer APRÈS qu'une denylist vient d'entrer en
+/// vigueur : par **clé** (tout émetteur désormais bloqué, pas seulement les
+/// clés de la liste qui vient d'arriver) puis par **CID** (blocs du magasin
+/// directement listés). Extraite de `Node::subscribe_denylist` telle quelle,
+/// pour que le chemin réseau (`fetch_denylist_inner`, exécuté depuis
+/// `follow_loop`, qui ne peut pas détenir un `Node`) applique exactement la
+/// même purge que le chemin manuel. Renvoie le nombre de blocs supprimés.
+async fn purge_after_denylist_inner(state: &ModerationState) -> CoreResult<usize> {
+    let mut purged = 0usize;
+    let blocked_entries: Vec<CatalogEntry> = state
+        .catalog
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entries()
+        .into_iter()
+        .filter(|e| is_key_blocked_inner(&state.moderation, &state.blocked_channels, &e.issuer))
+        .collect();
+    for entry in &blocked_entries {
+        purged += purge_blocked_issuer_inner(state, entry.issuer, &entry.cids).await;
+    }
+    if !blocked_entries.is_empty() {
+        let _ = state.catalog_events.send(());
+    }
+
+    // --- Purge par CID (comportement historique) : les blocs encore présents
+    // et directement listés (les blocs d'émetteurs bloqués ci-dessus ont déjà
+    // été retirés, donc jamais recomptés ici).
+    for cid in state.blockstore.list()? {
+        if is_blocked_inner(&state.moderation, &cid) {
+            state.blockstore.remove(&cid)?;
+            stop_providing_inner(&state.cmd_tx, cid).await;
+            purged += 1;
+        }
+    }
+    Ok(purged)
+}
+
+/// Interroge la DHT pour le record de denylist de `issuer` et ne retient que
+/// le candidat de plus grand `seq` dont la signature ET l'émetteur sont
+/// vérifiés — même patron que [`fetch_verified_feed_from_dht`]. Le `seq` signé
+/// (v3) protège les **suiveurs déjà à jour** (LWW en mémoire et en cache) et
+/// les **stockeurs** de la clé (`should_store_denylist_record` refuse un
+/// rejeu rétrogradé lors du `PutRecord` entrant, finding I1) contre un rejeu
+/// d'une version antérieure. Il ne protège PAS un nœud neuf au cache vide qui
+/// interrogerait un pair dont le store aurait été rétrogradé avant que ce
+/// correctif ne s'applique partout : c'est une limite connue de la
+/// distribution par record Kademlia, pas une garantie absolue — voir ADR 0011.
+async fn fetch_verified_denylist_from_dht(
+    cmd_tx: &mpsc::Sender<Command>,
+    issuer: PeerId,
+) -> CoreResult<Option<Denylist>> {
+    let (tx, rx) = oneshot::channel();
+    cmd_tx
+        .send(Command::GetRecord {
+            key: denylist_record_key(&issuer),
+            tx,
+        })
+        .await
+        .map_err(|_| CoreError::Shutdown)?;
+    let values = rx.await.map_err(|_| CoreError::Shutdown)?;
+
+    let mut best: Option<Denylist> = None;
+    for value in values {
+        let Ok(text) = std::str::from_utf8(&value) else {
+            continue;
+        };
+        let Ok(list) = Denylist::from_json(text) else {
+            continue;
+        };
+        if list.verify().is_err() || list.issuer_peer_id().ok() != Some(issuer) {
+            continue;
+        }
+        if best.as_ref().is_none_or(|b| list.seq > b.seq) {
+            best = Some(list);
+        }
+    }
+    Ok(best)
+}
+
+/// Cœur de [`Node::fetch_denylist`], factorisé pour être appelable depuis
+/// `follow_loop` (qui ne détient pas de `Node`). Récupère la liste vérifiée de
+/// plus grand `seq`, l'applique au moteur et — **uniquement si elle est plus
+/// récente** que ce qui était connu de cet éditeur — écrit le cache disque,
+/// lance la purge rétroactive et émet le tic de modération. Une liste périmée
+/// (rejeu) ne touche ni le cache, ni le disque, ni les abonnés du tic.
+async fn fetch_denylist_inner(
+    state: &ModerationState,
+    issuer: PeerId,
+) -> CoreResult<Option<Denylist>> {
+    let Some(list) = fetch_verified_denylist_from_dht(&state.cmd_tx, issuer).await? else {
+        return Ok(None);
+    };
+    // Seul un éditeur SOUSCRIT a un effet. Sans ce garde, un appel isolé
+    // appliquerait une liste qui disparaîtrait du moteur au redémarrage (le
+    // constructeur ne recharge que le cache des éditeurs souscrits) alors que
+    // sa purge de blocs, elle, est irréversible — et laisserait une entrée de
+    // cache orpheline que `republish_known_feeds` ignore de son côté. La liste
+    // vérifiée est tout de même renvoyée : c'est ce qui permet de PRÉVISUALISER
+    // un éditeur avant de le suivre, sans rien subir de sa liste.
+    let subscribed = state
+        .denylist_issuers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&issuer);
+    if !subscribed {
+        return Ok(Some(list));
+    }
+    // Verrou pris et relâché avant tout `.await` (la purge en fait plusieurs).
+    let applied = {
+        let mut guard = state
+            .moderation
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.apply_list(&list)?
+    };
+    if matches!(applied, Applied::Stale) {
+        return Ok(Some(list));
+    }
+    if let Err(e) = crate::moderation::save_cached_list(state.blockstore.root(), &list) {
+        // Le cache n'est qu'une optimisation hors ligne : son échec ne doit
+        // pas annuler une liste déjà appliquée en mémoire.
+        tracing::warn!("mise en cache de la denylist de {issuer} échouée: {e}");
+    }
+    if let Err(e) = purge_after_denylist_inner(state).await {
+        tracing::warn!("purge rétroactive après denylist de {issuer} échouée: {e}");
+    }
+    let _ = state.moderation_events.send(());
+    Ok(Some(list))
 }
 
 // --- Primitives réseau « libres » (paramétrées sur des `Arc` isolés plutôt
@@ -2994,6 +3529,10 @@ async fn seed_loop(
 /// Préfixe des clés DHT de feeds.
 const FEED_KEY_PREFIX: &[u8] = b"/champinium/feed/";
 
+/// Préfixe des clés DHT de denylists (spec 2026-09-06) : une liste de
+/// modération signée est distribuée comme un feed — un record par éditeur.
+const DENYLIST_KEY_PREFIX: &[u8] = b"/champinium/denylist/";
+
 /// Préfixe des clés de fournisseurs de tags.
 const TAG_KEY_PREFIX: &[u8] = b"/champinium/tag/";
 
@@ -3015,9 +3554,54 @@ fn feed_record_key(peer: &PeerId) -> RecordKey {
     RecordKey::new(&key)
 }
 
+/// Clé DHT de la denylist d'un éditeur : `/champinium/denylist/<peerid>`.
+fn denylist_record_key(peer: &PeerId) -> RecordKey {
+    let mut key = DENYLIST_KEY_PREFIX.to_vec();
+    key.extend_from_slice(&peer.to_bytes());
+    RecordKey::new(&key)
+}
+
+/// Valide un record DHT entrant de **denylist** avant stockage : clé
+/// `/champinium/denylist/<peerid>`, valeur = liste v3 signée dont l'éditeur
+/// correspond au `<peerid>` de la clé. Un tiers ne peut donc pas écraser la
+/// liste d'un éditeur (même garantie que pour un feed), ni faire stocker une
+/// liste géante : la taille est bornée par [`crate::moderation::MAX_DENYLIST_SIZE`]
+/// avant tout parsing. Renvoie la liste parsée pour que l'appelant puisse en
+/// comparer le `seq` avec ce qui est déjà stocké (finding I1, revue finale
+/// 2026-09-06) sans reparser.
+fn parse_valid_denylist_record(record: &kad::Record) -> Option<Denylist> {
+    let peer_bytes = record.key.as_ref().strip_prefix(DENYLIST_KEY_PREFIX)?;
+    let expected_issuer = PeerId::from_bytes(peer_bytes).ok()?;
+    if record.value.len() > crate::moderation::MAX_DENYLIST_SIZE {
+        return None;
+    }
+    let text = std::str::from_utf8(&record.value).ok()?;
+    let list = Denylist::from_json(text).ok()?;
+    if list.verify().is_ok() && list.issuer_peer_id().ok() == Some(expected_issuer) {
+        Some(list)
+    } else {
+        None
+    }
+}
+
+/// Décide si un record de denylist entrant, déjà validé (signature + liaison
+/// clé↔émetteur), doit remplacer la version actuellement stockée pour cet
+/// éditeur. Un `seq` strictement inférieur au `seq` stocké est un
+/// **rejeu d'une version antérieure** (authentique mais périmée, possiblement
+/// plus permissive) et doit être refusé (finding I1) — un `seq` égal est
+/// accepté (idempotent), un `seq` supérieur toujours accepté. Absence de
+/// version stockée → toujours accepté (premier record pour cette clé).
+fn should_store_denylist_record(incoming: &Denylist, stored: Option<&Denylist>) -> bool {
+    match stored {
+        Some(stored) => incoming.seq >= stored.seq,
+        None => true,
+    }
+}
+
 /// Valide un record DHT entrant avant stockage : la clé doit être une clé de
 /// feed, la valeur un feed signé dont l'émetteur correspond au `<peerid>` de la
-/// clé. Toute autre clé est refusée (aucun autre type de record applicatif).
+/// clé. Les records applicatifs sont **deux** : les feeds (ici) et les
+/// denylists ([`is_valid_denylist_record`]) — toute autre clé est refusée.
 fn is_valid_feed_record(record: &kad::Record) -> bool {
     let Some(peer_bytes) = record.key.as_ref().strip_prefix(FEED_KEY_PREFIX) else {
         return false;
@@ -3339,17 +3923,43 @@ impl EventLoop {
     }
 
     /// Stores DHT entrants (mode `StoreInserts::FilterBoth` : rien n'est stocké
-    /// automatiquement). Seul un record de feed **valide** (signé, cohérent avec
-    /// la clé `/champinium/feed/<peerid>`) est stocké — un tiers ne peut donc pas
-    /// écraser le record d'un créateur. Les provider records sont de simples
-    /// annonces (le contenu est vérifié par CID au téléchargement) : acceptés.
+    /// automatiquement). Seul un record applicatif **valide** est stocké — feed
+    /// signé cohérent avec la clé `/champinium/feed/<peerid>`, ou denylist
+    /// signée cohérente avec `/champinium/denylist/<peerid>` : un tiers ne peut
+    /// donc écraser ni le record d'un créateur, ni la liste d'un éditeur de
+    /// modération. Les provider records sont de simples annonces (le contenu
+    /// est vérifié par CID au téléchargement) : acceptés.
     fn handle_inbound_kad_request(&mut self, request: kad::InboundRequest) {
         match request {
             kad::InboundRequest::PutRecord {
                 record: Some(record),
                 ..
             } => {
-                if is_valid_feed_record(&record) {
+                if let Some(incoming) = parse_valid_denylist_record(&record) {
+                    // Finding I1 (revue finale 2026-09-06) : sans cette
+                    // comparaison, un rejeu d'une ANCIENNE liste authentique
+                    // écraserait, chez les stockeurs de cette clé, une version
+                    // plus récente et potentiellement plus restrictive — un
+                    // nœud neuf (cache vide) qui la récupère ensuite verrait
+                    // un ban de clé levé. Un `seq` égal reste accepté
+                    // (idempotent).
+                    let key = record.key.clone();
+                    let stored = self
+                        .swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .store_mut()
+                        .get(&key)
+                        .and_then(|r| parse_valid_denylist_record(&r));
+                    if should_store_denylist_record(&incoming, stored.as_ref()) {
+                        if let Err(e) = self.swarm.behaviour_mut().kademlia.store_mut().put(record)
+                        {
+                            tracing::debug!("record DHT refusé par le store: {e}");
+                        }
+                    } else {
+                        tracing::debug!("record de denylist rétrogradé ignoré");
+                    }
+                } else if is_valid_feed_record(&record) {
                     if let Err(e) = self.swarm.behaviour_mut().kademlia.store_mut().put(record) {
                         tracing::debug!("record DHT refusé par le store: {e}");
                     }
@@ -3578,6 +4188,257 @@ mod tests {
         assert!(
             !seed_still_wanted(false, true),
             "ni abonné ni autorisé → abandon"
+        );
+    }
+
+    /// Un record de denylist n'est accepté au stockage que sous la clé de SON
+    /// éditeur : sans cette liaison clé↔émetteur, n'importe qui pourrait
+    /// écraser la liste d'un éditeur suivi par une liste qu'il signe lui-même
+    /// (donc valide) — c'est-à-dire choisir la modération des autres.
+    #[test]
+    fn denylist_record_is_bound_to_its_issuer_key_and_size() {
+        let issuer = Keypair::generate_ed25519();
+        let list = Denylist::build_signed(
+            "l",
+            "2026-09-06T00:00:00Z",
+            &issuer,
+            1,
+            &[cid_for(b"x")],
+            &[],
+        )
+        .unwrap();
+        let value = serde_json::to_vec(&list).unwrap();
+        let issuer_peer = issuer.public().to_peer_id();
+        let other_peer = Keypair::generate_ed25519().public().to_peer_id();
+
+        assert!(
+            parse_valid_denylist_record(&kad::Record::new(
+                denylist_record_key(&issuer_peer),
+                value.clone(),
+            ))
+            .is_some(),
+            "liste signée sous la clé de son propre éditeur → acceptée"
+        );
+        assert!(
+            parse_valid_denylist_record(&kad::Record::new(
+                denylist_record_key(&other_peer),
+                value.clone(),
+            ))
+            .is_none(),
+            "la même liste sous la clé d'un AUTRE PeerId → refusée"
+        );
+        assert!(
+            parse_valid_denylist_record(&kad::Record::new(
+                denylist_record_key(&issuer_peer),
+                vec![b'x'; crate::moderation::MAX_DENYLIST_SIZE + 1],
+            ))
+            .is_none(),
+            "valeur au-delà de MAX_DENYLIST_SIZE → refusée avant tout parsing"
+        );
+        assert!(
+            parse_valid_denylist_record(&kad::Record::new(feed_record_key(&issuer_peer), value,))
+                .is_none(),
+            "une liste sous une clé de feed n'est pas un record de denylist"
+        );
+    }
+
+    /// Finding I1 (revue finale 2026-09-06) : un record de denylist entrant
+    /// authentique mais de `seq` STRICTEMENT inférieur à celui déjà stocké
+    /// pour cette clé doit être refusé — sinon un rejeu d'une ancienne liste
+    /// authentique (récupérable dans la DHT) écraserait une version plus
+    /// récente et potentiellement plus restrictive.
+    #[test]
+    fn denylist_record_downgrade_is_rejected() {
+        let issuer = Keypair::generate_ed25519();
+        let old =
+            Denylist::build_signed("l", "2026-09-06T00:00:00Z", &issuer, 1, &[], &[]).unwrap();
+        let new =
+            Denylist::build_signed("l", "2026-09-06T00:01:00Z", &issuer, 2, &[], &[]).unwrap();
+
+        assert!(
+            should_store_denylist_record(&new, Some(&old)),
+            "seq supérieur au stocké → accepté"
+        );
+        assert!(
+            should_store_denylist_record(&new, Some(&new)),
+            "seq égal au stocké → accepté (idempotent)"
+        );
+        assert!(
+            !should_store_denylist_record(&old, Some(&new)),
+            "seq strictement inférieur au stocké → REJETÉ (rétrogradation)"
+        );
+        assert!(
+            should_store_denylist_record(&new, None),
+            "aucune version stockée → toujours accepté"
+        );
+    }
+
+    /// Les éditeurs de denylist souscrits survivent à un redémarrage, et
+    /// l'éditeur PROJET est à la fois présent d'office et non retirable —
+    /// c'est le garde-fou non désactivable de CLAUDE.md.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn denylist_issuers_persist_and_project_is_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).await.unwrap();
+        let project = node
+            .project_issuer()
+            .expect("Node::open injecte l'éditeur projet");
+        assert_eq!(node.denylist_issuers(), vec![project]);
+
+        let other = Keypair::generate_ed25519().public().to_peer_id();
+        node.subscribe_denylist_issuer(other).unwrap();
+        assert!(
+            node.unsubscribe_denylist_issuer(project).await.is_err(),
+            "l'éditeur projet ne peut pas être retiré"
+        );
+        drop(node);
+
+        let node = Node::open(dir.path()).await.unwrap();
+        let issuers = node.denylist_issuers();
+        assert_eq!(issuers.first(), Some(&project), "projet en tête");
+        assert!(issuers.contains(&other), "souscription persistée");
+        assert_eq!(issuers.len(), 2);
+
+        node.unsubscribe_denylist_issuer(other).await.unwrap();
+        assert_eq!(node.denylist_issuers(), vec![project]);
+    }
+
+    /// Bout en bout : une denylist signée publiée dans la DHT par un éditeur
+    /// est récupérée, vérifiée et **appliquée** par un autre nœud — c'est le
+    /// mécanisme qui permet de mettre à jour la modération sans release. Un
+    /// second fetch du même record est périmé (`seq` égal) et ne réémet pas de
+    /// tic : le cache et les abonnés ne bougent que sur un changement réel.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn denylist_published_to_dht_is_fetched_verified_and_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let publisher = spawn_node(dir.path(), "dl_pub").await;
+        let follower = spawn_node(dir.path(), "dl_fol").await;
+
+        let addr = publisher
+            .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        follower
+            .add_address(publisher.peer_id(), addr.clone())
+            .await
+            .unwrap();
+        follower.dial(addr).await.unwrap();
+
+        let editor = Keypair::generate_ed25519();
+        let editor_peer = editor.public().to_peer_id();
+        let bad = cid_for(b"contenu banni par l'editeur");
+        let list = Denylist::build_signed("liste", "2026-09-06T00:00:00Z", &editor, 3, &[bad], &[])
+            .unwrap();
+
+        let mut ticks = follower.subscribe_moderation();
+        assert!(!follower.is_blocked(&bad), "rien de bloqué au départ");
+        follower.subscribe_denylist_issuer(editor_peer).unwrap();
+
+        let fetched = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                publisher.publish_denylist(&list).await.unwrap();
+                if let Some(l) = follower.fetch_denylist(editor_peer).await.unwrap() {
+                    break l;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+        .await
+        .expect("la liste publiée doit être découvrable dans la DHT");
+
+        assert_eq!(fetched.seq, 3);
+        assert!(
+            follower.is_blocked(&bad),
+            "la liste récupérée doit être appliquée au moteur"
+        );
+        let source = follower
+            .denylist_source(&editor_peer)
+            .expect("éditeur connu du moteur après application");
+        assert_eq!((source.seq, source.entry_count), (3, 1));
+        // Au moins un tic (souscription, puis application) ; on les draine tous
+        // pour que l'assertion « périmé = pas de tic » plus bas soit nette : le
+        // fetch immédiat lancé par `subscribe_denylist_issuer` peut avoir
+        // gagné la course avec celui de la boucle ci-dessus.
+        let mut seen = 0usize;
+        while ticks.try_recv().is_ok() {
+            seen += 1;
+        }
+        assert!(seen >= 1, "un tic de modération est émis à l'application");
+        assert!(
+            crate::moderation::denylist_cache_dir(follower.blockstore().root())
+                .join(format!("{editor_peer}.json"))
+                .exists(),
+            "la liste appliquée est mise en cache pour un démarrage hors ligne"
+        );
+
+        // Second fetch du même record : `seq` déjà connu → périmé, aucun tic.
+        follower.fetch_denylist(editor_peer).await.unwrap();
+        assert!(
+            matches!(
+                ticks.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "une liste périmée ne doit pas réveiller les abonnés"
+        );
+    }
+
+    /// La liste d'un éditeur **non souscrit** est bien récupérée et vérifiée
+    /// (prévisualisation), mais n'a AUCUN effet : ni moteur, ni cache disque,
+    /// ni purge. Sans ce garde, un appel isolé infligerait une purge de blocs
+    /// irréversible dont l'effet en mémoire s'évaporerait au redémarrage — le
+    /// constructeur ne recharge que le cache des éditeurs souscrits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn denylist_of_unsubscribed_editor_is_returned_but_never_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let publisher = spawn_node(dir.path(), "dl_pub2").await;
+        let follower = spawn_node(dir.path(), "dl_fol2").await;
+
+        let addr = publisher
+            .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        follower
+            .add_address(publisher.peer_id(), addr.clone())
+            .await
+            .unwrap();
+        follower.dial(addr).await.unwrap();
+
+        let editor = Keypair::generate_ed25519();
+        let editor_peer = editor.public().to_peer_id();
+        let bad = cid_for(b"contenu d'un editeur non suivi");
+        let list = Denylist::build_signed("liste", "2026-09-06T00:00:00Z", &editor, 1, &[bad], &[])
+            .unwrap();
+        assert!(
+            !follower.denylist_issuers().contains(&editor_peer),
+            "éditeur volontairement non souscrit"
+        );
+
+        let fetched = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                publisher.publish_denylist(&list).await.unwrap();
+                if let Some(l) = follower.fetch_denylist(editor_peer).await.unwrap() {
+                    break l;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+        .await
+        .expect("la liste doit être récupérable pour prévisualisation");
+
+        assert_eq!(fetched.seq, 1, "la liste vérifiée est bien renvoyée");
+        assert!(
+            !follower.is_blocked(&bad),
+            "aucun effet sur le moteur sans souscription"
+        );
+        assert!(
+            follower.denylist_source(&editor_peer).is_none(),
+            "l'éditeur non souscrit n'entre pas dans le moteur"
+        );
+        assert!(
+            !crate::moderation::denylist_cache_dir(follower.blockstore().root())
+                .join(format!("{editor_peer}.json"))
+                .exists(),
+            "aucune entrée de cache orpheline n'est écrite"
         );
     }
 
@@ -3902,8 +4763,9 @@ mod tests {
         node_a.add(&forbidden).await.unwrap();
 
         let issuer = identity::load_or_generate(dir.path().join("issuer.key")).unwrap();
-        let dl = Denylist::build_signed("test", "2026-06-24T00:00:00Z", &issuer, &[bad_cid], &[])
-            .unwrap();
+        let dl =
+            Denylist::build_signed("test", "2026-06-24T00:00:00Z", &issuer, 1, &[bad_cid], &[])
+                .unwrap();
         let mut moderation = Moderation::empty();
         moderation.subscribe(&dl).unwrap();
 

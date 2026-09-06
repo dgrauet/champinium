@@ -163,10 +163,26 @@ public partial class App : Application
 
         if (uri is not null && _window is MainWindow main)
         {
-            // Jamais d'abonnement automatique : ouvre l'APERÇU du channel.
-            _ = main.OpenChannelLinkAsync(uri);
+            if (IsDenylistLink(uri))
+            {
+                // Lien de denylist : préremplit le panneau « Listes de modération »
+                // sans suivre automatiquement — jamais l'aperçu de channel.
+                _ = main.OpenDenylistLinkAsync(uri);
+            }
+            else
+            {
+                // Jamais d'abonnement automatique : ouvre l'APERÇU du channel.
+                _ = main.OpenChannelLinkAsync(uri);
+            }
         }
     }
+
+    /// <summary>Distingue un lien de denylist (`champinium://denylist/…`) d'un
+    /// lien de channel — tous deux passent le filtre <see cref="AsChannelLink"/>,
+    /// seule cette forme route vers le panneau de modération plutôt que
+    /// l'aperçu de channel.</summary>
+    private static bool IsDenylistLink(string uri) =>
+        uri.StartsWith("champinium://denylist/", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Découpe une ligne de commande brute (`"exe" "uri"`) — une URI
     /// `champinium://&lt;peerid&gt;` ne contient jamais d'espace, un découpage

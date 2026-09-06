@@ -2,7 +2,7 @@
 
 > Public : quiconque veut comprendre comment le projet fonctionne de bout en
 > bout. Les renvois pointent vers le code (chemins cliquables) et les ADRs
-> (`docs/adr/`) pour les décisions. État au contrat FFI **v12** (voir
+> (`docs/adr/`) pour les décisions. État au contrat FFI **v13** (voir
 > `.release-please-manifest.json` / `CHANGELOG.md` pour la version de release
 > — elle dérive, pas de version en dur ici, cf. `CLAUDE.md`).
 
@@ -61,7 +61,7 @@ un front est un bug). Carte des modules :
 | [`identity`](../crates/champinium-core/src/identity.rs) | paire Ed25519 persistée (`node.key`, mode 0600) → PeerId |
 | [`feed`](../crates/champinium-core/src/feed.rs) | feed signé d'un créateur, versionné par `seq` (LWW) ; **v3** = métadonnées titre/tags par entrée + identité de channel (nom/description/avatar) signées, v1/v2 supprimés |
 | [`catalog`](../crates/champinium-core/src/catalog.rs) | CRDT maison : map last-writer-wins par émetteur, bornée (1024 émetteurs, sauf émetteurs souscrits — §6) ; recherche locale |
-| [`moderation`](../crates/champinium-core/src/moderation.rs) | denylist compilée (non désactivable) + denylists signées souscrites (fédéré), **v2** = CIDs **et** clés (`key_entries`, ban d'émetteur entier) ; blocage local privé de channel côté `Node` (§7) |
+| [`moderation`](../crates/champinium-core/src/moderation.rs) | ancre de confiance compilée (`deny/project.issuer`, non désactivable) + denylists signées **distribuées par le réseau** (fédéré, format **v3** = CIDs **et** clés `key_entries`, `seq` signé, LWW, ADR 0011) ; blocage local privé de channel côté `Node` (§7) |
 | [`report`](../crates/champinium-core/src/report.rs) | signalement P2P : rapport signé + agrégateur borné de rapporteurs distincts |
 | [`ingest`](../crates/champinium-core/src/ingest.rs) | orchestration ffmpeg → segments HLS alignés keyframes → manifeste `champinium-hls/v1` |
 | [`stream`](../crates/champinium-core/src/stream) | lecture progressive : session HLS servie sur 127.0.0.1 (`scheduler` pur, `server` HTTP), `open_stream`/`close_stream`/`stream_status` |
@@ -154,13 +154,16 @@ déplacer du contenu d'un champ à l'autre à signature constante
   ont été supprimés** (zéro utilisateur en usage réel au moment de chaque
   retrait) : un feed d'un format antérieur reçu est rejeté au parsing plutôt
   que toléré en compatibilité descendante.
-- **Denylist** (`champinium-denylist/v2`, JSON signé) : liste signée par son
-  éditeur, portant des **CIDs** bloqués (`entries`) **et** des **clés**
-  bloquées (`key_entries` — PeerIds d'émetteurs bannis en entier ; tout contenu
-  de cette clé est refusé quel que soit son CID). Les deux collections sont
-  couvertes indépendamment par la signature préfixée-longueur. Le format **v1
-  (CIDs seuls) a été supprimé** (zéro-compat, comme le feed v3). Voir
-  [`deny/README.md`](../deny/README.md) et §7.
+- **Denylist** (`champinium-denylist/v3`, JSON signé) : liste signée par son
+  éditeur, versionnée par un **`seq`** signé (LWW par éditeur), portant des
+  **CIDs** bloqués (`entries`) **et** des **clés** bloquées (`key_entries` —
+  PeerIds d'émetteurs bannis en entier ; tout contenu de cette clé est refusé
+  quel que soit son CID). Les collections sont couvertes indépendamment par la
+  signature préfixée-longueur. Les formats **v2 et v1 ont été supprimés**
+  (zéro-compat, comme le feed v3). Distribuée par le réseau (record DHT
+  `/champinium/denylist/<peerid-éditeur>`), pas compilée — voir l'
+  [ADR 0011](adr/0011-reputational-moderation.md), [`deny/README.md`](../deny/README.md)
+  et §7.
 - **Rapport** (`champinium-report/v1`, JSON signé) : « ce CID a été refusé par
   ma modération » — voir §7.
 
@@ -445,14 +448,61 @@ passent tous par le même moteur :
    refus émet un **rapport signé** sur `champinium/reports/v1` (best-effort).
 3. **Service** (requête entrante de bloc) : jamais servi.
 
-Sources de blocage : la denylist **compilée dans le binaire**
-(`deny/default.cids`, inaltérable à l'exécution) + les denylists **signées
-souscrites** (modèle fédéré : chaque nœud choisit qui suivre ; signature
-vérifiée ; souscription à chaud possible avec **purge rétroactive** du cache).
+Source de blocage : les denylists **signées, distribuées par le réseau**
+(modèle fédéré : chaque nœud choisit qui suivre ; signature vérifiée) —
+décision figée par l'[ADR 0011](adr/0011-reputational-moderation.md), qui
+remplace partiellement l'[ADR 0002](adr/0002-node-side-moderation.md). Le
+binaire n'embarque **aucune liste** : `Moderation::new()` démarre vide, seule
+une **ancre de confiance compilée** (`deny/project.issuer`, le PeerId de
+l'éditeur de la liste projet) est inaltérable à l'exécution. La liste
+elle-même est un record DHT récupéré et mis à jour **sans nouvelle release**.
 
-### Modération par clé (denylist v2)
+### Ancre de confiance et distribution réseau (denylist v3, ADR 0011)
 
-Une denylist v2 ([`moderation`](../crates/champinium-core/src/moderation.rs))
+Un CID Champinium ne matchera jamais une base de hash externe : chaque CID
+est un segment HLS issu du réencodage local, quand les bases connues sont
+perceptuelles — le hash exact ne protège que contre un contenu précis déjà
+vu sur le réseau. D'où le choix **réputationnel primaire** : bannir un
+émetteur (`key_entries`) plutôt que d'accumuler des CIDs.
+
+- **Ancre** : `deny/project.issuer` (PeerId compilé via `include_str!`,
+  [`moderation::PROJECT_ISSUER`]) ne peut pas être retiré par l'API
+  (`unsubscribe_denylist_issuer` → `InvalidInput`) ; un binaire recompilé
+  sans cette clé le peut, comme toujours.
+- **Distribution** : `champinium-denylist/v3` (v2/v1 rejetés, zéro-compat) —
+  `seq` u64 **signé** en plus de `entries`/`key_entries`, LWW par éditeur (une
+  liste avec `seq` ≤ au `seq` connu de cet éditeur est ignorée). Publiée dans
+  la DHT sous `/champinium/denylist/<peerid-éditeur>`
+  (`Node::publish_denylist`), filtrée à l'entrée (taille ≤ `MAX_DENYLIST_SIZE`
+  = 1 Mio, signature, émetteur = clé). Bornes : `entries` + `key_entries`
+  cumulés ≤ `MAX_DENYLIST_ENTRIES` = 65 536.
+- **Souscription par éditeur** (`subscribe_denylist_issuer`, persistance
+  `.denylist_issuers`) : fetch immédiat, suivi **périodique**
+  (`FOLLOW_INTERVAL`, même boucle que les abonnements de channel), rattrapage
+  au **démarrage**. **Cache hors ligne** : chaque liste récupérée est mise en
+  cache (`.denylists/<peerid>.json`), rechargé **avant tout réseau** à
+  l'ouverture du nœud — le cache appliqué au démarrage n'exécute pas de purge
+  (les checkpoints lisent les vues agrégées, déjà à jour).
+- **Republication** : `Node::republish_known_feeds` (démon `champinium-seed`)
+  republie aussi les listes tierces en cache — une liste dont l'éditeur est
+  hors ligne ne s'éteint pas au TTL du `MemoryStore` Kademlia tant qu'un
+  abonné tourne.
+- L'éditeur projet est **toujours réinséré** dans les éditeurs suivis et non
+  retirable. Une liste d'un éditeur **non souscrit** récupérée par ailleurs
+  n'est **jamais appliquée**.
+- **Moteur indexé par éditeur** : retirer un éditeur retire ses entrées
+  seules ; une entrée portée par deux éditeurs reste bloquée tant qu'un seul
+  des deux la maintient.
+- **Conséquence assumée** : un nœud neuf n'est protégé qu'après la première
+  récupération de la liste projet (ou jamais si aucune liste n'est publiée
+  sous cette clé) — état visible dans les fronts (« jamais récupérée »). La
+  clé privée projet est un secret opérationnel hors dépôt ; sa rotation exige
+  une release (nouvelle valeur compilée). Contrat FFI **v13** ; voir
+  [`deny/README.md`](../deny/README.md) pour la procédure de publication.
+
+### Modération par clé (denylist v3)
+
+Une denylist v3 ([`moderation`](../crates/champinium-core/src/moderation.rs))
 peut bannir des **émetteurs entiers** (`key_entries`, PeerIds) en plus de CIDs
 isolés (`entries`). Une clé bannie voit **tout** son contenu refusé, quel que
 soit son CID, aux mêmes checkpoints — c'est la réponse au créateur récidiviste
@@ -477,7 +527,7 @@ contenu des feeds.
 Enforcement d'une clé bannie, aux mêmes points que par CID :
 - **catalogue** : un feed d'un émetteur banni est rejeté à l'ingestion
   (`fetch_feed_inner`/`handle_feed_message`), jamais appliqué ;
-- **purge rétroactive à la souscription** : souscrire une denylist v2 purge
+- **purge rétroactive à la souscription** : souscrire une denylist v3 purge
   immédiatement toute entrée de catalogue **déjà présente** dont l'émetteur est
   désormais banni (pas seulement les clés de *cette* liste — une clé a pu être
   bannie avant que son feed n'arrive) ;
@@ -547,7 +597,7 @@ Autour, trois mécanismes d'écosystème :
   catalogue borné à 1024 émetteurs (refus-quand-plein, pas d'éviction), c'est
   la défense contre l'inondation par clés jetables.
 
-## 8. La frontière FFI : le contrat v12
+## 8. La frontière FFI : le contrat v13
 
 La surface UniFFI de [`ffi.rs`](../crates/champinium-core/src/ffi.rs) est
 **le contrat** entre le noyau et les fronts (tableau exhaustif et protocole de
@@ -602,8 +652,23 @@ changement dans [`AGENTS.md`](../AGENTS.md)). Ce qui la caractérise :
 - **Bindings générés au build, jamais commités** : Swift via
   UniFFI/XCFramework (`just macos-prepare`), C# via `uniffi-bindgen-cs`
   (`just gen-csharp`). Le front Linux consomme le crate **directement** (pas
-  de FFI). `CONTRACT_VERSION` (=12) permet aux fronts de détecter une
+  de FFI). `CONTRACT_VERSION` (=13) permet aux fronts de détecter une
   incompatibilité au démarrage.
+- **Listes de modération distribuées (v13, ADR 0011)** : **retrait** de la
+  souscription par fichier JSON — une liste ne se souscrit plus par fichier
+  mais par **éditeur** (clé), récupérée dans la DHT et suivie. Record
+  `FfiDenylistSource { peer_id, name, seq, entry_count, key_count, updated,
+  locked, fetched }` ; `denylist_sources()` (sync — l'éditeur projet,
+  verrouillé, toujours présent), `subscribe_denylist_issuer(link_or_peer_id)`
+  (async — lien `champinium://denylist/<peerid>` ou PeerId nu),
+  `unsubscribe_denylist_issuer(peer_id)` (async — `InvalidInput` sur l'éditeur
+  projet), `denylist_link(peer_id)` (sync). Callback interface
+  **`ModerationListener`** (`on_moderation_updated()`), même patron que
+  `CatalogListener`/`SeedListener`/`StreamListener`. Les trois fronts affichent
+  un volet « Listes de modération » (liste projet verrouillée avec cadenas,
+  « Retirer » pour les autres, champ de collage + « Suivre », état « jamais
+  récupérée » tant que rien n'est en cache) ; un lien
+  `champinium://denylist/<peerid>` ouvre le volet prérempli **sans souscrire**.
 - **Abonnements (v6)** : `subscribe_channel`/`unsubscribe_channel` (lien
   `champinium://channel/<peerid>` ou PeerId nu), `subscriptions` (liste
   locale), `catalog_subscribed` (catalogue restreint aux émetteurs souscrits)
@@ -693,15 +758,17 @@ qui compte vit dans le réseau, chaque nœud n'en garde qu'une vue.
 | Channels lot (d) | denylist par clé (v2), blocage local privé de channel, purge rétroactive étendue (SeedIndex + `stop_providing`), signalements par channel — **implémenté** (contrat FFI v8) ; clôt la refonte channels (lots a–d) | §7 |
 | Lecture progressive | serveur HLS local (`open_stream`/`close_stream`/`stream_status`), `fetch_hls` retiré du FFI (reste au CLI, export hors ligne) — **implémenté** (contrat FFI v11) | §6, [ADR 0009](adr/0009-progressive-hls-local-server.md) |
 | Provenance déclarée | déclaration obligatoire et signée par entrée (mode + outils), feed v4, `publish_feed` sans métadonnées retiré du FFI — **implémenté** (contrat FFI v12) | §5, §8, [ADR 0010](adr/0010-declared-provenance.md) |
+| Modération réputationnelle | ancre de confiance compilée (`deny/project.issuer`) + denylist v3 distribuée par le réseau (`seq` signé, LWW, cache hors ligne, suivi périodique), souscription par fichier JSON retirée du FFI — **implémenté** (contrat FFI v13) | §7, [ADR 0011](adr/0011-reputational-moderation.md) |
 
 ## 12. Carte des documents
 
 - [`CLAUDE.md`](../CLAUDE.md) — principes + état d'avancement (source de vérité).
-- [`AGENTS.md`](../AGENTS.md) — contrat FFI (tableau v12) + garde-fous d'équipe.
+- [`AGENTS.md`](../AGENTS.md) — contrat FFI (tableau v13) + garde-fous d'équipe.
 - [`docs/adr/`](adr/) — décisions : libp2p vs iroh (0001), modération côté
-  nœud (0002), feeds signés (0003), transport de blocs (0006), IPNS (0007),
-  stockage froid Arweave (0008), lecture progressive par serveur HLS local
-  (0009)…
+  nœud (0002, partiellement remplacé par 0011), feeds signés (0003), transport
+  de blocs (0006), IPNS (0007), stockage froid Arweave (0008), lecture
+  progressive par serveur HLS local (0009), provenance déclarée (0010),
+  modération réputationnelle (0011)…
 - [`docs/mvp-demo.md`](mvp-demo.md) / [`docs/gui-demo.md`](gui-demo.md) —
   démos de bout en bout (CLI validée ; GUI deux machines à dérouler).
 - [`docs/deploy-bootstrap-relay.md`](deploy-bootstrap-relay.md) — opérer

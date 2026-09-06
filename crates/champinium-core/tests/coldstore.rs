@@ -340,7 +340,8 @@ async fn fallback_still_enforces_moderation_checkpoint_two() {
     let cid = cid_for(&forbidden);
 
     let issuer = load_or_generate(dir.path().join("issuer.key")).unwrap();
-    let dl = Denylist::build_signed("test", "2026-07-23T00:00:00Z", &issuer, &[cid], &[]).unwrap();
+    let dl =
+        Denylist::build_signed("test", "2026-07-23T00:00:00Z", &issuer, 1, &[cid], &[]).unwrap();
     let mut moderation = Moderation::empty();
     moderation.subscribe(&dl).unwrap();
 

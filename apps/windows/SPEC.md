@@ -16,7 +16,7 @@ pour le seeding hors UI. Consomme les bindings C# générés par `uniffi-bindgen
 
 - **Consomme** : bindings C# `Champinium.Core` générés par `just gen-csharp`
   (`bindings/csharp/`, **non commité**) + la `champinium_core.dll`. Contrat
-  actuel **v12** : objet `ChampiniumNode` (`OpenNode`, `PeerId`, `Catalog`,
+  actuel **v13** : objet `ChampiniumNode` (`OpenNode`, `PeerId`, `Catalog`,
   `Listen`, `Connect`, `IngestFile`, `PublishFeedWith`, `OpenStream`/
   `CloseStream`/`StreamStatus`, `SetStreamListener`, …), record
   `FfiCatalogEntry { Issuer, Seq, Cids }`, erreur `FfiError`. `FetchHls` a été
@@ -27,6 +27,9 @@ pour le seeding hors UI. Consomme les bindings C# générés par `uniffi-bindgen
   Les fonctions libres (dont `OpenNode`) sont exposées par uniffi-bindgen-cs
   dans la classe statique `ChampiniumCoreMethods`.
 - **Produit** : rien pour les autres agents (feuille de l'arbre).
+
+Contrat FFI v13 (ADR 0011) : volet « Listes de modération » (`DenylistSources`,
+`SubscribeDenylistIssuer`/`UnsubscribeDenylistIssuer`, `ModerationListener`).
 
 ## Definition of Done — Phase 4 (UI catalogue + lecture)
 

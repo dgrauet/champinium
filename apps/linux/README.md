@@ -36,6 +36,10 @@ déclaré » + outils, ADR 0010) — pas de champ de saisie, la publication rest
 CLI-only. Un runtime tokio exécute les appels async du noyau ; les résultats
 reviennent sur le thread GTK via `glib::spawn_future_local` + oneshot.
 
+Un volet **« Listes de modération »** (liste projet verrouillée, champ de
+collage + « Suivre » pour un éditeur tiers, état « jamais récupérée » tant que
+rien n'est en cache) couvre les denylists distribuées par le réseau (ADR 0011).
+
 ## Statut de vérification
 
 - ✅ `cargo build -p champinium-linux` (sans feature) et le workspace : compilent.

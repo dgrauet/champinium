@@ -139,6 +139,7 @@
                 <ColumnDefinition Width="*" />
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
             <StackPanel Grid.Column="0" Spacing="2">
                 <TextBlock Text="Champinium" Style="{StaticResource TitleTextBlockStyle}" />
@@ -212,6 +213,55 @@
                                     </DataTemplate>
                                 </ListView.ItemTemplate>
                             </ListView>
+                        </StackPanel>
+                    </Flyout>
+                </Button.Flyout>
+            </Button>
+            <!-- Réglages : sources de denylist suivies (tâche 9) — même patron de
+                 Flyout que "Channels bloqués". Le champ de lien reçoit aussi les
+                 liens `champinium://denylist/…` reçus de l'OS (voir MainWindow.xaml.cs). -->
+            <Button x:Name="ModerationButton" Grid.Column="3" VerticalAlignment="Top" Content="Listes de modération">
+                <Button.Flyout>
+                    <Flyout>
+                        <StackPanel Spacing="8" Width="300">
+                            <TextBlock Text="Listes de modération" Style="{StaticResource BaseTextBlockStyle}" />
+                            <ListView ItemsSource="{Binding DenylistSources, Mode=OneWay}"
+                                      SelectionMode="None"
+                                      MaxHeight="220">
+                                <ListView.ItemTemplate>
+                                    <DataTemplate>
+                                        <Grid ColumnSpacing="8" Padding="0,4">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="Auto" />
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel Grid.Column="0" Spacing="0">
+                                                <StackPanel Orientation="Horizontal" Spacing="4">
+                                                    <FontIcon Glyph="&#xE72E;" FontSize="12"
+                                                              Visibility="{Binding Locked, Converter={StaticResource BooleanToVisibility}}" />
+                                                    <TextBlock Text="{Binding Display}"
+                                                               TextTrimming="CharacterEllipsis" />
+                                                </StackPanel>
+                                                <TextBlock Text="{Binding Detail}"
+                                                           Style="{StaticResource CaptionTextBlockStyle}"
+                                                           Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                                                <TextBlock Text="{Binding LockLabel}"
+                                                           Visibility="{Binding Locked, Converter={StaticResource BooleanToVisibility}}"
+                                                           Style="{StaticResource CaptionTextBlockStyle}"
+                                                           Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                                            </StackPanel>
+                                            <Button Grid.Column="1" Content="Retirer"
+                                                    Visibility="{Binding CanRemove, Converter={StaticResource BooleanToVisibility}}"
+                                                    Click="OnUnfollowDenylistClick" />
+                                        </Grid>
+                                    </DataTemplate>
+                                </ListView.ItemTemplate>
+                            </ListView>
+                            <TextBox PlaceholderText="lien ou PeerId de la denylist"
+                                     Text="{Binding DenylistField, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                            <Button Content="Suivre" HorizontalAlignment="Stretch"
+                                    IsEnabled="{Binding IsFollowingDenylist, Converter={StaticResource InverseBoolean}}"
+                                    Click="OnFollowDenylistClick" />
                         </StackPanel>
                     </Flyout>
                 </Button.Flyout>

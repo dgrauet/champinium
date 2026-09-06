@@ -36,6 +36,22 @@ private final class SeedRefresher: SeedListener {
     }
 }
 
+/// Pont vers le callback de modération (listes de dénylistes suivies) : même
+/// patron que `SeedRefresher` — re-dispatch vers le thread principal, où le
+/// modèle relit `denylistSources()` et le catalogue (une denylist suivie peut
+/// purger rétroactivement des entrées du catalogue).
+private final class ModerationRefresher: ModerationListener {
+    private let onUpdate: @Sendable () -> Void
+
+    init(onUpdate: @escaping @Sendable () -> Void) {
+        self.onUpdate = onUpdate
+    }
+
+    func onModerationUpdated() {
+        onUpdate()
+    }
+}
+
 /// Pont vers le callback de session de lecture (contrat v11) : même patron
 /// que `SeedRefresher` — re-dispatch vers le thread principal.
 private final class StreamRefresher: StreamListener {
@@ -59,6 +75,7 @@ final class NodeModel: ObservableObject {
     @Published var subscribedEntries: [FfiCatalogEntry] = []
     @Published var subscriptions: Set<String> = []
     @Published var blockedChannels: [String] = []
+    @Published var denylistSources: [FfiDenylistSource] = []
     @Published var searchHits: [FfiSearchHit] = []
     @Published var storageStats = FfiStorageStats(usedBytes: 0, quotaBytes: 0)
     @Published var coldRetrievalEnabled: Bool = true
@@ -68,6 +85,7 @@ final class NodeModel: ObservableObject {
     private var node: ChampiniumNode?
     private var listener: CatalogListener?
     private var seedListener: SeedListener?
+    private var moderationListener: ModerationListener?
     private var currentStreamId: UInt64?
     private var streamListener: StreamListener?
 
@@ -108,7 +126,16 @@ final class NodeModel: ObservableObject {
             }
             streamListener = streamRefresher
             await node.setStreamListener(listener: streamRefresher)
+            let moderationRefresher = ModerationRefresher { [weak self] in
+                Task { @MainActor in
+                    self?.refreshCatalog()
+                    self?.refreshModeration()
+                }
+            }
+            moderationListener = moderationRefresher
+            await node.setModerationListener(listener: moderationRefresher)
             status = "nœud en ligne"
+            refreshModeration()
         } catch {
             status = "erreur d'ouverture: \(error)"
         }
@@ -161,6 +188,36 @@ final class NodeModel: ObservableObject {
         storageStats = node?.storageStats() ?? FfiStorageStats(usedBytes: 0, quotaBytes: 0)
         coldRetrievalEnabled = node?.coldRetrievalEnabled() ?? true
         status = "catalogue: \(entries.count) créateur(s)"
+    }
+
+    /// Relit les sources de denylist suivies (liste projet verrouillée +
+    /// éditeurs suivis par lien).
+    func refreshModeration() {
+        denylistSources = node?.denylistSources() ?? []
+    }
+
+    /// Suit un éditeur de denylist via un lien `champinium://denylist/<clé>`
+    /// ou un PeerId nu. Rafraîchit la liste en cas de succès.
+    func followDenylist(_ link: String) async {
+        guard let node else { return }
+        do {
+            try await node.subscribeDenylistIssuer(linkOrPeerId: link)
+            refreshModeration()
+        } catch {
+            status = "suivi de denylist: \(error)"
+        }
+    }
+
+    /// Cesse de suivre un éditeur de denylist. Rafraîchit la liste en cas de
+    /// succès.
+    func unfollowDenylist(_ peerId: String) async {
+        guard let node else { return }
+        do {
+            try await node.unsubscribeDenylistIssuer(peerId: peerId)
+            refreshModeration()
+        } catch {
+            status = "retrait de denylist: \(error)"
+        }
     }
 
     /// Définit le quota de seed proactif en gigaoctets (arrondi à l'octet).

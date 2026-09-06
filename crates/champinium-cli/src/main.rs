@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use champinium_core::identity::{load_or_generate, peer_id};
 use champinium_core::p2p::split_peer_id;
-use champinium_core::{channel_link, Blockstore, Cid, Denylist, Moderation, Node, PeerId};
+use champinium_core::{channel_link, Cid, Denylist, Node, PeerId};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -22,10 +22,6 @@ struct Cli {
     /// Répertoire de données du nœud (clé d'identité + blocs).
     #[arg(long, default_value = ".champinium")]
     data_dir: PathBuf,
-    /// Denylists signées à souscrire (JSON `champinium-denylist/v1`), répétable.
-    /// La denylist par défaut reste toujours active (non désactivable).
-    #[arg(long)]
-    denylist: Vec<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -210,6 +206,48 @@ enum Cmd {
         #[arg(long)]
         set: Option<String>,
     },
+    /// Listes de modération : suivi d'éditeurs, outillage éditeur.
+    Denylist {
+        #[command(subcommand)]
+        action: DenylistCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum DenylistCmd {
+    /// État des éditeurs suivis (l'éditeur projet est toujours présent).
+    Sources,
+    /// Suit un éditeur (lien champinium://denylist/<peerid> ou PeerId nu).
+    Follow {
+        link_or_peerid: String,
+        #[arg(long)]
+        peer: Option<String>,
+    },
+    /// Cesse de suivre un éditeur tiers (l'éditeur projet ne peut pas l'être).
+    Unfollow { peerid: String },
+    /// Signe une liste HORS nœud avec une clé d'éditeur (générée si absente).
+    Sign {
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        seq: u64,
+        #[arg(long = "cid")]
+        cids: Vec<String>,
+        #[arg(long = "key-entry")]
+        key_entries: Vec<String>,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Publie une liste signée dans la DHT depuis ce nœud.
+    Publish {
+        file: PathBuf,
+        #[arg(long)]
+        peer: String,
+    },
+    /// Vérifie et affiche une liste signée.
+    Show { file: PathBuf },
 }
 
 #[tokio::main]
@@ -228,7 +266,7 @@ async fn main() -> Result<()> {
             println!("{}", peer_id(&kp));
         }
         Cmd::Serve { listen, bootstrap } => {
-            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let node = build_node(&cli.data_dir).await?;
             let addr = node
                 .listen(listen.parse().context("multiaddr d'écoute invalide")?)
                 .await?;
@@ -247,7 +285,7 @@ async fn main() -> Result<()> {
             tokio::signal::ctrl_c().await?;
         }
         Cmd::Add { path, listen } => {
-            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let node = build_node(&cli.data_dir).await?;
             let addr = node
                 .listen(listen.parse().context("multiaddr d'écoute invalide")?)
                 .await?;
@@ -270,7 +308,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Get { cid, peer, out } => {
             let cid: Cid = cid.parse().context("CID invalide")?;
-            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let node = build_node(&cli.data_dir).await?;
             node.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await?;
             connect_peer(&node, &peer).await?;
             let bytes = fetch_with_retry(&node, cid).await?;
@@ -284,7 +322,7 @@ async fn main() -> Result<()> {
         }
         Cmd::FindProviders { cid, peer } => {
             let cid: Cid = cid.parse().context("CID invalide")?;
-            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let node = build_node(&cli.data_dir).await?;
             node.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await?;
             connect_peer(&node, &peer).await?;
             let providers = node.get_providers(cid).await?;
@@ -298,7 +336,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Replication { cid, peer } => {
             let cid: Cid = cid.parse().context("CID invalide")?;
-            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let node = build_node(&cli.data_dir).await?;
             node.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await?;
             connect_peer(&node, &peer).await?;
             let n = node.replication_factor(cid).await?;
@@ -309,7 +347,7 @@ async fn main() -> Result<()> {
             wait,
             subscribed,
         } => {
-            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let node = build_node(&cli.data_dir).await?;
             node.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await?;
             connect_peer(&node, &peer).await?;
             // Écoute les feeds diffusés en gossipsub pendant `wait` secondes.
@@ -347,7 +385,7 @@ async fn main() -> Result<()> {
         Cmd::FetchFeed { peer, issuer } => {
             let issuer: champinium_core::PeerId =
                 issuer.parse().context("PeerId d'émetteur invalide")?;
-            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let node = build_node(&cli.data_dir).await?;
             node.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await?;
             connect_peer(&node, &peer).await?;
             match fetch_feed_with_retry(&node, issuer).await? {
@@ -374,7 +412,7 @@ async fn main() -> Result<()> {
                     champinium_core::feed::MAX_TOOLS_PER_ENTRY
                 );
             }
-            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let node = build_node(&cli.data_dir).await?;
             let addr = node
                 .listen(listen.parse().context("multiaddr d'écoute invalide")?)
                 .await?;
@@ -396,7 +434,7 @@ async fn main() -> Result<()> {
             tokio::signal::ctrl_c().await?;
         }
         Cmd::Search { query, peer, wait } => {
-            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let node = build_node(&cli.data_dir).await?;
             node.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await?;
             connect_peer(&node, &peer).await?;
             // Laisse le catalogue se reconstruire par écoute gossip.
@@ -404,7 +442,7 @@ async fn main() -> Result<()> {
             print_hits(&node.search(&query));
         }
         Cmd::SearchTag { tag, peer } => {
-            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let node = build_node(&cli.data_dir).await?;
             node.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await?;
             connect_peer(&node, &peer).await?;
             let hits = search_tag_with_retry(&node, &tag).await?;
@@ -416,7 +454,7 @@ async fn main() -> Result<()> {
             out,
         } => {
             let manifest_cid: Cid = manifest.parse().context("CID de manifeste invalide")?;
-            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let node = build_node(&cli.data_dir).await?;
             node.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await?;
             connect_peer(&node, &peer).await?;
             let playlist = fetch_hls_with_retry(&node, manifest_cid, &out).await?;
@@ -424,7 +462,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Stream { manifest, peer } => {
             let manifest_cid: Cid = manifest.parse().context("CID de manifeste invalide")?;
-            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let node = build_node(&cli.data_dir).await?;
             node.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await?;
             connect_peer(&node, &peer).await?;
             let info = open_stream_with_retry(&node, manifest_cid).await?;
@@ -461,7 +499,7 @@ async fn main() -> Result<()> {
         } => {
             let issuer: PeerId =
                 channel_link::parse(&link_or_peerid).context("lien ou PeerId invalide")?;
-            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let node = build_node(&cli.data_dir).await?;
             node.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await?;
             if let Some(peer_addr) = peer {
                 connect_peer(&node, &peer_addr).await?;
@@ -471,12 +509,12 @@ async fn main() -> Result<()> {
         }
         Cmd::Unsubscribe { peerid } => {
             let issuer: PeerId = peerid.parse().context("PeerId invalide")?;
-            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let node = build_node(&cli.data_dir).await?;
             node.unsubscribe(issuer)?;
             println!("désabonné de {}", channel_link::format(&issuer));
         }
         Cmd::Subscriptions => {
-            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let node = build_node(&cli.data_dir).await?;
             let subs = node.subscriptions();
             if subs.is_empty() {
                 println!("aucun abonnement");
@@ -489,18 +527,18 @@ async fn main() -> Result<()> {
         Cmd::Block { link_or_peerid } => {
             let issuer: PeerId =
                 channel_link::parse(&link_or_peerid).context("lien ou PeerId invalide")?;
-            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let node = build_node(&cli.data_dir).await?;
             node.block_channel(issuer).await?;
             println!("bloqué: {}", channel_link::format(&issuer));
         }
         Cmd::Unblock { peerid } => {
             let issuer: PeerId = peerid.parse().context("PeerId invalide")?;
-            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let node = build_node(&cli.data_dir).await?;
             node.unblock_channel(issuer)?;
             println!("débloqué: {}", channel_link::format(&issuer));
         }
         Cmd::Blocked => {
-            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let node = build_node(&cli.data_dir).await?;
             let blocked = node.blocked_channels();
             if blocked.is_empty() {
                 println!("aucun channel bloqué");
@@ -511,7 +549,7 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Quota { set } => {
-            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let node = build_node(&cli.data_dir).await?;
             if let Some(bytes) = set {
                 node.set_seed_quota(bytes)?;
             }
@@ -520,18 +558,18 @@ async fn main() -> Result<()> {
         }
         Cmd::Pin { manifest_cid } => {
             let manifest_cid: Cid = manifest_cid.parse().context("CID de manifeste invalide")?;
-            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let node = build_node(&cli.data_dir).await?;
             node.pin(manifest_cid)?;
             println!("épinglé: {manifest_cid}");
         }
         Cmd::Unpin { manifest_cid } => {
             let manifest_cid: Cid = manifest_cid.parse().context("CID de manifeste invalide")?;
-            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let node = build_node(&cli.data_dir).await?;
             node.unpin(manifest_cid)?;
             println!("épinglage retiré: {manifest_cid}");
         }
         Cmd::Reports { by_channel } => {
-            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let node = build_node(&cli.data_dir).await?;
             if by_channel {
                 let by_channel = node.report_counts_by_channel();
                 if by_channel.is_empty() {
@@ -554,7 +592,7 @@ async fn main() -> Result<()> {
         }
         #[cfg(feature = "cold-storage")]
         Cmd::ColdRetrieval { set } => {
-            let node = build_node(&cli.data_dir, &cli.denylist).await?;
+            let node = build_node(&cli.data_dir).await?;
             if let Some(value) = set {
                 let enabled = match value.to_lowercase().as_str() {
                     "on" => true,
@@ -570,8 +608,123 @@ async fn main() -> Result<()> {
             };
             println!("repli de récupération froid: {state}");
         }
+        Cmd::Denylist { action } => match action {
+            DenylistCmd::Sources => {
+                let node = build_node(&cli.data_dir).await?;
+                let project = node.project_issuer();
+                for issuer in node.denylist_issuers() {
+                    let lock = if Some(issuer) == project {
+                        " [projet, verrouillée]"
+                    } else {
+                        ""
+                    };
+                    match node.denylist_source(&issuer) {
+                        Some(s) => println!(
+                            "{issuer}{lock} — {} — seq {} — {} CID(s), {} clé(s) — {}",
+                            s.name, s.seq, s.entry_count, s.key_count, s.updated
+                        ),
+                        None => println!("{issuer}{lock} — jamais récupérée"),
+                    }
+                }
+            }
+            DenylistCmd::Follow {
+                link_or_peerid,
+                peer,
+            } => {
+                let issuer = channel_link::parse_denylist(&link_or_peerid)
+                    .context("lien ou PeerId invalide")?;
+                let node = build_node(&cli.data_dir).await?;
+                node.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await?;
+                if let Some(p) = peer {
+                    connect_peer(&node, &p).await?;
+                }
+                node.subscribe_denylist_issuer(issuer)?;
+                match node.fetch_denylist(issuer).await? {
+                    Some(l) => println!("suivi: {issuer} — liste « {} » seq {}", l.name, l.seq),
+                    None => println!(
+                        "suivi: {issuer} — aucune liste trouvée pour l'instant (réessai périodique)"
+                    ),
+                }
+            }
+            DenylistCmd::Unfollow { peerid } => {
+                let issuer: PeerId = peerid.parse().context("PeerId invalide")?;
+                let node = build_node(&cli.data_dir).await?;
+                node.unsubscribe_denylist_issuer(issuer).await?;
+                println!("ne suit plus: {issuer}");
+            }
+            DenylistCmd::Sign {
+                key,
+                name,
+                seq,
+                cids,
+                key_entries,
+                out,
+            } => {
+                let created = !key.exists();
+                let kp = load_or_generate(&key)?;
+                if created {
+                    eprintln!(
+                        "nouvelle clé d'éditeur écrite dans {} — PeerId à diffuser : {}",
+                        key.display(),
+                        kp.public().to_peer_id()
+                    );
+                }
+                let cids: Vec<Cid> = cids
+                    .iter()
+                    .map(|c| c.parse().context("CID invalide"))
+                    .collect::<Result<_>>()?;
+                let keys: Vec<PeerId> = key_entries
+                    .iter()
+                    .map(|k| k.parse().context("PeerId invalide"))
+                    .collect::<Result<_>>()?;
+                let updated = rfc3339_now();
+                let dl = Denylist::build_signed(&name, &updated, &kp, seq, &cids, &keys)?;
+                std::fs::write(&out, serde_json::to_string_pretty(&dl)?)?;
+                println!(
+                    "liste signée: {} (éditeur {}, seq {seq}, {} CID(s), {} clé(s))",
+                    out.display(),
+                    kp.public().to_peer_id(),
+                    cids.len(),
+                    keys.len()
+                );
+            }
+            DenylistCmd::Publish { file, peer } => {
+                let dl = Denylist::from_json(&std::fs::read_to_string(&file)?)?;
+                dl.verify().context("liste refusée (signature ?)")?;
+                let node = build_node(&cli.data_dir).await?;
+                node.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await?;
+                connect_peer(&node, &peer).await?;
+                node.publish_denylist(&dl).await?;
+                println!(
+                    "publiée: éditeur {} seq {} — laisser tourner quelques secondes pour la propagation DHT",
+                    dl.issuer_peer_id()?,
+                    dl.seq
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            DenylistCmd::Show { file } => {
+                let dl = Denylist::from_json(&std::fs::read_to_string(&file)?)?;
+                dl.verify().context("liste refusée (signature ?)")?;
+                println!(
+                    "{} — éditeur {} — seq {} — {} CID(s), {} clé(s) — {}",
+                    dl.name,
+                    dl.issuer_peer_id()?,
+                    dl.seq,
+                    dl.entries.len(),
+                    dl.key_entries.len(),
+                    dl.updated
+                );
+            }
+        },
     }
     Ok(())
+}
+
+/// Horodatage RFC 3339 courant (UTC), pour les métadonnées de liste signée.
+fn rfc3339_now() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
 /// Reconstruit un HLS en retentant le temps que le réseau converge.
@@ -763,20 +916,8 @@ async fn fetch_feed_with_retry(
     }
 }
 
-async fn build_node(data_dir: &Path, denylists: &[PathBuf]) -> Result<Node> {
-    let kp = load_or_generate(data_dir.join("node.key"))?;
-    let bs = Blockstore::open(data_dir.join("blocks"))?;
-    // Modération par défaut TOUJOURS active ; on ajoute les souscriptions signées.
-    let mut moderation = Moderation::with_default()?;
-    for path in denylists {
-        let json = std::fs::read_to_string(path)
-            .with_context(|| format!("lecture de la denylist {}", path.display()))?;
-        let dl = Denylist::from_json(&json)?;
-        moderation
-            .subscribe(&dl)
-            .with_context(|| format!("denylist refusée (signature ?) : {}", path.display()))?;
-    }
-    Ok(Node::with_moderation(kp, bs, moderation).await?)
+async fn build_node(data_dir: &Path) -> Result<Node> {
+    Ok(Node::open(data_dir).await?)
 }
 
 async fn connect_peer(node: &Node, peer: &str) -> Result<()> {

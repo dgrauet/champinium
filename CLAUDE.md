@@ -63,8 +63,12 @@ La suppression centrale est impossible par construction → modération côté n
 - **Checkpoint #2 (réception, AVANT tout reseed)** : hash-match + denylists signées
   souscrites → DROP, pas de reseed, signalement P2P. S'applique quelle que soit la
   source (l'interop IPFS public expose à du contenu de pairs non-Champinium).
-- Denylist par défaut active à l'installation (`deny/`). Modèle fédéré (subjectif
-  par nœud), format inspiré des denylists IPFS.
+- **Clé projet compilée, liste récupérée par le réseau** (ADR 0011) : le
+  binaire n'embarque qu'une **ancre de confiance** (`deny/project.issuer`, le
+  PeerId de l'éditeur de la liste projet), non retirable et non désactivable ;
+  la liste signée elle-même est un record DHT (`champinium-denylist/v3`,
+  `seq` signé, LWW) récupéré et mis à jour sans nouvelle release. Modèle
+  fédéré (subjectif par nœud) au-delà de l'éditeur projet.
 
 ## Risques classés
 
@@ -96,7 +100,7 @@ apps/macos/               SwiftUI (SwiftPM/Xcode)
 apps/windows/             WinUI 3 (.sln, C#)
 apps/linux/               GTK4 (gtk-rs)
 bindings/                 généré au build (gitignoré)
-deny/                     denylist par défaut signée
+deny/                     ancre de confiance de modération (clé projet compilée)
 docs/                     documentation
 packaging/flatpak/        manifeste Flatpak du front Linux (Phase 6)
 ```
@@ -125,7 +129,9 @@ Kademlia (provider records), identify, ping et un protocole request-response
   compilée dans le binaire (non désactivable) + denylists signées Ed25519
   souscrites (modèle fédéré, signature vérifiée). Enforcement aux trois points :
   ingestion (`add`), réception (`get`), service (requête entrante). CLI :
-  `--denylist <fichier>`. Voir [`deny/README.md`](deny/README.md).
+  `denylist follow <lien-ou-peerid>` (clé projet compilée toujours souscrite
+  d'office, non retirable ; voir modération réputationnelle plus bas). Voir
+  [`deny/README.md`](deny/README.md).
 - **Feeds signés + gossipsub + catalogue ✔** : `feed` (record `champinium-feed/v1`
   signé Ed25519, versionné par `seq`), diffusé en **gossipsub** ; `catalog` (CRDT
   maison last-writer-wins par émetteur) reconstruit en écoutant. Node :
@@ -396,6 +402,36 @@ sur deux machines physiques.
   (provenance obligatoire). Les trois fronts affichent un badge « IA /
   Assisté IA / Capturé / Non déclaré » + outils. Spec :
   `~/Work/.superpowers/champinium/specs/2026-09-06-provenance-design.md`.
+- **Modération réputationnelle ✔ (ADR 0011)** : la denylist compilée
+  (ADR 0002) est remplacée par une **ancre de confiance compilée**
+  (`deny/project.issuer`, le PeerId de l'éditeur de la liste projet,
+  non retirable) et des listes signées **distribuées par le réseau**. Format
+  `champinium-denylist/v3` (v2/v1 rejetés) : `seq` u64 signé en plus de
+  `entries`/`key_entries`, LWW par éditeur, bornes inchangées (1 Mio,
+  65 536 entrées cumulées). Publiée en record DHT
+  `/champinium/denylist/<peerid-éditeur>` (`Node::publish_denylist`), filtrée
+  à l'entrée ; suivi périodique des éditeurs souscrits (même boucle que les
+  abonnements de channel), fetch immédiat à la souscription et au démarrage,
+  **cache hors ligne** (`.denylists/<peerid>.json`) rechargé avant tout
+  réseau, republication des listes en cache par `champinium-seed`. Moteur
+  indexé par éditeur (retirer un éditeur ne retire que ses entrées).
+  L'éditeur projet est toujours réinséré et non retirable
+  (`unsubscribe_denylist_issuer` → `InvalidInput`) ; une liste d'un éditeur
+  non souscrit récupérée par ailleurs n'est jamais appliquée. **Contrat FFI
+  v13** : `FfiDenylistSource`, `denylist_sources`,
+  `subscribe_denylist_issuer`/`unsubscribe_denylist_issuer`, `denylist_link`,
+  callback `ModerationListener` ; `subscribe_denylist(json)` retiré. CLI :
+  flag global `--denylist` retiré, sous-commandes `denylist
+  sources|follow|unfollow|sign|publish|show`. Les trois fronts ont un volet
+  « Listes de modération » (liste projet verrouillée, champ de collage +
+  « Suivre », état « jamais récupérée » tant que rien n'est en cache) ; un
+  lien `champinium://denylist/<peerid>` l'ouvre prérempli sans souscrire.
+  **Honnêteté assumée** : un CID Champinium (segment HLS réencodé) ne matche
+  aucune base de hash externe — le bannissement par clé reste le mécanisme
+  premier ; le hash perceptuel est différé ; un binaire recompilé sans la clé
+  projet reste possible. Un nœud neuf n'est protégé qu'après la première
+  récupération de la liste projet (ou jamais si aucune liste n'est publiée).
+  Spec : `~/Work/.superpowers/champinium/specs/2026-09-06-moderation-lists-design.md`.
 - **Packaging Linux — Flatpak ✔ (fonctionnel, palier gratuit)** : manifeste
   [`packaging/flatpak/org.champinium.Champinium.yml`](packaging/flatpak/org.champinium.Champinium.yml)
   (app-id `org.champinium.Champinium`, runtime GNOME 48, rustc via rustup au
@@ -464,7 +500,8 @@ mesurée ✔, recherche ✔ (#20) ; **refonte channels COMPLÈTE** — lot (a) i
 par clé + blocage local + signalements par channel ✔ ; aperçu de channel par
 lien ✔ (`resolve_channel`, contrat v9 ; partie B — scheme OS — ✔) ; durabilité
 du record de feed ✔ (`republish_known_feeds`) ; IPNS #21 close, voir ADR 0007 ;
-lecture progressive ✔ (ADR 0009) ; provenance déclarée ✔ (ADR 0010)).
+lecture progressive ✔ (ADR 0009) ; provenance déclarée ✔ (ADR 0010) ;
+modération réputationnelle ✔ (ADR 0011)).
 Voir le spec.
 
 **Dernière release : voir `.release-please-manifest.json` / CHANGELOG** —
@@ -472,4 +509,4 @@ pas de version en dur ici, elle dérive (règle intendant DG006). Release-please
 gère le versionnement (`bump-minor-pre-major` actif :
 un breaking change bumpe la mineure tant qu'on est < 1.0.0 — la 1.0 sera un
 choix délibéré de stabilisation d'API). Versionnement du contrat FFI distinct :
-`CONTRACT_VERSION = 12` (voir `AGENTS.md`).
+`CONTRACT_VERSION = 13` (voir `AGENTS.md`).

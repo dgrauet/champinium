@@ -31,4 +31,8 @@ provenance déclarée (« IA / Assisté IA / Capturé / Non déclaré » + outil
 ADR 0010) — pas de champ de saisie, la publication reste CLI-only. Toute la
 logique reste dans le noyau ; ce front n'orchestre que des appels UniFFI.
 
+Un volet **« Listes de modération »** (liste projet verrouillée, champ de
+collage + « Suivre » pour un éditeur tiers, état « jamais récupérée » tant que
+rien n'est en cache) couvre les denylists distribuées par le réseau (ADR 0011).
+
 Packaging Phase 6 : `.app`/`.dmg` + notarisation Apple (Developer ID).
