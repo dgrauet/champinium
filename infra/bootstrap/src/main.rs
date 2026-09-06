@@ -45,6 +45,14 @@ async fn main() -> Result<()> {
         .listen(cli.listen.parse().context("multiaddr d'écoute invalide")?)
         .await?;
 
+    // Découverte initiale (ADR 0013) : rejoint aussi les bootstraps connus de
+    // ce nœud (compilés ∪ persistés), best-effort — un bootstrap peut lui-même
+    // s'appuyer sur d'autres bootstraps pour peupler sa table de routage.
+    match node.bootstrap().await {
+        Ok(n) => tracing::info!("bootstrap: {n} pair(s) joint(s)"),
+        Err(e) => tracing::warn!("bootstrap échoué: {e}"),
+    }
+
     println!("champinium-bootstrap en ligne (stateless)");
     println!("PeerId : {}", node.peer_id());
     println!("Adresse: {addr}/p2p/{}", node.peer_id());

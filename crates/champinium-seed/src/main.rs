@@ -76,6 +76,14 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Découverte initiale (ADR 0013) : rejoint aussi les bootstraps connus du
+    // nœud (compilés ∪ persistés `.bootstraps`), best-effort — n'empêche pas
+    // le démarrage du démon si aucun n'est joignable.
+    match node.bootstrap().await {
+        Ok(n) => tracing::info!("bootstrap: {n} pair(s) joint(s)"),
+        Err(e) => tracing::warn!("bootstrap échoué: {e}"),
+    }
+
     let interval = Duration::from_secs(cli.reprovide_interval.max(1));
     loop {
         reseed(&node).await;

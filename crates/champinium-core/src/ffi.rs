@@ -444,6 +444,34 @@ impl ChampiniumNode {
             failed_reason: s.failed_reason,
         })
     }
+
+    /// Bootstraps connus (compilés ∪ persistés par l'utilisateur), en chaînes
+    /// multiaddr. Vide sur un nœud neuf si aucun bootstrap n'est compilé
+    /// (contrat v14, ADR 0013).
+    pub fn bootstraps(&self) -> Vec<String> {
+        self.inner
+            .bootstraps()
+            .into_iter()
+            .map(|a| a.to_string())
+            .collect()
+    }
+
+    /// La découverte mDNS (réseau local) est-elle active ? (persisté, actif
+    /// par défaut).
+    pub fn mdns_enabled(&self) -> bool {
+        self.inner.mdns_enabled()
+    }
+
+    /// Active/désactive la découverte mDNS (persisté). **N'a d'effet qu'au
+    /// prochain démarrage** du nœud — le socket multicast n'est ouvert/fermé
+    /// qu'à la construction du swarm. À afficher côté front avec un avis
+    /// « redémarrage requis ». mDNS révèle la présence de ce nœud aux autres
+    /// machines du même réseau local : le désactiver est une option de vie
+    /// privée sur un réseau partagé/public.
+    pub fn set_mdns(&self, enabled: bool) -> Result<(), FfiError> {
+        self.inner.set_mdns(enabled)?;
+        Ok(())
+    }
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -706,6 +734,36 @@ impl ChampiniumNode {
             }
         });
     }
+
+    /// Compose vers tous les bootstraps connus (best-effort, un dial refusé
+    /// n'est pas propagé) puis peuple la table de routage Kademlia. Renvoie
+    /// le nombre de bootstraps joints ; `0` si la liste est vide ou si aucun
+    /// n'a répondu (contrat v14, ADR 0013).
+    pub async fn bootstrap(&self) -> Result<u32, FfiError> {
+        Ok(self.inner.bootstrap().await? as u32)
+    }
+
+    /// Nombre de pairs actuellement connectés.
+    pub async fn connected_peers(&self) -> Result<u32, FfiError> {
+        Ok(self.inner.connected_peers().await? as u32)
+    }
+
+    /// Ajoute un bootstrap connu de l'utilisateur (persisté). `multiaddr`
+    /// doit porter un composant `/p2p/<peerid>`, sinon `InvalidInput` ; la
+    /// borne de [`crate::p2p::MAX_BOOTSTRAPS`] (compilés + persistés confondus)
+    /// est aussi une `InvalidInput` côté front — le noyau la reporte en
+    /// `CoreError::Network`, remappée ici explicitement (le mapping par défaut
+    /// donnerait `Network`, ce qui laisserait le front proposer une UX
+    /// « réessayer plus tard » alors qu'il faut retirer un bootstrap).
+    pub async fn add_bootstrap(&self, multiaddr: String) -> Result<(), FfiError> {
+        let addr = multiaddr.parse().map_err(|e| FfiError::InvalidInput {
+            msg: format!("multiaddr invalide: {e}"),
+        })?;
+        self.inner.add_bootstrap(addr).map_err(|e| match e {
+            crate::CoreError::Network(msg) => FfiError::InvalidInput { msg },
+            other => other.into(),
+        })
+    }
 }
 
 fn catalog_entry_to_ffi(node: &Node, e: crate::catalog::CatalogEntry) -> FfiCatalogEntry {
@@ -877,7 +935,7 @@ mod tests {
             hits[0].provenance.mode,
             FfiProvenanceMode::Generated
         ));
-        assert_eq!(crate::contract_version(), 13);
+        assert_eq!(crate::contract_version(), 14);
     }
 
     /// Le listener enregistré est rappelé quand le catalogue change — c'est le
@@ -1553,7 +1611,48 @@ mod tests {
             node.subscribe_denylist_issuer("pas-un-peerid".into()).await,
             Err(FfiError::InvalidInput { .. })
         ));
-        assert_eq!(crate::contract_version(), 13);
+        assert_eq!(crate::contract_version(), 14);
+    }
+
+    /// Contrat v14 (ADR 0013) : découverte initiale — un nœud neuf n'a aucun
+    /// bootstrap compilé (liste vide), `add_bootstrap` valide la présence de
+    /// `/p2p/<peerid>`, et le débrayage mDNS persiste son état côté FFI.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bootstrap_discovery_ffi_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = open_node(dir.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+
+        assert!(node.bootstraps().is_empty());
+
+        assert!(matches!(
+            node.add_bootstrap("/ip4/1.2.3.4/tcp/1".into()).await,
+            Err(FfiError::InvalidInput { .. })
+        ));
+
+        node.add_bootstrap(
+            "/ip4/127.0.0.1/tcp/4101/p2p/12D3KooWJtMRdnYaZgSyi3KTLaa5DN6mCAcpfwaTXgD1PHo997ej"
+                .into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(node.bootstraps().len(), 1);
+
+        assert!(node.mdns_enabled());
+        node.set_mdns(false).unwrap();
+        assert!(!node.mdns_enabled());
+
+        // Liste de bootstraps vide (nœud neuf, sans ajout) : `Ok(0)`, aucun
+        // effet — `Node::bootstrap` documente ce cas (`kademlia.bootstrap()`
+        // renvoie alors `NoKnownPeers`, journalisé mais pas propagé).
+        let fresh = open_node(dir.path().to_string_lossy().into_owned() + "-fresh")
+            .await
+            .unwrap();
+        assert!(fresh.bootstraps().is_empty());
+        assert_eq!(fresh.bootstrap().await.unwrap(), 0);
+
+        assert_eq!(crate::contract_version(), 14);
     }
 
     async fn ffmpeg_available() -> bool {
