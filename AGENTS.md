@@ -20,7 +20,7 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
   capacité absente, ils **ouvrent une demande de changement de contrat** (voir
   protocole plus bas) — ils ne contournent pas via du code natif ad hoc.
 
-### Contrat actuel — v11 (`CONTRACT_VERSION = 11`)
+### Contrat actuel — v12 (`CONTRACT_VERSION = 12`)
 
 > v1 → v2 : ajout de `subscribe_denylist(json) -> u64` sur `ChampiniumNode`
 > (modération fédérée activable depuis les fronts). Purement additif.
@@ -120,6 +120,17 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
 > interface **`StreamListener`** (`on_stream_updated(id)`) via
 > `set_stream_listener(listener)` (async). Politique de stockage inchangée :
 > `Seed` si channel souscrit, `Stream` sinon.
+>
+> v11 → v12 : **provenance déclarée** (feed `champinium-feed/v4`, ADR 0010).
+> Enum `FfiProvenanceMode { Generated, Assisted, Captured, Undeclared }`,
+> record `FfiProvenance { mode, tools }` ; `FfiContentItem` et `FfiSearchHit`
+> gagnent `provenance` (rupture pour qui construit le record) —
+> `FfiCatalogEntry.items` et `FfiChannelPreview.items` en héritent.
+> **Retrait** de `publish_feed(cids)` : une entrée sans déclaration n'est plus
+> valide, `publish_feed_with(items)` est l'unique chemin de publication.
+> `search(query)` et `search_tag(tag)` matchent aussi les outils déclarés ;
+> les outils sont annoncés dans la DHT sous le même préfixe que les tags.
+> Une déclaration est une **affirmation signée du publieur**, pas une preuve.
 
 Fonctions libres (smoke test async, conservées de v0) :
 
@@ -139,12 +150,11 @@ Objet **`ChampiniumNode`** (méthodes) :
 | `listen(addr) -> String` | **async** | écoute, renvoie l'adresse liée |
 | `connect(peer) -> ()` | **async** | se connecte à `/…/p2p/<id>` |
 | `ingest_file(path) -> String` | **async** | ffmpeg → HLS, renvoie le CID du manifeste |
-| `publish_feed(cids) -> ()` | **async** | publie un feed signé |
 | `subscribe_denylist(json) -> u64` | **async** | souscrit une denylist signée, renvoie le nb de blocs purgés |
 | `set_catalog_listener(listener) -> ()` | **async** | enregistre un `CatalogListener` (rafraîchissement réactif) |
-| `publish_feed_with(items) -> ()` | **async** | publie un feed v2 (titre/tags signés) + annonce les tags DHT |
-| `search(query) -> Vec<FfiSearchHit>` | sync | recherche locale (titres/tags du catalogue reconstruit) |
-| `search_tag(tag) -> Vec<FfiSearchHit>` | **async** | découverte par tag via la DHT (hors gossip) |
+| `publish_feed_with(items) -> ()` | **async** | publie un feed v4 (titre/tags/provenance signés) + annonce tags et outils DHT |
+| `search(query) -> Vec<FfiSearchHit>` | sync | recherche locale (titres, tags et outils du catalogue reconstruit) |
+| `search_tag(tag) -> Vec<FfiSearchHit>` | **async** | découverte par tag via la DHT (hors gossip) — matche aussi les outils déclarés |
 | `set_channel_profile(profile) -> ()` | **async** | définit le profil de channel : persiste et republie le feed courant |
 | `channel_profile() -> FfiChannelProfile` | sync | profil de channel courant de ce nœud |
 | `subscribe_channel(link_or_peer_id) -> ()` | **async** | s'abonne (lien ou PeerId nu) : persiste + fetch immédiat en tâche de fond |

@@ -39,11 +39,16 @@ ffmpeg -f lavfi -i "testsrc=duration=10:size=640x360:rate=25" \
 ## 1. Machine A — publication (créateur)
 
 ```sh
-champinium-cli --data-dir ./machine-a ingest video.mp4 --listen /ip4/0.0.0.0/tcp/4711
+champinium-cli --data-dir ./machine-a ingest video.mp4 --listen /ip4/0.0.0.0/tcp/4711 \
+    --provenance generated --tool sora
 ```
 
-Sortie : le **CID du manifeste HLS** (checkpoint modération #1 appliqué à
-chaque segment), le PeerId et l'**adresse** de A. Le contenu publié par A est
+`--provenance` est **obligatoire** (`generated`/`assisted`/`captured`/
+`undeclared`, aucun défaut implicite, ADR 0010) ; `--tool` est répétable
+(≤ 8 outils). Sortie : le **CID du manifeste HLS** (checkpoint modération #1
+appliqué à chaque segment), le PeerId et l'**adresse** de A ; le badge « IA ·
+sora » de cette publication apparaît dans le catalogue des pairs qui la
+reçoivent. Le contenu publié par A est
 **auto-épinglé** dans son propre `SeedIndex` (un créateur ne s'évince jamais
 lui-même sous quota). Le nœud reste en ligne (Ctrl-C pour arrêter) et
 rediffuse son feed signé périodiquement.

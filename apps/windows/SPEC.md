@@ -16,13 +16,16 @@ pour le seeding hors UI. Consomme les bindings C# générés par `uniffi-bindgen
 
 - **Consomme** : bindings C# `Champinium.Core` générés par `just gen-csharp`
   (`bindings/csharp/`, **non commité**) + la `champinium_core.dll`. Contrat
-  actuel **v11** : objet `ChampiniumNode` (`OpenNode`, `PeerId`, `Catalog`,
-  `Listen`, `Connect`, `IngestFile`, `PublishFeed`, `OpenStream`/`CloseStream`/
-  `StreamStatus`, `SetStreamListener`, …), record
+  actuel **v12** : objet `ChampiniumNode` (`OpenNode`, `PeerId`, `Catalog`,
+  `Listen`, `Connect`, `IngestFile`, `PublishFeedWith`, `OpenStream`/
+  `CloseStream`/`StreamStatus`, `SetStreamListener`, …), record
   `FfiCatalogEntry { Issuer, Seq, Cids }`, erreur `FfiError`. `FetchHls` a été
-  retiré du FFI (ADR 0009) — la lecture passe désormais par `OpenStream`. Les
-  fonctions libres (dont `OpenNode`) sont exposées par uniffi-bindgen-cs dans
-  la classe statique `ChampiniumCoreMethods`.
+  retiré du FFI (ADR 0009) — la lecture passe désormais par `OpenStream`.
+  Chaque `FfiContentItem` porte une `Provenance` (`FfiProvenance { Mode,
+  Tools }`, ADR 0010), affichée en badge (« IA / Assisté IA / Capturé / Non
+  déclaré » + outils) sans champ de saisie — la publication reste CLI-only.
+  Les fonctions libres (dont `OpenNode`) sont exposées par uniffi-bindgen-cs
+  dans la classe statique `ChampiniumCoreMethods`.
 - **Produit** : rien pour les autres agents (feuille de l'arbre).
 
 ## Definition of Done — Phase 4 (UI catalogue + lecture)

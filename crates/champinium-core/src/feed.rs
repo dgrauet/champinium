@@ -17,10 +17,10 @@ use libp2p::identity::{Keypair, PublicKey};
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 
-/// Identifiant de schéma de feed v3 : le feed porte l'identité éditoriale du
-/// channel (nom, description, avatar) EN PLUS des métadonnées par contenu.
-/// Formats v1/v2 supprimés (décision de spec channels, zéro utilisateur).
-pub const SCHEMA: &str = "champinium-feed/v3";
+/// Identifiant de schéma de feed v4 : chaque entrée porte une **déclaration de
+/// provenance** obligatoire (mode + outils), signée avec le reste (spec
+/// 2026-09-06, ADR 0010). Formats v1/v2/v3 supprimés (zéro-compat).
+pub const SCHEMA: &str = "champinium-feed/v4";
 
 /// Bornes des métadonnées de channel (anti-abus : le feed n'est pas un canal de
 /// données arbitraires ; ces bornes sont VÉRIFIÉES à la réception, pas seulement
@@ -32,6 +32,76 @@ pub const MAX_CHANNEL_DESC_LEN: usize = 1024;
 pub const MAX_TITLE_LEN: usize = 256;
 pub const MAX_TAG_LEN: usize = 64;
 pub const MAX_TAGS_PER_ENTRY: usize = 16;
+
+/// Bornes de la déclaration de provenance (vérifiées à la réception).
+pub const MAX_TOOLS_PER_ENTRY: usize = 8;
+pub const MAX_TOOL_LEN: usize = 64;
+
+/// Mode de provenance **déclaré** par le créateur — une affirmation signée,
+/// pas une vérification. `Undeclared` est une valeur explicite, jamais un
+/// défaut injecté au parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProvenanceMode {
+    Generated,
+    Assisted,
+    Captured,
+    Undeclared,
+}
+
+impl ProvenanceMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Generated => "generated",
+            Self::Assisted => "assisted",
+            Self::Captured => "captured",
+            Self::Undeclared => "undeclared",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "generated" => Some(Self::Generated),
+            "assisted" => Some(Self::Assisted),
+            "captured" => Some(Self::Captured),
+            "undeclared" => Some(Self::Undeclared),
+            _ => None,
+        }
+    }
+}
+
+/// Déclaration de provenance d'un contenu : mode + outils/modèles (texte
+/// libre normalisé comme les tags, donc cherchable). Pas de prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Provenance {
+    pub mode: ProvenanceMode,
+    pub tools: Vec<String>,
+}
+
+impl Provenance {
+    pub fn undeclared() -> Self {
+        Self {
+            mode: ProvenanceMode::Undeclared,
+            tools: Vec::new(),
+        }
+    }
+
+    /// Outils normalisés (`normalize_tag`), vides retirés, dédupliqués en
+    /// conservant l'ordre.
+    pub fn normalized(&self) -> Self {
+        let mut tools: Vec<String> = Vec::new();
+        for t in &self.tools {
+            let n = normalize_tag(t);
+            if !n.is_empty() && !tools.contains(&n) {
+                tools.push(n);
+            }
+        }
+        Self {
+            mode: self.mode,
+            tools,
+        }
+    }
+}
 
 /// Identité éditoriale d'un channel, signée avec le feed. L'avatar est un CID
 /// d'image — modéré comme tout contenu (checkpoints inchangés).
@@ -51,9 +121,24 @@ pub struct FeedEntry {
     pub title: String,
     /// Tags normalisés (minuscules, sans espaces de bord).
     pub tags: Vec<String>,
+    /// Déclaration de provenance (obligatoire, signée).
+    pub provenance: Provenance,
 }
 
-/// Feed signé d'un créateur (format unique `champinium-feed/v3`).
+impl FeedEntry {
+    /// Entrée « non déclarée » sans outils — raccourci pour les publications
+    /// par CIDs nus et les tests.
+    pub fn undeclared(cid: String, title: String, tags: Vec<String>) -> Self {
+        Self {
+            cid,
+            title,
+            tags,
+            provenance: Provenance::undeclared(),
+        }
+    }
+}
+
+/// Feed signé d'un créateur (format unique `champinium-feed/v4`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Feed {
     /// Identifiant de schéma ; toujours [`SCHEMA`].
@@ -80,7 +165,7 @@ impl Feed {
     /// Octets canoniques signés (déterministes). Chaque champ est **préfixé par
     /// sa longueur** (non séparé par `\n`) pour éliminer toute malléabilité par
     /// décalage de frontière. Le bloc channel est couvert, puis les entrées,
-    /// triées par CID, chacune couvrant cid, titre et tags.
+    /// triées par CID, chacune couvrant cid, titre, tags, mode et outils.
     fn signing_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         push_field(&mut buf, self.schema.as_bytes());
@@ -102,6 +187,11 @@ impl Feed {
             for t in &e.tags {
                 push_field(&mut buf, t.as_bytes());
             }
+            push_field(&mut buf, e.provenance.mode.as_str().as_bytes());
+            push_field(&mut buf, &(e.provenance.tools.len() as u64).to_le_bytes());
+            for t in &e.provenance.tools {
+                push_field(&mut buf, t.as_bytes());
+            }
         }
         buf
     }
@@ -111,11 +201,7 @@ impl Feed {
     pub fn build_signed(issuer: &Keypair, seq: u64, cids: &[Cid]) -> CoreResult<Self> {
         let entries: Vec<FeedEntry> = cids
             .iter()
-            .map(|c| FeedEntry {
-                cid: c.to_string(),
-                title: String::new(),
-                tags: Vec::new(),
-            })
+            .map(|c| FeedEntry::undeclared(c.to_string(), String::new(), Vec::new()))
             .collect();
         Self::build_signed_with(issuer, seq, &ChannelMeta::default(), &entries)
     }
@@ -140,6 +226,7 @@ impl Feed {
                     .map(|t| normalize_tag(t))
                     .filter(|t| !t.is_empty())
                     .collect(),
+                provenance: e.provenance.normalized(),
             })
             .collect();
         let mut feed = Self {
@@ -206,6 +293,8 @@ impl Feed {
             if e.title.len() > MAX_TITLE_LEN
                 || e.tags.len() > MAX_TAGS_PER_ENTRY
                 || e.tags.iter().any(|t| t.len() > MAX_TAG_LEN)
+                || e.provenance.tools.len() > MAX_TOOLS_PER_ENTRY
+                || e.provenance.tools.iter().any(|t| t.len() > MAX_TOOL_LEN)
             {
                 return Err(CoreError::Network("métadonnées de feed hors bornes".into()));
             }
@@ -242,6 +331,19 @@ impl Feed {
         tags.sort();
         tags.dedup();
         tags
+    }
+
+    /// Outils de provenance distincts (normalisés) portés par le feed, tous
+    /// contenus confondus.
+    pub fn all_tools(&self) -> Vec<String> {
+        let mut tools: Vec<String> = self
+            .entries
+            .iter()
+            .flat_map(|e| e.provenance.tools.iter().cloned())
+            .collect();
+        tools.sort();
+        tools.dedup();
+        tools
     }
 }
 
@@ -283,11 +385,118 @@ mod tests {
     // --- métadonnées de contenu (titre, tags) signées ---
 
     fn entry(cid: Cid, title: &str, tags: &[&str]) -> FeedEntry {
+        FeedEntry::undeclared(
+            cid.to_string(),
+            title.to_string(),
+            tags.iter().map(|t| t.to_string()).collect(),
+        )
+    }
+
+    fn entry_with(cid: Cid, mode: ProvenanceMode, tools: &[&str]) -> FeedEntry {
         FeedEntry {
             cid: cid.to_string(),
-            title: title.to_string(),
-            tags: tags.iter().map(|t| t.to_string()).collect(),
+            title: "t".into(),
+            tags: vec!["nature".into()],
+            provenance: Provenance {
+                mode,
+                tools: tools.iter().map(|s| s.to_string()).collect(),
+            },
         }
+    }
+
+    #[test]
+    fn provenance_is_signed_mode_and_tools() {
+        let issuer = Keypair::generate_ed25519();
+        let e = entry_with(cid_for(b"x"), ProvenanceMode::Generated, &["Sora"]);
+        let feed = Feed::build_signed_with(&issuer, 1, &ChannelMeta::default(), &[e]).unwrap();
+        feed.verify().unwrap();
+        assert_eq!(feed.entries[0].provenance.tools, vec!["sora".to_string()]);
+
+        let mut tampered = feed.clone();
+        tampered.entries[0].provenance.mode = ProvenanceMode::Captured;
+        assert!(
+            tampered.verify().is_err(),
+            "changer le mode invalide la signature"
+        );
+
+        let mut tampered = feed.clone();
+        tampered.entries[0].provenance.tools.push("runway".into());
+        assert!(
+            tampered.verify().is_err(),
+            "changer les outils invalide la signature"
+        );
+
+        // Déplacer un outil vers les tags (même octets, autre champ) invalide.
+        let mut tampered = feed;
+        let tool = tampered.entries[0].provenance.tools.remove(0);
+        tampered.entries[0].tags.push(tool);
+        assert!(tampered.verify().is_err());
+    }
+
+    #[test]
+    fn feed_v3_and_missing_or_unknown_provenance_are_rejected() {
+        let issuer = Keypair::generate_ed25519();
+        let feed = Feed::build_signed(&issuer, 1, &[cid_for(b"a")]).unwrap();
+        let mut v3 = feed.clone();
+        v3.schema = "champinium-feed/v3".into();
+        assert!(v3.verify().is_err());
+
+        let json = feed.to_json().unwrap();
+        let without = json.replace(r#","provenance":{"mode":"undeclared","tools":[]}"#, "");
+        assert_ne!(json, without, "le JSON doit contenir le bloc à retirer");
+        assert!(
+            Feed::from_json(without.as_bytes()).is_err(),
+            "provenance obligatoire"
+        );
+
+        let unknown = json.replace(r#""mode":"undeclared""#, r#""mode":"magic""#);
+        assert!(
+            Feed::from_json(unknown.as_bytes()).is_err(),
+            "mode inconnu rejeté"
+        );
+    }
+
+    #[test]
+    fn provenance_bounds_are_enforced_on_receive() {
+        let issuer = Keypair::generate_ed25519();
+        let nine: Vec<String> = (0..9).map(|i| format!("tool{i}")).collect();
+        let mut e = entry_with(cid_for(b"x"), ProvenanceMode::Assisted, &[]);
+        e.provenance.tools = nine;
+        // build_signed_with signe tel quel ; verify (réception) refuse.
+        let feed = Feed::build_signed_with(&issuer, 1, &ChannelMeta::default(), &[e]).unwrap();
+        assert!(feed.verify().is_err(), "9 outils refusés");
+
+        let mut e = entry_with(cid_for(b"y"), ProvenanceMode::Assisted, &[]);
+        e.provenance.tools = vec!["a".repeat(MAX_TOOL_LEN + 1)];
+        let feed = Feed::build_signed_with(&issuer, 1, &ChannelMeta::default(), &[e]).unwrap();
+        assert!(feed.verify().is_err(), "outil trop long refusé");
+    }
+
+    #[test]
+    fn tools_are_normalized_and_deduplicated() {
+        let issuer = Keypair::generate_ed25519();
+        let e = entry_with(
+            cid_for(b"x"),
+            ProvenanceMode::Generated,
+            &[" Sora ", "sora", "", "ComfyUI"],
+        );
+        let feed = Feed::build_signed_with(&issuer, 1, &ChannelMeta::default(), &[e]).unwrap();
+        assert_eq!(
+            feed.entries[0].provenance.tools,
+            vec!["sora".to_string(), "comfyui".to_string()]
+        );
+        assert_eq!(
+            feed.all_tools(),
+            vec!["comfyui".to_string(), "sora".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_signed_yields_undeclared_entries() {
+        let issuer = Keypair::generate_ed25519();
+        let feed = Feed::build_signed(&issuer, 1, &[cid_for(b"a")]).unwrap();
+        assert_eq!(feed.entries[0].provenance, Provenance::undeclared());
+        assert_eq!(feed.schema, "champinium-feed/v4");
     }
 
     fn channel(name: &str, desc: &str, avatar: Option<&str>) -> ChannelMeta {

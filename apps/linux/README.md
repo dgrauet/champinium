@@ -30,9 +30,11 @@ cargo build -p champinium-linux                   # build « stub » sans GTK (C
 reconstruit → bouton « Lire » → `open_stream` ouvre une session de lecture
 progressive servie par le noyau sur `127.0.0.1` (ADR 0009), dont l'URL est
 passée directement à `playbin` (**GStreamer**), avec une ligne de progression
-« segments : x/y » et `close_stream` à l'arrêt. Un runtime tokio exécute les
-appels async du noyau ; les résultats reviennent sur le thread GTK via
-`glib::spawn_future_local` + oneshot.
+« segments : x/y » et `close_stream` à l'arrêt. Chaque entrée du catalogue
+affiche un badge de provenance déclarée (« IA / Assisté IA / Capturé / Non
+déclaré » + outils, ADR 0010) — pas de champ de saisie, la publication reste
+CLI-only. Un runtime tokio exécute les appels async du noyau ; les résultats
+reviennent sur le thread GTK via `glib::spawn_future_local` + oneshot.
 
 ## Statut de vérification
 

@@ -13,6 +13,19 @@ using Champinium.Core; // bindings générés par `just gen-csharp`
 
 namespace Champinium;
 
+/// <summary>Traduit un mode de provenance déclaré en libellé affichable (FR).</summary>
+internal static class ProvenanceText
+{
+    public static string Label(FfiProvenanceMode mode) => mode switch
+    {
+        FfiProvenanceMode.Generated => "IA",
+        FfiProvenanceMode.Assisted => "Assisté IA",
+        FfiProvenanceMode.Captured => "Capturé",
+        FfiProvenanceMode.Undeclared => "Non déclaré",
+        _ => "Mode inconnu",
+    };
+}
+
 /// <summary>Une ligne de contenu affichable, rattachée à son groupe (créateur/feed).</summary>
 public sealed class CatalogCid
 {
@@ -29,11 +42,23 @@ public sealed class CatalogCid
     /// gabarit d'item est partagé avec Explorer, où le bouton reste masqué).</summary>
     public bool CanPin { get; init; }
 
+    /// <summary>Mode de provenance déclaré par le créateur (feed v4).</summary>
+    internal FfiProvenanceMode ProvenanceMode { get; init; } = FfiProvenanceMode.Undeclared;
+
+    /// <summary>Outils déclarés (normalisés, peut être vide).</summary>
+    public IReadOnlyList<string> Tools { get; init; } = Array.Empty<string>();
+
     /// <summary>Libellé principal : le titre, ou le CID si sans titre.</summary>
     public string Display => Title.Length > 0 ? Title : Cid;
 
     /// <summary>Tags joints pour l'affichage (vide si aucun).</summary>
     public string TagsText => string.Join(" · ", Tags);
+
+    /// <summary>Libellé du badge de provenance (IA / Assisté IA / Capturé / Non déclaré).</summary>
+    public string ProvenanceLabel => ProvenanceText.Label(ProvenanceMode);
+
+    /// <summary>Outils déclarés, joints pour l'affichage (vide si aucun).</summary>
+    public string ToolsText => string.Join(" · ", Tools);
 
     /// <summary>Libellé du bouton pin — "Garder" (non épinglé) / "Oublier" (épinglé).</summary>
     public string PinLabel => IsPinned ? "Oublier" : "Garder";
@@ -95,8 +120,12 @@ public sealed class ChannelPreviewItem
     public string Cid { get; init; } = "";
     public string Title { get; init; } = "";
     public IReadOnlyList<string> Tags { get; init; } = Array.Empty<string>();
+    internal FfiProvenanceMode ProvenanceMode { get; init; } = FfiProvenanceMode.Undeclared;
+    public IReadOnlyList<string> Tools { get; init; } = Array.Empty<string>();
     public string Display => Title.Length > 0 ? Title : Cid;
     public string TagsText => string.Join(" · ", Tags);
+    public string ProvenanceLabel => ProvenanceText.Label(ProvenanceMode);
+    public string ToolsText => string.Join(" · ", Tools);
 }
 
 /// <summary>
@@ -468,6 +497,8 @@ public sealed class NodeViewModel : INotifyPropertyChanged
                     Cid = hit.cid,
                     Title = hit.title,
                     Tags = hit.tags,
+                    ProvenanceMode = hit.provenance.mode,
+                    Tools = hit.provenance.tools,
                 });
             }
             Status = $"recherche: {hits.Count} résultat(s)";
@@ -512,6 +543,8 @@ public sealed class NodeViewModel : INotifyPropertyChanged
                     Cid = item.cid,
                     Title = item.title,
                     Tags = item.tags,
+                    ProvenanceMode = item.provenance.mode,
+                    Tools = item.provenance.tools,
                     IsPinned = showPin && entry.pinned.Contains(item.cid),
                     CanPin = showPin,
                 });
@@ -551,7 +584,14 @@ public sealed class NodeViewModel : INotifyPropertyChanged
                 Description = preview.description,
                 AvatarCid = preview.avatarCid,
                 Items = preview.items
-                    .Select(i => new ChannelPreviewItem { Cid = i.cid, Title = i.title, Tags = i.tags })
+                    .Select(i => new ChannelPreviewItem
+                    {
+                        Cid = i.cid,
+                        Title = i.title,
+                        Tags = i.tags,
+                        ProvenanceMode = i.provenance.mode,
+                        Tools = i.provenance.tools,
+                    })
                     .ToList(),
                 Subscribed = preview.subscribed,
                 Blocked = preview.blocked,

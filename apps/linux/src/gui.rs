@@ -10,11 +10,13 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use champinium_core::feed::Provenance;
 use champinium_core::p2p::ChannelPreview;
 use champinium_core::{
     channel_link, paths, CatalogEntry, Cid, CoreError, Node, PeerId, StreamSessionInfo,
 };
 use gstreamer::prelude::*;
+use gtk::gdk;
 use gtk::glib;
 use gtk::prelude::*;
 use gtk::{
@@ -118,6 +120,18 @@ struct Ui {
 }
 
 fn build_ui(app: &Application) {
+    // Badge de provenance (présentation seule) : classe CSS `pill` appliquée
+    // au niveau du display par défaut, pas de style inline dans chaque ligne.
+    let css_provider = gtk::CssProvider::new();
+    css_provider.load_from_data(
+        ".pill { padding: 0 6px; border-radius: 8px; background: alpha(@accent_bg_color, 0.15); font-weight: bold; font-size: smaller; }",
+    );
+    gtk::style_context_add_provider_for_display(
+        &gdk::Display::default().expect("display par défaut"),
+        &css_provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+
     let ui = Rc::new(Ui {
         rt: Arc::new(Runtime::new().expect("runtime tokio")),
         node: RefCell::new(None),
@@ -607,6 +621,7 @@ fn refresh_lists(
                 search_entry,
                 &hit.title,
                 &hit.tags,
+                &hit.provenance,
                 &hit.cid.to_string(),
                 None,
             ));
@@ -619,6 +634,7 @@ fn refresh_lists(
                     search_entry,
                     &hit.title,
                     &hit.tags,
+                    &hit.provenance,
                     &hit.cid.to_string(),
                     None,
                 ));
@@ -654,6 +670,7 @@ fn refresh_lists(
                 search_entry,
                 &item.title,
                 &item.tags,
+                &item.provenance,
                 &item.cid.to_string(),
                 None,
             ));
@@ -683,6 +700,7 @@ fn refresh_lists(
                 search_entry,
                 &item.title,
                 &item.tags,
+                &item.provenance,
                 &item.cid.to_string(),
                 Some(pinned.contains(&item.cid)),
             ));
@@ -873,8 +891,36 @@ fn describe_preview_error(e: &CoreError) -> String {
     }
 }
 
-/// Une ligne de contenu : titre (ou CID si sans titre) + tags + bouton de pin
-/// (Abonnements uniquement, quand `pinned` est fourni) + bouton « Lire ».
+/// Libellé du mode de provenance déclaré (présentation seule — aucune
+/// vérification, c'est une affirmation signée par le créateur).
+fn provenance_label(p: &Provenance) -> String {
+    use champinium_core::feed::ProvenanceMode as M;
+    match p.mode {
+        M::Generated => "IA",
+        M::Assisted => "Assisté IA",
+        M::Captured => "Capturé",
+        M::Undeclared => "Non déclaré",
+    }
+    .to_string()
+}
+
+/// Badge de provenance + outils déclarés (présentation seule).
+fn provenance_row(p: &Provenance) -> GtkBox {
+    let row = GtkBox::new(Orientation::Horizontal, 6);
+    let badge = Label::new(Some(&provenance_label(p)));
+    badge.add_css_class("pill");
+    row.append(&badge);
+    if !p.tools.is_empty() {
+        let tools = Label::new(Some(&p.tools.join(" · ")));
+        tools.add_css_class("dim-label");
+        row.append(&tools);
+    }
+    row
+}
+
+/// Une ligne de contenu : titre (ou CID si sans titre) + tags + provenance
+/// déclarée + bouton de pin (Abonnements uniquement, quand `pinned` est
+/// fourni) + bouton « Lire ».
 #[allow(clippy::too_many_arguments)]
 fn content_row(
     ui: &Rc<Ui>,
@@ -884,6 +930,7 @@ fn content_row(
     search_entry: &Entry,
     title: &str,
     tags: &[String],
+    provenance: &Provenance,
     cid: &str,
     pinned: Option<bool>,
 ) -> GtkBox {
@@ -898,6 +945,7 @@ fn content_row(
         tags_label.add_css_class("dim-label");
         text.append(&tags_label);
     }
+    text.append(&provenance_row(provenance));
     text.set_hexpand(true);
     row.append(&text);
 
@@ -1289,6 +1337,7 @@ fn open_channel_preview(
                 tags_label.add_css_class("dim-label");
                 row.append(&tags_label);
             }
+            row.append(&provenance_row(&item.provenance));
             items_list.append(&row);
         }
         let scroller = ScrolledWindow::builder()

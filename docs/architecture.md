@@ -2,17 +2,19 @@
 
 > Public : quiconque veut comprendre comment le projet fonctionne de bout en
 > bout. Les renvois pointent vers le code (chemins cliquables) et les ADRs
-> (`docs/adr/`) pour les décisions. État au contrat FFI **v11** (voir
+> (`docs/adr/`) pour les décisions. État au contrat FFI **v12** (voir
 > `.release-please-manifest.json` / `CHANGELOG.md` pour la version de release
 > — elle dérive, pas de version en dur ici, cf. `CLAUDE.md`).
 
 ## 1. Ce que c'est, en une phrase
 
-Une plateforme de partage P2P de contenu généré par IA (vidéo d'abord), avec
-l'UX de Popcorn Time (parcourir → cliquer → ça joue) et l'architecture
-inverse : **native sur les 3 OS** (pas d'Electron) et **décentralisée jusque
-dans la découverte** (pas d'API centrale, pas de base serveur, pas de stockage
-qu'on possède).
+Une plateforme de partage P2P de contenu à **provenance déclarée** (vidéo
+d'abord) : chaque publication dit, signée par son créateur, si elle est
+générée par IA, assistée, capturée ou non déclarée — une affirmation, pas une
+preuve (ADR 0010). UX de Popcorn Time (parcourir → cliquer → ça joue) et
+architecture inverse : **native sur les 3 OS** (pas d'Electron) et
+**décentralisée jusque dans la découverte** (pas d'API centrale, pas de base
+serveur, pas de stockage qu'on possède).
 
 Deux principes non négociables en découlent :
 
@@ -129,22 +131,29 @@ déplacer du contenu d'un champ à l'autre à signature constante
   leurs CIDs. `open_stream` le sert en lecture progressive (§6) ; `fetch_hls`
   (CLI seul, ADR 0009) le retransforme en `index.m3u8` jouable localement pour
   un export hors ligne.
-- **Feed** (`champinium-feed/v3`, JSON signé) : LA publication d'un créateur.
+- **Feed** (`champinium-feed/v4`, JSON signé) : LA publication d'un créateur.
   `{schema, issuer_pubkey, seq, channel{name, description, avatar_cid},
-  entries[{cid, title, tags}], signature}`. Versionné par `seq` **monotone et
-  persisté** (`.feed_seq` à côté des blocs : un créateur qui redémarre ne
-  régresse pas, sinon le LWW des pairs l'ignorerait). Bornes vérifiées à la
-  réception (titre ≤ 256, ≤ 16 tags). Le bloc `channel` porte l'identité
-  éditoriale du créateur, signée avec le reste du feed (pas de canal séparé
-  ni de confiance implicite) : nom ≤ 64, description ≤ 1024. `avatar_cid` est
-  optionnel et, s'il est présent, doit être un CID valide — **c'est un CID
-  comme un autre** : il traverse les mêmes checkpoints de modération que
-  n'importe quel contenu (pas de contournement pour les avatars). Le profil
-  courant est persisté par le créateur (`.channel_profile`, à côté du feed) et
-  republié (nouveau `seq`) à chaque changement. Les formats **v1 et v2 ont été
-  supprimés** (zéro utilisateur en usage réel au moment du retrait) : un feed
-  v1/v2 reçu est rejeté au parsing plutôt que toléré en compatibilité
-  descendante.
+  entries[{cid, title, tags, provenance{mode, tools}}], signature}`. Versionné
+  par `seq` **monotone et persisté** (`.feed_seq` à côté des blocs : un
+  créateur qui redémarre ne régresse pas, sinon le LWW des pairs l'ignorerait).
+  Bornes vérifiées à la réception (titre ≤ 256, ≤ 16 tags). Le bloc `channel`
+  porte l'identité éditoriale du créateur, signée avec le reste du feed (pas de
+  canal séparé ni de confiance implicite) : nom ≤ 64, description ≤ 1024.
+  `avatar_cid` est optionnel et, s'il est présent, doit être un CID valide —
+  **c'est un CID comme un autre** : il traverse les mêmes checkpoints de
+  modération que n'importe quel contenu (pas de contournement pour les
+  avatars). Le profil courant est persisté par le créateur
+  (`.channel_profile`, à côté du feed) et republié (nouveau `seq`) à chaque
+  changement. Le bloc `provenance` de chaque entrée est **obligatoire**
+  (ADR 0010) : `mode` ∈ `generated`/`assisted`/`captured`/`undeclared` — une
+  valeur explicite, jamais un défaut injecté au parsing — et jusqu'à 8 `tools`
+  en texte libre normalisé comme les tags (≤ 64 caractères chacun), signés
+  avec le reste des champs (préfixe-longueur). C'est une **affirmation signée
+  du publieur**, pas une vérification technique : elle prouve qui affirme, pas
+  ce qui est affirmé ; la modération ne la lit pas. Les formats **v1, v2 et v3
+  ont été supprimés** (zéro utilisateur en usage réel au moment de chaque
+  retrait) : un feed d'un format antérieur reçu est rejeté au parsing plutôt
+  que toléré en compatibilité descendante.
 - **Denylist** (`champinium-denylist/v2`, JSON signé) : liste signée par son
   éditeur, portant des **CIDs** bloqués (`entries`) **et** des **clés**
   bloquées (`key_entries` — PeerIds d'émetteurs bannis en entier ; tout contenu
@@ -161,7 +170,7 @@ déplacer du contenu d'un champ à l'autre à signature constante
 
 ```
 fichier → [modération #1] → ffmpeg (segments HLS) → blocs CID + manifeste
-       → feed v3 signé { seq+1, channel, entries }
+       → feed v4 signé { seq+1, channel, entries (provenance obligatoire) }
             ├─► catalogue local (+ tic catalog_events)
             ├─► gossipsub feeds/v1                     (live, secondes)
             ├─► DHT PUT /champinium/feed/<peerid>      (découverte hors gossip)
@@ -180,8 +189,12 @@ fichier → [modération #1] → ffmpeg (segments HLS) → blocs CID + manifeste
    `/champinium/tag/nature` → ce sont les émetteurs eux-mêmes → `fetch_feed`
    de chacun, filtrage par tag. Un tag annoncé à tort ne coûte qu'une requête
    (le feed signé fait foi). La recherche **locale** (`search`) ne parcourt
-   que le catalogue déjà reconstruit — limite assumée : pas de recherche
-   globale exhaustive sur un réseau décentralisé (risque #4).
+   que le catalogue déjà reconstruit et matche **titres, tags et outils
+   déclarés** — limite assumée : pas de recherche globale exhaustive sur un
+   réseau décentralisé (risque #4). Les outils déclarés (`provenance.tools`,
+   ADR 0010) sont annoncés dans la DHT sous le **même préfixe** que les tags
+   (`/champinium/tag/<outil>`) : ils sont donc découvrables par le même
+   chemin 3, sans mécanisme séparé.
 
 ### Abonnements : suivi actif d'un émetteur choisi
 
@@ -534,7 +547,7 @@ Autour, trois mécanismes d'écosystème :
   catalogue borné à 1024 émetteurs (refus-quand-plein, pas d'éviction), c'est
   la défense contre l'inondation par clés jetables.
 
-## 8. La frontière FFI : le contrat v11
+## 8. La frontière FFI : le contrat v12
 
 La surface UniFFI de [`ffi.rs`](../crates/champinium-core/src/ffi.rs) est
 **le contrat** entre le noyau et les fronts (tableau exhaustif et protocole de
@@ -575,10 +588,21 @@ changement dans [`AGENTS.md`](../AGENTS.md)). Ce qui la caractérise :
 - **Erreurs typées** : `FfiError::{Moderated, Network, NotFound, InvalidInput,
   Internal}` — un contenu bloqué par la modération s'affiche « contenu
   bloqué », pas comme une panne réseau.
+- **Provenance déclarée (v12, ADR 0010)** : `FfiProvenanceMode { Generated,
+  Assisted, Captured, Undeclared }` et record `FfiProvenance { mode, tools }` ;
+  `FfiContentItem` et `FfiSearchHit` gagnent `provenance` (rupture pour qui
+  construit le record — `FfiCatalogEntry.items` et `FfiChannelPreview.items`
+  en héritent). **Retrait** de `publish_feed(cids)` : une entrée sans
+  déclaration n'est plus valide, `publish_feed_with(items)` reste l'unique
+  chemin de publication. `search`/`search_tag` matchent aussi les outils
+  déclarés ; les outils sont annoncés dans la DHT sous le même préfixe que les
+  tags. Une déclaration est une affirmation signée du publieur, pas une
+  preuve ; aucune UI de saisie côté fronts — la publication reste CLI-only
+  (`ingest --provenance <mode> --tool …`, provenance obligatoire).
 - **Bindings générés au build, jamais commités** : Swift via
   UniFFI/XCFramework (`just macos-prepare`), C# via `uniffi-bindgen-cs`
   (`just gen-csharp`). Le front Linux consomme le crate **directement** (pas
-  de FFI). `CONTRACT_VERSION` (=11) permet aux fronts de détecter une
+  de FFI). `CONTRACT_VERSION` (=12) permet aux fronts de détecter une
   incompatibilité au démarrage.
 - **Abonnements (v6)** : `subscribe_channel`/`unsubscribe_channel` (lien
   `champinium://channel/<peerid>` ou PeerId nu), `subscriptions` (liste
@@ -668,11 +692,12 @@ qui compte vit dans le réseau, chaque nœud n'en garde qu'une vue.
 | Channels lot (c) | seed proactif des channels souscrits + quota + éviction + pins + retrait de seed-what-you-consume — **implémenté** (contrat FFI v7) | §6 bis |
 | Channels lot (d) | denylist par clé (v2), blocage local privé de channel, purge rétroactive étendue (SeedIndex + `stop_providing`), signalements par channel — **implémenté** (contrat FFI v8) ; clôt la refonte channels (lots a–d) | §7 |
 | Lecture progressive | serveur HLS local (`open_stream`/`close_stream`/`stream_status`), `fetch_hls` retiré du FFI (reste au CLI, export hors ligne) — **implémenté** (contrat FFI v11) | §6, [ADR 0009](adr/0009-progressive-hls-local-server.md) |
+| Provenance déclarée | déclaration obligatoire et signée par entrée (mode + outils), feed v4, `publish_feed` sans métadonnées retiré du FFI — **implémenté** (contrat FFI v12) | §5, §8, [ADR 0010](adr/0010-declared-provenance.md) |
 
 ## 12. Carte des documents
 
 - [`CLAUDE.md`](../CLAUDE.md) — principes + état d'avancement (source de vérité).
-- [`AGENTS.md`](../AGENTS.md) — contrat FFI (tableau v11) + garde-fous d'équipe.
+- [`AGENTS.md`](../AGENTS.md) — contrat FFI (tableau v12) + garde-fous d'équipe.
 - [`docs/adr/`](adr/) — décisions : libp2p vs iroh (0001), modération côté
   nœud (0002), feeds signés (0003), transport de blocs (0006), IPNS (0007),
   stockage froid Arweave (0008), lecture progressive par serveur HLS local

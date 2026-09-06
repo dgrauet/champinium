@@ -1,12 +1,11 @@
 # Champinium
 
-Plateforme de **partage P2P de contenu généré par IA** (vidéo, image, audio).
-UX esprit Popcorn Time (parcourir → cliquer → ça streame), mais **native sur les
-3 OS** (pas d'Electron) et **décentralisée jusque dans la découverte** (pas d'API
-centrale).
-
-> ⚠️ Projet à un stade **squelette** : l'arborescence, le workspace et les stubs
-> sont posés ; il n'y a **pas encore de logique métier** (P2P, ingestion, lecture).
+Plateforme de **partage P2P de contenu à provenance déclarée** (vidéo, image,
+audio) : chaque publication dit, signée par son créateur, si elle est générée
+par IA, assistée, capturée ou non déclarée — une affirmation, pas une preuve
+(ADR 0010). UX esprit Popcorn Time (parcourir → cliquer → ça streame), mais
+**native sur les 3 OS** (pas d'Electron) et **décentralisée jusque dans la
+découverte** (pas d'API centrale).
 
 ## Principes
 

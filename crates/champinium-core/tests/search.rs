@@ -21,11 +21,11 @@ async fn node(dir: &std::path::Path, name: &str) -> Node {
 }
 
 fn entry(cid: champinium_core::Cid, title: &str, tags: &[&str]) -> FeedEntry {
-    FeedEntry {
-        cid: cid.to_string(),
-        title: title.to_string(),
-        tags: tags.iter().map(|t| t.to_string()).collect(),
-    }
+    FeedEntry::undeclared(
+        cid.to_string(),
+        title.to_string(),
+        tags.iter().map(|t| t.to_string()).collect(),
+    )
 }
 
 /// Un feed v2 avec métadonnées se propage en gossip et devient cherchable
@@ -106,4 +106,57 @@ async fn search_tag_discovers_content_via_dht() {
     })
     .await
     .expect("le tag doit être découvrable via la DHT");
+}
+
+/// Un outil déclaré est une clé de découverte comme un tag : `search_tag`
+/// retrouve via la DHT l'émetteur qui a déclaré cet outil, sans gossip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn declared_tool_is_discoverable_via_dht() {
+    use champinium_core::feed::{Provenance, ProvenanceMode};
+    let dir = tempfile::tempdir().unwrap();
+    let creator = node(dir.path(), "creator-tool").await;
+    let seeker = node(dir.path(), "seeker-tool").await;
+    let addr = creator
+        .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .await
+        .unwrap();
+    seeker
+        .add_address(creator.peer_id(), addr.clone())
+        .await
+        .unwrap();
+    seeker.dial(addr).await.unwrap();
+
+    let cid = creator.add(b"dunes generees").await.unwrap();
+    let mut e = entry(cid, "Dunes", &["desert"]);
+    e.provenance = Provenance {
+        mode: ProvenanceMode::Generated,
+        tools: vec!["Sora".into()],
+    };
+    creator
+        .publish_feed_with(std::slice::from_ref(&e))
+        .await
+        .unwrap();
+
+    let hits = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let hits = seeker.search_tag("sora").await.unwrap();
+            if !hits.is_empty() {
+                return hits;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("l'outil déclaré doit être découvrable via la DHT");
+    assert_eq!(hits[0].cid, cid);
+    assert_eq!(hits[0].provenance.mode, ProvenanceMode::Generated);
+    assert!(
+        seeker
+            .search_tag("desert")
+            .await
+            .unwrap()
+            .iter()
+            .any(|h| h.cid == cid),
+        "les tags marchent toujours"
+    );
 }

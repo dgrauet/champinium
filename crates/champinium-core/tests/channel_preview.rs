@@ -59,11 +59,11 @@ async fn resolves_immediately_from_catalog_without_network() {
         description: "desc".into(),
         avatar_cid: None,
     };
-    let entries = vec![FeedEntry {
-        cid: cid.to_string(),
-        title: "Titre".into(),
-        tags: vec!["tag".into()],
-    }];
+    let entries = vec![FeedEntry::undeclared(
+        cid.to_string(),
+        "Titre".into(),
+        vec!["tag".into()],
+    )];
     let feed = Feed::build_signed_with(&other, 1, &channel, &entries).unwrap();
     node.apply_feed_for_tests(feed).unwrap();
 

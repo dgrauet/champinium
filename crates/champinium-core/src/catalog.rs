@@ -7,17 +7,19 @@
 //! émetteur, le feed de `seq` le plus élevé, signature vérifiée).
 
 use crate::error::Result as CoreResult;
-use crate::feed::{ChannelMeta, Feed};
+use crate::feed::{ChannelMeta, Feed, Provenance};
 use cid::Cid;
 use libp2p::PeerId;
 use std::collections::{HashMap, HashSet};
 
-/// Un contenu du catalogue avec ses métadonnées signées (titre, tags).
+/// Un contenu du catalogue avec ses métadonnées signées (titre, tags,
+/// provenance).
 #[derive(Debug, Clone)]
 pub struct CatalogItem {
     pub cid: Cid,
     pub title: String,
     pub tags: Vec<String>,
+    pub provenance: Provenance,
 }
 
 /// Une entrée de catalogue : le dernier feed connu d'un créateur.
@@ -39,6 +41,7 @@ pub struct SearchHit {
     pub cid: Cid,
     pub title: String,
     pub tags: Vec<String>,
+    pub provenance: Provenance,
 }
 
 /// Borne par défaut du nombre d'émetteurs retenus (anti-DoS : sans borne, des
@@ -113,6 +116,7 @@ impl Catalog {
                             cid,
                             title: e.title.clone(),
                             tags: e.tags.clone(),
+                            provenance: e.provenance.clone(),
                         })
                     })
                     .collect();
@@ -128,10 +132,10 @@ impl Catalog {
     }
 
     /// Recherche locale : sous-chaîne insensible à la casse dans les titres,
-    /// correspondance sur les tags (déjà normalisés en minuscules). Limite
-    /// assumée (risque #4 du spec) : l'index ne couvre que les feeds que CE
-    /// nœud a vus passer — il n'y a pas de recherche globale exhaustive sur un
-    /// réseau décentralisé.
+    /// correspondance sur les tags et les outils déclarés (déjà normalisés en
+    /// minuscules). Limite assumée (risque #4 du spec) : l'index ne couvre que
+    /// les feeds que CE nœud a vus passer — il n'y a pas de recherche globale
+    /// exhaustive sur un réseau décentralisé.
     pub fn search(&self, query: &str) -> Vec<SearchHit> {
         let needle = query.trim().to_lowercase();
         if needle.is_empty() {
@@ -142,12 +146,14 @@ impl Catalog {
             for item in entry.items {
                 if item.title.to_lowercase().contains(&needle)
                     || item.tags.iter().any(|t| t == &needle)
+                    || item.provenance.tools.iter().any(|t| t == &needle)
                 {
                     hits.push(SearchHit {
                         issuer: entry.issuer,
                         cid: item.cid,
                         title: item.title,
                         tags: item.tags,
+                        provenance: item.provenance,
                     });
                 }
             }
@@ -325,11 +331,11 @@ mod tests {
     // --- ne couvre que ce que CE nœud a vu passer) ---
 
     fn meta(cid: Cid, title: &str, tags: &[&str]) -> crate::feed::FeedEntry {
-        crate::feed::FeedEntry {
-            cid: cid.to_string(),
-            title: title.to_string(),
-            tags: tags.iter().map(|t| t.to_string()).collect(),
-        }
+        crate::feed::FeedEntry::undeclared(
+            cid.to_string(),
+            title.to_string(),
+            tags.iter().map(|t| t.to_string()).collect(),
+        )
     }
 
     #[test]
@@ -414,5 +420,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cat.entries()[0].channel, ch);
+    }
+
+    #[test]
+    fn search_matches_declared_tools() {
+        let issuer = Keypair::generate_ed25519();
+        let mut e = meta(cid_for(b"v"), "Vol au-dessus des dunes", &["desert"]);
+        e.provenance = crate::feed::Provenance {
+            mode: crate::feed::ProvenanceMode::Generated,
+            tools: vec!["sora".into()],
+        };
+        let feed = Feed::build_signed_with(&issuer, 1, &ChannelMeta::default(), &[e]).unwrap();
+        let mut cat = Catalog::new();
+        cat.apply(feed, &HashSet::new()).unwrap();
+        let hits = cat.search("Sora");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].provenance.tools, vec!["sora".to_string()]);
+        assert_eq!(
+            hits[0].provenance.mode,
+            crate::feed::ProvenanceMode::Generated
+        );
+        assert!(cat.search("runway").is_empty());
     }
 }

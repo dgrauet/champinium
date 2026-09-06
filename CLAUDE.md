@@ -1,8 +1,10 @@
 # CLAUDE.md — Champinium
 
-Plateforme de partage P2P de contenu généré par IA (vidéo, image, audio).
-UX esprit Popcorn Time ; architecture à l'opposé : **natif, pas Electron ;
-décentralisé jusque dans la découverte, pas d'API centrale.**
+Plateforme de partage P2P de contenu à provenance déclarée (vidéo, image,
+audio) : chaque publication dit, signée par son créateur, si elle est générée
+par IA, assistée, capturée ou non déclarée — une affirmation, pas une preuve
+(ADR 0010). UX esprit Popcorn Time ; architecture à l'opposé : **natif, pas
+Electron ; décentralisé jusque dans la découverte, pas d'API centrale.**
 
 > Spec d'architecture complet : `~/Work/.superpowers/champinium/specs/2026-06-24-bootstrap-architecture.md`
 > (hors repo — artefact de design local).
@@ -383,6 +385,17 @@ sur deux machines physiques.
   CLI `stream <cid> --peer …`. Les trois fronts lisent l'URL dans leur
   lecteur natif et affichent « segments : x/y ». Spec :
   `~/Work/.superpowers/champinium/specs/2026-09-05-hls-streaming-design.md`.
+- **Provenance déclarée ✔ (ADR 0010)** : feed `champinium-feed/v4`, bloc
+  `provenance { mode, tools }` **obligatoire** par entrée, signé (préfixe-
+  longueur) ; `mode` ∈ generated/assisted/captured/undeclared (valeur
+  explicite, jamais un défaut), ≤ 8 outils normalisés comme les tags,
+  cherchables (index local + DHT sous `/champinium/tag/`). Une déclaration est
+  une affirmation signée du publieur, pas une preuve ; C2PA différé. Zéro-
+  compat (v3 rejeté). **Contrat FFI v12** (`FfiProvenance`, records enrichis,
+  retrait de `publish_feed`). CLI `ingest --provenance <mode> --tool …`
+  (provenance obligatoire). Les trois fronts affichent un badge « IA /
+  Assisté IA / Capturé / Non déclaré » + outils. Spec :
+  `~/Work/.superpowers/champinium/specs/2026-09-06-provenance-design.md`.
 - **Packaging Linux — Flatpak ✔ (fonctionnel, palier gratuit)** : manifeste
   [`packaging/flatpak/org.champinium.Champinium.yml`](packaging/flatpak/org.champinium.Champinium.yml)
   (app-id `org.champinium.Champinium`, runtime GNOME 48, rustc via rustup au
@@ -451,7 +464,7 @@ mesurée ✔, recherche ✔ (#20) ; **refonte channels COMPLÈTE** — lot (a) i
 par clé + blocage local + signalements par channel ✔ ; aperçu de channel par
 lien ✔ (`resolve_channel`, contrat v9 ; partie B — scheme OS — ✔) ; durabilité
 du record de feed ✔ (`republish_known_feeds`) ; IPNS #21 close, voir ADR 0007 ;
-lecture progressive ✔ (ADR 0009)).
+lecture progressive ✔ (ADR 0009) ; provenance déclarée ✔ (ADR 0010)).
 Voir le spec.
 
 **Dernière release : voir `.release-please-manifest.json` / CHANGELOG** —
@@ -459,4 +472,4 @@ pas de version en dur ici, elle dérive (règle intendant DG006). Release-please
 gère le versionnement (`bump-minor-pre-major` actif :
 un breaking change bumpe la mineure tant qu'on est < 1.0.0 — la 1.0 sera un
 choix délibéré de stabilisation d'API). Versionnement du contrat FFI distinct :
-`CONTRACT_VERSION = 11` (voir `AGENTS.md`).
+`CONTRACT_VERSION = 12` (voir `AGENTS.md`).
