@@ -179,9 +179,17 @@ async fn republish_known_feeds_skips_blocked_issuer() {
     let feed = Feed::build_signed(&victim, 1, &[cid_for(b"blocked")]).unwrap();
     node.apply_feed_unchecked_for_tests(feed).unwrap();
 
+    // `subscribe_denylist` inscrit désormais son éditeur dans
+    // `.denylist_issuers` (finding I2, revue finale 2026-09-06) : `signer` est
+    // donc lui-même un éditeur souscrit, et sa liste en cache est légitimement
+    // republiée. Seul le feed de `victim` (le compte BANNI) doit rester exclu
+    // — d'où un `count` de 1 (la liste de `signer`) et non 0.
+    assert!(node
+        .denylist_issuers()
+        .contains(&signer.public().to_peer_id()));
     let count = node.republish_known_feeds().await.unwrap();
     assert_eq!(
-        count, 0,
-        "un émetteur souscrit mais banni ne doit jamais être republié"
+        count, 1,
+        "seule la liste de l'éditeur (signer) est republiée ; le feed de l'émetteur banni (victim) ne doit jamais l'être"
     );
 }

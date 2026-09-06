@@ -852,10 +852,17 @@ impl Node {
     ///
     /// Renvoie le nombre total de blocs supprimés du magasin.
     ///
-    /// Chemin **manuel** (liste signée déjà en main, ex. CLI `denylist show`) :
-    /// aucun réseau. Le chemin réseau ([`Node::fetch_denylist`]) applique
-    /// exactement la même purge, via la même fonction libre.
+    /// Chemin **manuel** (liste signée déjà en main) : aucun réseau. Inscrit
+    /// aussi son éditeur dans `.denylist_issuers` (finding I2, revue finale
+    /// 2026-09-06) — sans quoi cette entrée serait un **orphelin** que ni la
+    /// republication ni le rechargement au démarrage ne regardent (même
+    /// raisonnement que le garde `subscribed` de `fetch_denylist_inner`),
+    /// alors que la purge de blocs, elle, est irréversible. Utilisé par les
+    /// tests et les opérateurs qui ont déjà une liste signée en main ; le
+    /// chemin réseau ([`Node::fetch_denylist`]) applique exactement la même
+    /// purge, via la même fonction libre.
     pub async fn subscribe_denylist(&self, list: &Denylist) -> CoreResult<usize> {
+        let issuer = list.issuer_peer_id()?;
         let state = self.moderation_state();
         let applied = {
             let mut mod_guard = self
@@ -864,6 +871,14 @@ impl Node {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             mod_guard.apply_list(list)?
         };
+        {
+            let mut issuers = self
+                .denylist_issuers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            issuers.insert(issuer);
+            save_denylist_issuers(&self.blockstore, &issuers)?;
+        }
         // La purge reste inconditionnelle (comportement historique : elle
         // rattrape aussi les blocages posés par une souscription antérieure
         // dont le catalogue vient d'être peuplé), mais cache et tic ne sont
@@ -873,8 +888,10 @@ impl Node {
             if let Err(e) = crate::moderation::save_cached_list(self.blockstore.root(), list) {
                 tracing::warn!("mise en cache de la denylist échouée: {e}");
             }
-            let _ = self.moderation_events.send(());
         }
+        // Tic inconditionnel : la liste des éditeurs suivis a changé même si
+        // le contenu appliqué était périmé.
+        let _ = self.moderation_events.send(());
         Ok(purged)
     }
 
@@ -2734,8 +2751,13 @@ async fn purge_after_denylist_inner(state: &ModerationState) -> CoreResult<usize
 /// Interroge la DHT pour le record de denylist de `issuer` et ne retient que
 /// le candidat de plus grand `seq` dont la signature ET l'émetteur sont
 /// vérifiés — même patron que [`fetch_verified_feed_from_dht`]. Le `seq` signé
-/// (v3) est ce qui empêche un tiers de rejouer une version antérieure, plus
-/// permissive, d'une liste de modération.
+/// (v3) protège les **suiveurs déjà à jour** (LWW en mémoire et en cache) et
+/// les **stockeurs** de la clé (`should_store_denylist_record` refuse un
+/// rejeu rétrogradé lors du `PutRecord` entrant, finding I1) contre un rejeu
+/// d'une version antérieure. Il ne protège PAS un nœud neuf au cache vide qui
+/// interrogerait un pair dont le store aurait été rétrogradé avant que ce
+/// correctif ne s'applique partout : c'est une limite connue de la
+/// distribution par record Kademlia, pas une garantie absolue — voir ADR 0011.
 async fn fetch_verified_denylist_from_dht(
     cmd_tx: &mpsc::Sender<Command>,
     issuer: PeerId,
@@ -3544,24 +3566,36 @@ fn denylist_record_key(peer: &PeerId) -> RecordKey {
 /// correspond au `<peerid>` de la clé. Un tiers ne peut donc pas écraser la
 /// liste d'un éditeur (même garantie que pour un feed), ni faire stocker une
 /// liste géante : la taille est bornée par [`crate::moderation::MAX_DENYLIST_SIZE`]
-/// avant tout parsing.
-fn is_valid_denylist_record(record: &kad::Record) -> bool {
-    let Some(peer_bytes) = record.key.as_ref().strip_prefix(DENYLIST_KEY_PREFIX) else {
-        return false;
-    };
-    let Ok(expected_issuer) = PeerId::from_bytes(peer_bytes) else {
-        return false;
-    };
+/// avant tout parsing. Renvoie la liste parsée pour que l'appelant puisse en
+/// comparer le `seq` avec ce qui est déjà stocké (finding I1, revue finale
+/// 2026-09-06) sans reparser.
+fn parse_valid_denylist_record(record: &kad::Record) -> Option<Denylist> {
+    let peer_bytes = record.key.as_ref().strip_prefix(DENYLIST_KEY_PREFIX)?;
+    let expected_issuer = PeerId::from_bytes(peer_bytes).ok()?;
     if record.value.len() > crate::moderation::MAX_DENYLIST_SIZE {
-        return false;
+        return None;
     }
-    let Ok(text) = std::str::from_utf8(&record.value) else {
-        return false;
-    };
-    let Ok(list) = Denylist::from_json(text) else {
-        return false;
-    };
-    list.verify().is_ok() && list.issuer_peer_id().ok() == Some(expected_issuer)
+    let text = std::str::from_utf8(&record.value).ok()?;
+    let list = Denylist::from_json(text).ok()?;
+    if list.verify().is_ok() && list.issuer_peer_id().ok() == Some(expected_issuer) {
+        Some(list)
+    } else {
+        None
+    }
+}
+
+/// Décide si un record de denylist entrant, déjà validé (signature + liaison
+/// clé↔émetteur), doit remplacer la version actuellement stockée pour cet
+/// éditeur. Un `seq` strictement inférieur au `seq` stocké est un
+/// **rejeu d'une version antérieure** (authentique mais périmée, possiblement
+/// plus permissive) et doit être refusé (finding I1) — un `seq` égal est
+/// accepté (idempotent), un `seq` supérieur toujours accepté. Absence de
+/// version stockée → toujours accepté (premier record pour cette clé).
+fn should_store_denylist_record(incoming: &Denylist, stored: Option<&Denylist>) -> bool {
+    match stored {
+        Some(stored) => incoming.seq >= stored.seq,
+        None => true,
+    }
 }
 
 /// Valide un record DHT entrant avant stockage : la clé doit être une clé de
@@ -3901,7 +3935,31 @@ impl EventLoop {
                 record: Some(record),
                 ..
             } => {
-                if is_valid_feed_record(&record) || is_valid_denylist_record(&record) {
+                if let Some(incoming) = parse_valid_denylist_record(&record) {
+                    // Finding I1 (revue finale 2026-09-06) : sans cette
+                    // comparaison, un rejeu d'une ANCIENNE liste authentique
+                    // écraserait, chez les stockeurs de cette clé, une version
+                    // plus récente et potentiellement plus restrictive — un
+                    // nœud neuf (cache vide) qui la récupère ensuite verrait
+                    // un ban de clé levé. Un `seq` égal reste accepté
+                    // (idempotent).
+                    let key = record.key.clone();
+                    let stored = self
+                        .swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .store_mut()
+                        .get(&key)
+                        .and_then(|r| parse_valid_denylist_record(&r));
+                    if should_store_denylist_record(&incoming, stored.as_ref()) {
+                        if let Err(e) = self.swarm.behaviour_mut().kademlia.store_mut().put(record)
+                        {
+                            tracing::debug!("record DHT refusé par le store: {e}");
+                        }
+                    } else {
+                        tracing::debug!("record de denylist rétrogradé ignoré");
+                    }
+                } else if is_valid_feed_record(&record) {
                     if let Err(e) = self.swarm.behaviour_mut().kademlia.store_mut().put(record) {
                         tracing::debug!("record DHT refusé par le store: {e}");
                     }
@@ -4154,29 +4212,64 @@ mod tests {
         let other_peer = Keypair::generate_ed25519().public().to_peer_id();
 
         assert!(
-            is_valid_denylist_record(&kad::Record::new(
+            parse_valid_denylist_record(&kad::Record::new(
                 denylist_record_key(&issuer_peer),
                 value.clone(),
-            )),
+            ))
+            .is_some(),
             "liste signée sous la clé de son propre éditeur → acceptée"
         );
         assert!(
-            !is_valid_denylist_record(&kad::Record::new(
+            parse_valid_denylist_record(&kad::Record::new(
                 denylist_record_key(&other_peer),
                 value.clone(),
-            )),
+            ))
+            .is_none(),
             "la même liste sous la clé d'un AUTRE PeerId → refusée"
         );
         assert!(
-            !is_valid_denylist_record(&kad::Record::new(
+            parse_valid_denylist_record(&kad::Record::new(
                 denylist_record_key(&issuer_peer),
                 vec![b'x'; crate::moderation::MAX_DENYLIST_SIZE + 1],
-            )),
+            ))
+            .is_none(),
             "valeur au-delà de MAX_DENYLIST_SIZE → refusée avant tout parsing"
         );
         assert!(
-            !is_valid_denylist_record(&kad::Record::new(feed_record_key(&issuer_peer), value,)),
+            parse_valid_denylist_record(&kad::Record::new(feed_record_key(&issuer_peer), value,))
+                .is_none(),
             "une liste sous une clé de feed n'est pas un record de denylist"
+        );
+    }
+
+    /// Finding I1 (revue finale 2026-09-06) : un record de denylist entrant
+    /// authentique mais de `seq` STRICTEMENT inférieur à celui déjà stocké
+    /// pour cette clé doit être refusé — sinon un rejeu d'une ancienne liste
+    /// authentique (récupérable dans la DHT) écraserait une version plus
+    /// récente et potentiellement plus restrictive.
+    #[test]
+    fn denylist_record_downgrade_is_rejected() {
+        let issuer = Keypair::generate_ed25519();
+        let old =
+            Denylist::build_signed("l", "2026-09-06T00:00:00Z", &issuer, 1, &[], &[]).unwrap();
+        let new =
+            Denylist::build_signed("l", "2026-09-06T00:01:00Z", &issuer, 2, &[], &[]).unwrap();
+
+        assert!(
+            should_store_denylist_record(&new, Some(&old)),
+            "seq supérieur au stocké → accepté"
+        );
+        assert!(
+            should_store_denylist_record(&new, Some(&new)),
+            "seq égal au stocké → accepté (idempotent)"
+        );
+        assert!(
+            !should_store_denylist_record(&old, Some(&new)),
+            "seq strictement inférieur au stocké → REJETÉ (rétrogradation)"
+        );
+        assert!(
+            should_store_denylist_record(&new, None),
+            "aucune version stockée → toujours accepté"
         );
     }
 

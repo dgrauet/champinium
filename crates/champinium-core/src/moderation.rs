@@ -378,12 +378,21 @@ pub fn denylist_cache_dir(root: &Path) -> PathBuf {
 
 /// Persiste une denylist signée dans le cache disque, sous
 /// `<root>/.denylists/<peerid>.json`.
+///
+/// Écriture atomique (fichier temporaire puis rename, même patron que
+/// [`crate::blockstore::Blockstore::put`], minor M4 de la revue finale
+/// 2026-09-06) : une coupure en cours d'écriture ne laisse jamais de fichier
+/// tronqué qui serait silencieusement ignoré — et donc perdrait la protection
+/// hors ligne de cet éditeur — au prochain démarrage.
 pub fn save_cached_list(root: &Path, list: &Denylist) -> CoreResult<()> {
     let dir = denylist_cache_dir(root);
     std::fs::create_dir_all(&dir)?;
     let json =
         serde_json::to_string(list).map_err(|e| CoreError::Moderation(format!("json: {e}")))?;
-    std::fs::write(dir.join(format!("{}.json", list.issuer_peer_id()?)), json)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
+    std::io::Write::write_all(&mut tmp, json.as_bytes())?;
+    tmp.persist(dir.join(format!("{}.json", list.issuer_peer_id()?)))
+        .map_err(|e| CoreError::Io(e.error))?;
     Ok(())
 }
 
