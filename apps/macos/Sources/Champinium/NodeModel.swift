@@ -79,6 +79,8 @@ final class NodeModel: ObservableObject {
     @Published var searchHits: [FfiSearchHit] = []
     @Published var storageStats = FfiStorageStats(usedBytes: 0, quotaBytes: 0)
     @Published var coldRetrievalEnabled: Bool = true
+    @Published var mdnsEnabled: Bool = true
+    @Published var peerCount: UInt32 = 0
     @Published var player: AVPlayer?
     @Published var streamProgress: String = ""
 
@@ -88,6 +90,7 @@ final class NodeModel: ObservableObject {
     private var moderationListener: ModerationListener?
     private var currentStreamId: UInt64?
     private var streamListener: StreamListener?
+    private var peerCountTask: Task<Void, Never>?
 
     /// Résultat de `start()` une fois terminé (vrai = nœud ouvert), `nil` tant
     /// qu'il tourne. Voir `waitUntilStarted()`.
@@ -136,9 +139,37 @@ final class NodeModel: ObservableObject {
             await node.setModerationListener(listener: moderationRefresher)
             status = "nœud en ligne"
             refreshModeration()
+            mdnsEnabled = node.mdnsEnabled()
+            // Amorçage best-effort : ne bloque jamais le démarrage de l'UI ni
+            // n'échoue de façon visible — le champ « Connecter » manuel reste
+            // le chemin de secours.
+            Task { [weak self] in
+                _ = try? await node.bootstrap()
+                await self?.refreshPeerCount()
+            }
+            startPeerCountTimer()
         } catch {
             status = "erreur d'ouverture: \(error)"
         }
+    }
+
+    /// Rafraîchit le compteur de pairs connectés toutes les 10 s, en plus du
+    /// rafraîchissement immédiat après l'amorçage et à chaque tic du
+    /// catalogue (voir `refreshCatalog()`).
+    private func startPeerCountTimer() {
+        peerCountTask?.cancel()
+        peerCountTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                guard !Task.isCancelled else { return }
+                await self?.refreshPeerCount()
+            }
+        }
+    }
+
+    private func refreshPeerCount() async {
+        guard let node else { return }
+        peerCount = await (try? node.connectedPeers()) ?? peerCount
     }
 
     /// Attend la fin de `start()` et rend vrai si le nœud est ouvert.
@@ -188,6 +219,7 @@ final class NodeModel: ObservableObject {
         storageStats = node?.storageStats() ?? FfiStorageStats(usedBytes: 0, quotaBytes: 0)
         coldRetrievalEnabled = node?.coldRetrievalEnabled() ?? true
         status = "catalogue: \(entries.count) créateur(s)"
+        Task { [weak self] in await self?.refreshPeerCount() }
     }
 
     /// Relit les sources de denylist suivies (liste projet verrouillée +
@@ -235,6 +267,14 @@ final class NodeModel: ObservableObject {
         guard let node else { return }
         try node.setColdRetrieval(enabled: enabled)
         refreshCatalog()
+    }
+
+    /// Active/désactive la découverte mDNS sur le réseau local. Effet au
+    /// prochain démarrage (le comportement en cours reste inchangé).
+    func setMdns(_ enabled: Bool) async throws {
+        guard let node else { return }
+        try node.setMdns(enabled: enabled)
+        mdnsEnabled = node.mdnsEnabled()
     }
 
     /// Épingle un manifeste (exempté d'éviction par le seed proactif).
