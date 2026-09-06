@@ -15,7 +15,7 @@ UI. Consomme les bindings Swift générés à partir du contrat UniFFI.
 ## Interfaces
 
 - **Consomme** : module Swift `ChampiniumCore` + `ChampiniumCoreFFI.xcframework`
-  générés par `just macos-prepare` (**non commités**). Contrat actuel **v12** :
+  générés par `just macos-prepare` (**non commités**). Contrat actuel **v13** :
   objet `ChampiniumNode` (`openNode`, `listen`, `connect`, `catalog`,
   `ingestFile`, `publishFeedWith`, `openStream`/`closeStream`/`streamStatus`,
   `setStreamListener`, …) + record `FfiCatalogEntry`. `fetchHls` a été retiré

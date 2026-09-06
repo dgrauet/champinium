@@ -16,7 +16,7 @@ pour le seeding hors UI. Consomme les bindings C# générés par `uniffi-bindgen
 
 - **Consomme** : bindings C# `Champinium.Core` générés par `just gen-csharp`
   (`bindings/csharp/`, **non commité**) + la `champinium_core.dll`. Contrat
-  actuel **v12** : objet `ChampiniumNode` (`OpenNode`, `PeerId`, `Catalog`,
+  actuel **v13** : objet `ChampiniumNode` (`OpenNode`, `PeerId`, `Catalog`,
   `Listen`, `Connect`, `IngestFile`, `PublishFeedWith`, `OpenStream`/
   `CloseStream`/`StreamStatus`, `SetStreamListener`, …), record
   `FfiCatalogEntry { Issuer, Seq, Cids }`, erreur `FfiError`. `FetchHls` a été

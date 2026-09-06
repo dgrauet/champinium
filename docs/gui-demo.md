@@ -128,9 +128,10 @@ Sur les deux mêmes machines, valider la distribution réseau d'une denylist :
    clé `editeur.key` (ou `champinium://denylist/<peerid>`) dans le volet
    « Listes de modération » → **Suivre** (ou `champinium-cli denylist follow
    <lien-ou-peerid> --peer <adresse-A>`).
-3. ✅ **Suivi périodique** : dans la minute qui suit (`FOLLOW_INTERVAL`), le
-   channel de l'émetteur banni disparaît des vues de B (Abonnements et
-   Explorer), sans action supplémentaire côté B.
+3. ✅ **Suivi périodique** : dès la souscription (fetch immédiat), puis à
+   chaque intervalle de suivi (5 min, `FOLLOW_INTERVAL`), le channel de
+   l'émetteur banni disparaît des vues de B (Abonnements et Explorer), sans
+   action supplémentaire côté B.
 4. ✅ **Redémarrage hors ligne** : couper A, **fermer puis rouvrir** l'app de
    B. Le channel banni reste absent — le cache (`.denylists/<peerid>.json`)
    protège avant tout accès réseau.

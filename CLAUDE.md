@@ -129,7 +129,9 @@ Kademlia (provider records), identify, ping et un protocole request-response
   compilée dans le binaire (non désactivable) + denylists signées Ed25519
   souscrites (modèle fédéré, signature vérifiée). Enforcement aux trois points :
   ingestion (`add`), réception (`get`), service (requête entrante). CLI :
-  `--denylist <fichier>`. Voir [`deny/README.md`](deny/README.md).
+  `denylist follow <lien-ou-peerid>` (clé projet compilée toujours souscrite
+  d'office, non retirable ; voir modération réputationnelle plus bas). Voir
+  [`deny/README.md`](deny/README.md).
 - **Feeds signés + gossipsub + catalogue ✔** : `feed` (record `champinium-feed/v1`
   signé Ed25519, versionné par `seq`), diffusé en **gossipsub** ; `catalog` (CRDT
   maison last-writer-wins par émetteur) reconstruit en écoutant. Node :
