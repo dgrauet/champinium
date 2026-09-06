@@ -2,8 +2,10 @@
 //!
 //! Depuis le retrait de seed-what-you-consume (spec channels lot c), le démon
 //! ne fait plus que **resservir ce qu'il détient déjà** : au démarrage et
-//! périodiquement, il **réannonce** tous ses CIDs dans la DHT (provider
-//! records) ET **republie** les feeds SIGNÉS qu'il détient légitimement (le
+//! périodiquement, il **réannonce** dans la DHT (provider records) les ROOTS
+//! qu'il détient (blockstore moins les segments indexés par une publication —
+//! annonce par racine, ADR 0012 : un segment n'est plus annoncé
+//! individuellement) ET **republie** les feeds SIGNÉS qu'il détient légitimement (le
 //! sien s'il a publié, ceux de ses abonnements — voir
 //! `Node::republish_known_feeds`). Il ne PUBLIE (crée/incrémente `seq`)
 //! toujours PAS de feed — ça reste le rôle du nœud créateur, pas du démon de
@@ -87,15 +89,16 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Réannonce tous les CIDs détenus (provider records) PUIS republie les feeds
-/// signés détenus légitimement (le sien + ses abonnements — voir
-/// `Node::republish_known_feeds`). La PUBLICATION d'un feed (créer/incrémenter
-/// `seq`) n'appartient PAS au démon — c'est le nœud créateur qui publie ce
-/// qu'il crée ; le démon de seeding ne fait que resservir/réannoncer ce qu'il
-/// détient déjà, feeds compris.
+/// Réannonce les ROOTS détenus (provider records — blockstore moins les
+/// segments indexés par une publication, annonce par racine, ADR 0012) PUIS
+/// republie les feeds signés détenus légitimement (le sien + ses
+/// abonnements — voir `Node::republish_known_feeds`). La PUBLICATION d'un
+/// feed (créer/incrémenter `seq`) n'appartient PAS au démon — c'est le nœud
+/// créateur qui publie ce qu'il crée ; le démon de seeding ne fait que
+/// resservir/réannoncer ce qu'il détient déjà, feeds compris.
 async fn reseed(node: &Node) {
     match node.reprovide_all().await {
-        Ok(n) => tracing::info!("réannonce de {n} CID(s)"),
+        Ok(n) => tracing::info!("réannonce de {n} root(s)"),
         Err(e) => tracing::warn!("réannonce échouée: {e}"),
     }
     match node.republish_known_feeds().await {

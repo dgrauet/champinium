@@ -331,6 +331,34 @@ async fn fallback_disabled_propagates_no_providers() {
     );
 }
 
+/// (3 bis, I1/M4, revue finale) Sous un indice de racine (`root = Some`) —
+/// jamais exercé avant cette régression — un segment dont AUCUN fournisseur
+/// du manifeste ne dispose (nœud isolé, donc les deux requêtes DHT root/CID
+/// nu échouent également) doit rendre `NoProviders`, ce qui rebranche
+/// exactement le repli froid : `get_from` (API publique, `root: Option<Cid>`)
+/// sert le contenu depuis la gateway simulée malgré l'absence totale de
+/// fournisseur P2P.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallback_serves_bytes_for_a_segment_under_root_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = b"segment uniquement au froid, indice de racine fourni".to_vec();
+    let cid = cid_for(&bytes);
+    let root = cid_for(b"manifeste sans aucun fournisseur connu");
+
+    let node = solo_node(dir.path(), "solo_root").await;
+    let cold = Arc::new(MockColdStore {
+        cid,
+        bytes: bytes.clone(),
+    });
+    let node = node.with_cold_for_tests(cold);
+
+    let got = node
+        .get_from(cid, Some(root))
+        .await
+        .expect("le repli froid doit servir le segment malgré l'indice de racine");
+    assert_eq!(got, bytes);
+}
+
 /// (4) Un contenu en denylist récupéré depuis le froid reste refusé —
 /// checkpoint modération #2 inchangé, qu'il vienne du P2P ou du froid.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
