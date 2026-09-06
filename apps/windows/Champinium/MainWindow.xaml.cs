@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Media;
 using Windows.ApplicationModel.DataTransfer;
 using Windows.Media.Core;
 using Windows.Media.Playback;
@@ -238,6 +239,20 @@ public sealed partial class MainWindow : Window
                 {
                     list.Children.Add(new TextBlock { Text = item.TagsText, FontSize = 11, Opacity = 0.7 });
                 }
+
+                var provenanceRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
+                provenanceRow.Children.Add(new Border
+                {
+                    CornerRadius = new CornerRadius(8),
+                    Padding = new Thickness(6, 1, 6, 1),
+                    Background = (Brush)Application.Current.Resources["AccentFillColorTertiaryBrush"],
+                    Child = new TextBlock { Text = item.ProvenanceLabel, FontSize = 11, FontWeight = FontWeights.SemiBold },
+                });
+                if (item.ToolsText.Length > 0)
+                {
+                    provenanceRow.Children.Add(new TextBlock { Text = item.ToolsText, FontSize = 11, Opacity = 0.7 });
+                }
+                list.Children.Add(provenanceRow);
             }
             content.Children.Add(new ScrollViewer { Content = list, MaxHeight = 220 });
         }

@@ -101,6 +101,13 @@
                                                    Style="{StaticResource CaptionTextBlockStyle}"
                                                    Foreground="{ThemeResource TextFillColorTertiaryBrush}"
                                                    TextWrapping="NoWrap" />
+                                        <StackPanel Orientation="Horizontal" Spacing="6">
+                                            <Border CornerRadius="8" Padding="6,1" Background="{ThemeResource AccentFillColorTertiaryBrush}">
+                                                <TextBlock Text="{Binding ProvenanceLabel}" Style="{StaticResource CaptionTextBlockStyle}" FontWeight="SemiBold" />
+                                            </Border>
+                                            <TextBlock Text="{Binding ToolsText}" Style="{StaticResource CaptionTextBlockStyle}"
+                                                       Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                                        </StackPanel>
                                     </StackPanel>
                                     <!-- Pin par publication (lot c) — masqué côté Explorer,
                                          voir CatalogCid.CanPin. -->
@@ -254,6 +261,13 @@
                                        Style="{StaticResource CaptionTextBlockStyle}"
                                        Foreground="{ThemeResource TextFillColorTertiaryBrush}"
                                        TextWrapping="NoWrap" />
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <Border CornerRadius="8" Padding="6,1" Background="{ThemeResource AccentFillColorTertiaryBrush}">
+                                    <TextBlock Text="{Binding ProvenanceLabel}" Style="{StaticResource CaptionTextBlockStyle}" FontWeight="SemiBold" />
+                                </Border>
+                                <TextBlock Text="{Binding ToolsText}" Style="{StaticResource CaptionTextBlockStyle}"
+                                           Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                            </StackPanel>
                         </StackPanel>
                         <Button Grid.Column="1" Content="Lire"
                                 Tag="{Binding Cid}" Click="OnPlayClick" />
