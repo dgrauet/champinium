@@ -74,9 +74,16 @@ Laisser la commande tourner (elle sert le contenu et rediffuse le feed).
 
 ## 2. Machine B — l'app GUI
 
-1. Lancer l'app. Vérifier l'en-tête : « nœud en ligne » + PeerId affiché.
-2. Coller l'adresse de A dans le champ `/ip4/…/tcp/…/p2p/<peerid>` →
-   **Connecter**.
+1. Lancer l'app. Vérifier l'en-tête : « nœud en ligne » + PeerId affiché, et
+   le compteur « réseau : n pair(s) » qui progresse tout seul dans les
+   quelques secondes qui suivent.
+2. ✅ **Découverte automatique sur le même LAN (ADR 0013, mDNS)** : A et B
+   étant sur le même réseau local, B **n'a rien à coller** — mDNS trouve A de
+   lui-même (compteur de pairs à 1+, puis le catalogue). Le champ
+   `/ip4/…/tcp/…/p2p/<peerid>` → **Connecter** reste disponible et utile
+   quand mDNS est débrayé (réglage « Découverte sur le réseau local »), sur
+   un réseau qui bloque le multicast, ou pour connecter deux machines qui ne
+   sont pas sur le même LAN.
 3. ✅ **Découverte réactive** : le catalogue apparaît de lui-même en ~1–3 s
    (aucun bouton à presser — c'est le flux d'événements du contrat v3).
    L'entrée montre « Démo Champinium » avec ses tags `demo · nature`.
@@ -167,6 +174,13 @@ Ctrl-C ferme la session (`close_stream`) et purge le cache de lecture.
   0.0.0.0), le pare-feu de A (port 4711 entrant), et que la commande `ingest`
   de A tourne toujours. Le statut « connexion : … » en bas de l'app donne
   l'erreur typée (réseau vs entrée invalide).
+- **mDNS ne trouve pas A** (compteur de pairs bloqué à 0) : réseau qui bloque
+  le multicast (VPN, certains Wi-Fi invités, isolation client-à-client sur le
+  point d'accès), ou réglage « Découverte sur le réseau local » désactivé sur
+  B. Coller l'adresse manuellement (étape 2) reste la voie de repli — c'est
+  aussi la seule validation deux-machines réelle du comportement mDNS, le
+  test automatisé équivalent étant `#[ignore]` en CI (multicast bloqué sur
+  les runners, ADR 0013).
 - **Lecture noire / muette sur Linux** : plugins GStreamer manquants
   (`gstreamer1.0-libav`, `-plugins-good`, `-plugins-bad`).
 - **« introuvable » au clic Lire** : A s'est arrêté avant que B ait récupéré —

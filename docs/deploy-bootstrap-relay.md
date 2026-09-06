@@ -117,6 +117,29 @@ Idem pour le relay en remplaçant le binaire, le port (4201) et le
   cadre DSA/UE) — un opérateur de bootstrap/relay fournit de la connectivité,
   pas du contenu.
 
+## Être embarqué dans la liste par défaut (ADR 0013)
+
+Un nœud lancé via `champinium-cli serve --bootstrap …` ou `--bootstrap` sur
+`champinium-seed` ne compose que ponctuellement, sans persister l'adresse.
+Pour qu'un bootstrap serve **tout nouveau nœud sans configuration**, il faut
+l'ajouter à la liste compilée dans le binaire :
+[`bootstrap/default.peers`](../bootstrap/default.peers) — vide aujourd'hui,
+aucun bootstrap public n'existe encore.
+
+Procédure : ouvrir une PR ajoutant une ligne `/…/p2p/<peerid>` à ce fichier,
+avec dans la description un engagement de disponibilité (uptime visé,
+contact opérateur). Le nœud doit écouter sur le port **4101/tcp** ci-dessus
+et rester stateless. Voir [`bootstrap/README.md`](../bootstrap/README.md).
+
+Cette liste **n'est pas signée** : contrairement à la denylist projet
+(ADR 0011), l'intégrité repose sur la chaîne de confiance du binaire
+lui-même (build reproductible, release signée), pas sur un mécanisme
+cryptographique séparé — un bootstrap malveillant ne peut que refuser de
+répondre ou fournir de faux pairs, jamais falsifier du contenu
+(content-addressed, vérifié par CID). Publier en `/dns4/<hôte>/tcp/4101/p2p/…`
+plutôt qu'une IP figée est préférable : le transport résout désormais les
+noms d'hôte (ADR 0013).
+
 ## Mise à niveau — DHT dédiée (ADR 0012)
 
 Depuis cette version, le protocole Kademlia du réseau est

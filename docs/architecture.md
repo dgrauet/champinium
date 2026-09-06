@@ -2,7 +2,7 @@
 
 > Public : quiconque veut comprendre comment le projet fonctionne de bout en
 > bout. Les renvois pointent vers le code (chemins cliquables) et les ADRs
-> (`docs/adr/`) pour les décisions. État au contrat FFI **v13** (voir
+> (`docs/adr/`) pour les décisions. État au contrat FFI **v14** (voir
 > `.release-please-manifest.json` / `CHANGELOG.md` pour la version de release
 > — elle dérive, pas de version en dur ici, cf. `CLAUDE.md`).
 
@@ -47,6 +47,13 @@ Deux principes non négociables en découlent :
 - Le **relay** ([`infra/relay`](../infra/relay)) fait de la mise en relation
   NAT (circuit relay v2) et assiste le hole punching (DCUtR) ; il ne voit pas
   le contenu en clair. Guide opérateur : [`deploy-bootstrap-relay.md`](deploy-bootstrap-relay.md).
+- **Découverte automatique (ADR 0013)** : un nœud compose vers une liste de
+  bootstraps compilée (`bootstrap/default.peers`, vide tant qu'aucun n'est
+  publié) ∪ persistée par l'utilisateur (`Node::bootstrap()`, appelé par les
+  fronts et démons après `listen`), et se découvre sans rien coller avec tout
+  pair sur le même réseau local via **mDNS** (débrayable, réglage
+  « Découverte sur le réseau local »). Le transport résout aussi `/dns4/`,
+  `/dns6/`, `/dnsaddr/` : un bootstrap public référençable par nom d'hôte.
 
 ## 3. Le noyau Rust : toute la logique, un seul endroit
 
@@ -116,6 +123,8 @@ Comportements libp2p et leurs rôles :
 | **request-response** (cbor) | transfert de blocs `/champinium/block/1.0.0` (interim — bitswap différé, ADR 0006), plafonds 64 MiB/bloc |
 | **relay-client + DCUtR** | écouter/joindre via un relais et tenter le direct (NAT) |
 | **identify / ping** | peuplement de la table de routage / liveness |
+| **mDNS** (`Toggle`, débrayable, ADR 0013) | découverte des pairs sur le réseau local (multicast) — un pair trouvé est ajouté à la table Kademlia et composé, best-effort |
+| **transport DNS** (`with_dns()`, feature `dns`) | résolution des multiaddrs `/dns4/`, `/dns6/`, `/dnsaddr/` au dial — pas un `Behaviour`, une couche du transport |
 
 ## 5. Les données et leurs formats
 
@@ -779,16 +788,18 @@ qui compte vit dans le réseau, chaque nœud n'en garde qu'une vue.
 | Provenance déclarée | déclaration obligatoire et signée par entrée (mode + outils), feed v4, `publish_feed` sans métadonnées retiré du FFI — **implémenté** (contrat FFI v12) | §5, §8, [ADR 0010](adr/0010-declared-provenance.md) |
 | Modération réputationnelle | ancre de confiance compilée (`deny/project.issuer`) + denylist v3 distribuée par le réseau (`seq` signé, LWW, cache hors ligne, suivi périodique), souscription par fichier JSON retirée du FFI — **implémenté** (contrat FFI v13) | §7, [ADR 0011](adr/0011-reputational-moderation.md) |
 | Hygiène DHT | DHT Champinium **séparée** de la DHT IPFS publique (protocole dédié `/champinium/kad/1.0.0`) ; annonce par **racine** seule (manifestes, blocs nus, CIDs de feed/tag) — un segment sans indice de racine n'est plus découvrable seul (`get --root`) — **implémenté**, contrat FFI inchangé | §4, §6, [ADR 0012](adr/0012-dedicated-dht-and-root-providing.md) |
+| Découverte initiale | bootstraps compilés (liste vide tant qu'aucun n'est publié) ∪ persistés, `Node::bootstrap()` appelé par les fronts/démons après `listen` ; mDNS débrayable ; transport DNS (`/dns4/`, `/dns6/`, `/dnsaddr/`) — **implémenté** (contrat FFI v14) | §2, §4, [ADR 0013](adr/0013-bootstrap-discovery.md) |
 
 ## 12. Carte des documents
 
 - [`CLAUDE.md`](../CLAUDE.md) — principes + état d'avancement (source de vérité).
-- [`AGENTS.md`](../AGENTS.md) — contrat FFI (tableau v13) + garde-fous d'équipe.
+- [`AGENTS.md`](../AGENTS.md) — contrat FFI (tableau v14) + garde-fous d'équipe.
 - [`docs/adr/`](adr/) — décisions : libp2p vs iroh (0001), modération côté
   nœud (0002, partiellement remplacé par 0011), feeds signés (0003), transport
   de blocs (0006), IPNS (0007), stockage froid Arweave (0008), lecture
   progressive par serveur HLS local (0009), provenance déclarée (0010),
-  modération réputationnelle (0011), DHT dédiée et annonce par racine (0012)…
+  modération réputationnelle (0011), DHT dédiée et annonce par racine (0012),
+  découverte initiale (0013)…
 - [`docs/mvp-demo.md`](mvp-demo.md) / [`docs/gui-demo.md`](gui-demo.md) —
   démos de bout en bout (CLI validée ; GUI deux machines à dérouler).
 - [`docs/deploy-bootstrap-relay.md`](deploy-bootstrap-relay.md) — opérer
