@@ -169,7 +169,7 @@ async fn republish_known_feeds_skips_blocked_issuer() {
     // intact (`purge_blocked_issuer` ne touche pas `subscriptions`).
     let signer = Keypair::generate_ed25519();
     let list =
-        Denylist::build_signed("test-list", "2026-07-23", &signer, &[], &[victim_peer]).unwrap();
+        Denylist::build_signed("test-list", "2026-07-23", &signer, 1, &[], &[victim_peer]).unwrap();
     node.subscribe_denylist(&list).await.unwrap();
 
     // Réinjection directe du feed au catalogue (test uniquement, bypasse la

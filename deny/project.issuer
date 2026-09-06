@@ -1,0 +1,6 @@
+# PeerId (base58) de l'éditeur de la liste de modération projet.
+# La liste signée correspondante est publiée dans la DHT sous
+# /champinium/denylist/<ce PeerId> et récupérée par chaque nœud.
+# Clé privée : hors dépôt (voir deny/README.md). Valeur PROVISOIRE (Task 1),
+# remplacée par la vraie clé projet (Task 6).
+12D3KooWJtMRdnYaZgSyi3KTLaa5DN6mCAcpfwaTXgD1PHo997ej

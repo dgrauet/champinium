@@ -1,14 +1,16 @@
 //! Moteur de modération — garde-fou OBLIGATOIRE, actif par défaut.
 //!
 //! Sur un réseau décentralisé, la suppression centrale est impossible : la
-//! modération est donc côté nœud. Deux mécanismes :
+//! modération est donc côté nœud, via des **denylists signées souscrites**
+//! (modèle fédéré) : objets signés Ed25519 qu'un nœud choisit de suivre ; leur
+//! signature est **vérifiée** avant prise en compte. Format
+//! `champinium-denylist/v3` — v2/v1 sont supprimés : politique zéro-compat déjà
+//! appliquée aux feeds (`champinium-feed/v3`).
 //!
-//! 1. **Denylist par défaut** compilée dans le binaire (inaltérable à l'exécution,
-//!    donc non désactivable) — voir `deny/default.cids`.
-//! 2. **Denylists signées souscrites** (modèle fédéré) : objets signés Ed25519
-//!    qu'un nœud choisit de suivre ; leur signature est **vérifiée** avant prise
-//!    en compte. Format `champinium-denylist/v2` — v1 (CIDs seuls) est supprimé :
-//!    politique zéro-compat déjà appliquée aux feeds (`champinium-feed/v3`).
+//! Le binaire embarque uniquement la **clé** de l'éditeur de la liste projet
+//! ([`PROJECT_ISSUER`] / [`project_issuer`]), pas la liste elle-même : la liste
+//! signée est récupérée sur le réseau (DHT) et peut être mise à jour sans
+//! nouvelle release (spec 2026-09-06, ADR 0011).
 //!
 //! L'enforcement se fait à deux checkpoints (voir [`crate::p2p::Node`]) :
 //! - **#1 ingestion** : refus de publier un contenu matché ;
@@ -27,13 +29,33 @@ use std::collections::HashSet;
 use std::str::FromStr;
 
 /// Identifiant de schéma de denylist.
-pub const SCHEMA: &str = "champinium-denylist/v2";
+pub const SCHEMA: &str = "champinium-denylist/v3";
 
 /// Nombre maximal d'entrées (CIDs + clés cumulés) dans une denylist — borne
 /// anti-abus, absente en v1, posée avec l'ajout des entrées de clés.
 pub const MAX_DENYLIST_ENTRIES: usize = 65_536;
 
-/// Denylist signée souscrite (format `champinium-denylist/v2`).
+/// Taille max d'une liste (JSON, octets) — record DHT et parsing.
+pub const MAX_DENYLIST_SIZE: usize = 1_048_576;
+
+/// PeerId de l'éditeur de la LISTE PROJET, compilé dans le binaire (spec
+/// 2026-09-06, ADR 0011). Le binaire embarque la clé, pas la liste : la liste
+/// signée est récupérée dans la DHT et mise à jour sans release.
+pub const PROJECT_ISSUER: &str = include_str!("../../../deny/project.issuer");
+
+/// Parse [`PROJECT_ISSUER`] (lignes vides et `#` ignorées). Une valeur
+/// invalide est une erreur de build : `Node::open` échoue.
+pub fn project_issuer() -> CoreResult<PeerId> {
+    let line = PROJECT_ISSUER
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .ok_or_else(|| CoreError::Moderation("deny/project.issuer vide".into()))?;
+    PeerId::from_str(line)
+        .map_err(|e| CoreError::Moderation(format!("deny/project.issuer invalide: {e}")))
+}
+
+/// Denylist signée souscrite (format `champinium-denylist/v3`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Denylist {
     /// Identifiant de schéma ; doit valoir [`SCHEMA`].
@@ -42,6 +64,9 @@ pub struct Denylist {
     pub name: String,
     /// Clé publique Ed25519 de l'émetteur (protobuf libp2p, encodé base64).
     pub issuer_pubkey: String,
+    /// Numéro de séquence signé : permet de rejeter un rejeu d'une version
+    /// antérieure de la liste par un tiers qui la relaierait.
+    pub seq: u64,
     /// Horodatage de mise à jour (RFC 3339).
     pub updated: String,
     /// CIDs bloqués (chaînes CIDv1).
@@ -65,6 +90,7 @@ impl Denylist {
         push_field(&mut buf, self.schema.as_bytes());
         push_field(&mut buf, self.name.as_bytes());
         push_field(&mut buf, self.updated.as_bytes());
+        push_field(&mut buf, &self.seq.to_le_bytes());
         let mut entries = self.entries.clone();
         entries.sort();
         push_field(&mut buf, &(entries.len() as u64).to_le_bytes());
@@ -85,6 +111,7 @@ impl Denylist {
         name: &str,
         updated: &str,
         issuer: &Keypair,
+        seq: u64,
         entries: &[Cid],
         keys: &[PeerId],
     ) -> CoreResult<Self> {
@@ -92,6 +119,7 @@ impl Denylist {
             schema: SCHEMA.to_string(),
             name: name.to_string(),
             issuer_pubkey: B64.encode(issuer.public().encode_protobuf()),
+            seq,
             updated: updated.to_string(),
             entries: entries.iter().map(|c| c.to_string()).collect(),
             key_entries: keys.iter().map(|k| k.to_string()).collect(),
@@ -104,8 +132,13 @@ impl Denylist {
         Ok(dl)
     }
 
-    /// Parse une denylist depuis du JSON.
+    /// Parse une denylist depuis du JSON. Refuse tout document dépassant
+    /// [`MAX_DENYLIST_SIZE`] octets avant même de tenter le parsing (borne
+    /// anti-abus sur un record potentiellement reçu depuis la DHT).
     pub fn from_json(json: &str) -> CoreResult<Self> {
+        if json.len() > MAX_DENYLIST_SIZE {
+            return Err(CoreError::Moderation("denylist trop volumineuse".into()));
+        }
         serde_json::from_str(json).map_err(|e| CoreError::Moderation(format!("json: {e}")))
     }
 
@@ -142,6 +175,16 @@ impl Denylist {
         }
     }
 
+    /// PeerId de l'émetteur, dérivé de `issuer_pubkey`.
+    pub fn issuer_peer_id(&self) -> CoreResult<PeerId> {
+        let pk_bytes = B64
+            .decode(&self.issuer_pubkey)
+            .map_err(|e| CoreError::Moderation(format!("clé base64: {e}")))?;
+        let pk = PublicKey::try_decode_protobuf(&pk_bytes)
+            .map_err(|e| CoreError::Moderation(format!("clé invalide: {e}")))?;
+        Ok(pk.to_peer_id())
+    }
+
     /// CIDs de la liste (après parsing).
     pub fn cids(&self) -> CoreResult<HashSet<Cid>> {
         self.entries
@@ -161,10 +204,8 @@ impl Denylist {
     }
 }
 
-/// Denylist par défaut, compilée dans le binaire (non désactivable).
-const DEFAULT_CIDS: &str = include_str!("../../../deny/default.cids");
-
-/// Moteur de modération : ensemble des CIDs et des clés bloqués (défaut + souscriptions).
+/// Moteur de modération : ensemble des CIDs et des clés bloqués (par
+/// souscription à des denylists signées — voir le doc de module).
 #[derive(Debug, Clone, Default)]
 pub struct Moderation {
     blocked: HashSet<Cid>,
@@ -172,14 +213,12 @@ pub struct Moderation {
 }
 
 impl Moderation {
-    /// Moteur avec la denylist par défaut active (recommandé / défaut applicatif).
-    pub fn with_default() -> CoreResult<Self> {
-        let mut m = Self::default();
-        m.add_raw_cids(DEFAULT_CIDS)?;
-        Ok(m)
+    /// Moteur vide (aucune souscription).
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Moteur vide (pour les tests). La denylist par défaut n'est PAS chargée.
+    /// Alias de [`Moderation::new`] (nom historique, encore utilisé par les tests).
     pub fn empty() -> Self {
         Self::default()
     }
@@ -212,19 +251,6 @@ impl Moderation {
     pub fn is_empty(&self) -> bool {
         self.blocked.is_empty()
     }
-
-    /// Ajoute des CIDs depuis un texte (un CID par ligne ; `#` = commentaire).
-    fn add_raw_cids(&mut self, raw: &str) -> CoreResult<()> {
-        for line in raw.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            self.blocked
-                .insert(line.parse::<Cid>().map_err(CoreError::Cid)?);
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -233,17 +259,57 @@ mod tests {
     use crate::content::cid_for;
 
     #[test]
-    fn default_loads_without_error_and_is_empty() {
-        let m = Moderation::with_default().unwrap();
-        assert!(m.is_empty(), "la denylist par défaut est vide à ce stade");
+    fn seq_is_signed_and_v2_is_rejected() {
+        let issuer = Keypair::generate_ed25519();
+        let dl = Denylist::build_signed("t", "2026-09-06T00:00:00Z", &issuer, 7, &[], &[]).unwrap();
+        dl.verify().unwrap();
+        assert_eq!(dl.seq, 7);
+        let mut tampered = dl.clone();
+        tampered.seq = 8;
+        assert!(
+            tampered.verify().is_err(),
+            "changer seq invalide la signature"
+        );
+        let mut v2 = dl.clone();
+        v2.schema = "champinium-denylist/v2".into();
+        assert!(v2.verify().is_err());
+        let json = serde_json::to_string(&dl)
+            .unwrap()
+            .replace(r#""seq":7,"#, "");
+        assert!(
+            Denylist::from_json(&json).is_err(),
+            "seq obligatoire au parsing"
+        );
+    }
+
+    #[test]
+    fn oversized_json_is_rejected_before_parsing() {
+        let big = format!(
+            r#"{{"schema":"x","pad":"{}"}}"#,
+            "a".repeat(MAX_DENYLIST_SIZE)
+        );
+        assert!(Denylist::from_json(&big).is_err());
+    }
+
+    #[test]
+    fn project_issuer_parses() {
+        let p = project_issuer().expect("deny/project.issuer doit contenir un PeerId valide");
+        assert!(!p.to_string().is_empty());
+    }
+
+    #[test]
+    fn issuer_peer_id_matches_keypair() {
+        let issuer = Keypair::generate_ed25519();
+        let dl = Denylist::build_signed("t", "2026-09-06T00:00:00Z", &issuer, 1, &[], &[]).unwrap();
+        assert_eq!(dl.issuer_peer_id().unwrap(), issuer.public().to_peer_id());
     }
 
     #[test]
     fn signed_denylist_roundtrips_and_blocks() {
         let issuer = Keypair::generate_ed25519();
         let bad = cid_for(b"contenu interdit");
-        let dl =
-            Denylist::build_signed("test", "2026-06-24T00:00:00Z", &issuer, &[bad], &[]).unwrap();
+        let dl = Denylist::build_signed("test", "2026-06-24T00:00:00Z", &issuer, 1, &[bad], &[])
+            .unwrap();
 
         // Re-sérialisation/parse JSON puis vérification.
         let json = serde_json::to_string(&dl).unwrap();
@@ -261,9 +327,15 @@ mod tests {
         let issuer = Keypair::generate_ed25519();
         let banned_peer = PeerId::from(Keypair::generate_ed25519().public());
         let other_peer = PeerId::from(Keypair::generate_ed25519().public());
-        let dl =
-            Denylist::build_signed("test", "2026-07-23T00:00:00Z", &issuer, &[], &[banned_peer])
-                .unwrap();
+        let dl = Denylist::build_signed(
+            "test",
+            "2026-07-23T00:00:00Z",
+            &issuer,
+            1,
+            &[],
+            &[banned_peer],
+        )
+        .unwrap();
 
         let json = serde_json::to_string(&dl).unwrap();
         let parsed = Denylist::from_json(&json).unwrap();
@@ -280,7 +352,7 @@ mod tests {
         let issuer = Keypair::generate_ed25519();
         let banned_peer = PeerId::from(Keypair::generate_ed25519().public());
         let mut dl =
-            Denylist::build_signed("t", "2026-07-23T00:00:00Z", &issuer, &[], &[]).unwrap();
+            Denylist::build_signed("t", "2026-07-23T00:00:00Z", &issuer, 1, &[], &[]).unwrap();
         // Ajoute une clé après signature : la signature ne couvre plus les clés.
         dl.key_entries.push(banned_peer.to_string());
         assert!(dl.verify().is_err());
@@ -295,9 +367,15 @@ mod tests {
     #[test]
     fn tampered_entries_fail_verification() {
         let issuer = Keypair::generate_ed25519();
-        let mut dl =
-            Denylist::build_signed("t", "2026-06-24T00:00:00Z", &issuer, &[cid_for(b"x")], &[])
-                .unwrap();
+        let mut dl = Denylist::build_signed(
+            "t",
+            "2026-06-24T00:00:00Z",
+            &issuer,
+            1,
+            &[cid_for(b"x")],
+            &[],
+        )
+        .unwrap();
         // Ajoute un CID après signature : la signature ne couvre plus les entrées.
         dl.entries.push(cid_for(b"injecte").to_string());
         assert!(dl.verify().is_err());
@@ -317,7 +395,7 @@ mod tests {
         } else {
             (b, a)
         };
-        let legit = Denylist::build_signed("n", "u", &issuer, &[a, b], &[]).unwrap();
+        let legit = Denylist::build_signed("n", "u", &issuer, 1, &[a, b], &[]).unwrap();
 
         // Attaque : on déplace le premier CID depuis `entries` vers `updated`.
         // Avec une concaténation naïve séparée par '\n', les octets signés sont
@@ -327,6 +405,7 @@ mod tests {
             name: legit.name.clone(),
             issuer_pubkey: legit.issuer_pubkey.clone(),
             updated: format!("u\n{a}"),
+            seq: legit.seq,
             entries: vec![b.to_string()],
             key_entries: legit.key_entries.clone(),
             signature: legit.signature.clone(),
@@ -343,13 +422,14 @@ mod tests {
         // `key_entries` — les deux collections doivent être couvertes indépendamment.
         let issuer = Keypair::generate_ed25519();
         let peer = PeerId::from(Keypair::generate_ed25519().public());
-        let legit = Denylist::build_signed("n", "u", &issuer, &[], &[peer]).unwrap();
+        let legit = Denylist::build_signed("n", "u", &issuer, 1, &[], &[peer]).unwrap();
 
         let forged = Denylist {
             schema: legit.schema.clone(),
             name: legit.name.clone(),
             issuer_pubkey: legit.issuer_pubkey.clone(),
             updated: legit.updated.clone(),
+            seq: legit.seq,
             entries: vec![peer.to_string()],
             key_entries: vec![],
             signature: legit.signature.clone(),
@@ -363,9 +443,15 @@ mod tests {
     #[test]
     fn wrong_issuer_key_fails_verification() {
         let issuer = Keypair::generate_ed25519();
-        let mut dl =
-            Denylist::build_signed("t", "2026-06-24T00:00:00Z", &issuer, &[cid_for(b"y")], &[])
-                .unwrap();
+        let mut dl = Denylist::build_signed(
+            "t",
+            "2026-06-24T00:00:00Z",
+            &issuer,
+            1,
+            &[cid_for(b"y")],
+            &[],
+        )
+        .unwrap();
         // Remplace la clé émettrice par une autre : signature non vérifiable.
         let other = Keypair::generate_ed25519();
         dl.issuer_pubkey = B64.encode(other.public().encode_protobuf());
@@ -379,6 +465,7 @@ mod tests {
             name: "x".into(),
             issuer_pubkey: String::new(),
             updated: "2026-06-24T00:00:00Z".into(),
+            seq: 1,
             entries: vec![],
             key_entries: vec![],
             signature: None,
@@ -405,6 +492,7 @@ mod tests {
             name: "trop grande".into(),
             issuer_pubkey: B64.encode(issuer.public().encode_protobuf()),
             updated: "2026-07-23T00:00:00Z".into(),
+            seq: 1,
             entries: (0..=MAX_DENYLIST_ENTRIES)
                 .map(|i| cid_for(i.to_string().as_bytes()).to_string())
                 .collect(),

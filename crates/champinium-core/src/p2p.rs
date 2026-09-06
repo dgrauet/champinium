@@ -403,14 +403,16 @@ fn catalog_items_from_feed(feed: &Feed) -> Vec<CatalogItem> {
 }
 
 impl Node {
-    /// Construit un nœud avec la modération par défaut active (non désactivable).
+    /// Construit un nœud avec un moteur de modération vide (aucune souscription).
     pub async fn new(keypair: Keypair, blockstore: Blockstore) -> CoreResult<Self> {
-        Self::with_moderation(keypair, blockstore, Moderation::with_default()?).await
+        Self::with_moderation(keypair, blockstore, Moderation::new()).await
     }
 
     /// Ouvre (ou crée) un nœud sous `data_dir` : identité Ed25519 persistée +
-    /// magasin de blocs, avec la modération par défaut active. Point d'entrée
-    /// commun aux fronts (via FFI) et aux consommateurs Rust directs (GTK).
+    /// magasin de blocs, avec un moteur de modération vide (aucune
+    /// souscription — voir [`crate::moderation`] pour la clé projet compilée
+    /// et les souscriptions ultérieures). Point d'entrée commun aux fronts
+    /// (via FFI) et aux consommateurs Rust directs (GTK).
     pub async fn open(data_dir: &Path) -> CoreResult<Self> {
         let keypair = identity::load_or_generate(data_dir.join("node.key"))?;
         let blockstore = Blockstore::open(data_dir.join("blocks"))?;
@@ -3902,8 +3904,9 @@ mod tests {
         node_a.add(&forbidden).await.unwrap();
 
         let issuer = identity::load_or_generate(dir.path().join("issuer.key")).unwrap();
-        let dl = Denylist::build_signed("test", "2026-06-24T00:00:00Z", &issuer, &[bad_cid], &[])
-            .unwrap();
+        let dl =
+            Denylist::build_signed("test", "2026-06-24T00:00:00Z", &issuer, 1, &[bad_cid], &[])
+                .unwrap();
         let mut moderation = Moderation::empty();
         moderation.subscribe(&dl).unwrap();
 

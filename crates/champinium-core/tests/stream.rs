@@ -242,7 +242,7 @@ async fn moderated_segment_is_403_and_freezes_session() {
     let (m, cids) = publish(&a, &[true, true, false]).await;
 
     let issuer = Keypair::generate_ed25519();
-    let dl = Denylist::build_signed("test", UPDATED, &issuer, &[cids[1]], &[]).unwrap();
+    let dl = Denylist::build_signed("test", UPDATED, &issuer, 1, &[cids[1]], &[]).unwrap();
     let mut moderation = Moderation::empty();
     moderation.subscribe(&dl).unwrap();
     let b = node_with(dir.path(), "b4", moderation).await;

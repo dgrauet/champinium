@@ -766,8 +766,8 @@ async fn fetch_feed_with_retry(
 async fn build_node(data_dir: &Path, denylists: &[PathBuf]) -> Result<Node> {
     let kp = load_or_generate(data_dir.join("node.key"))?;
     let bs = Blockstore::open(data_dir.join("blocks"))?;
-    // Modération par défaut TOUJOURS active ; on ajoute les souscriptions signées.
-    let mut moderation = Moderation::with_default()?;
+    // On ajoute les souscriptions signées (--denylist) au moteur vide.
+    let mut moderation = Moderation::new();
     for path in denylists {
         let json = std::fs::read_to_string(path)
             .with_context(|| format!("lecture de la denylist {}", path.display()))?;

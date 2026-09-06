@@ -45,7 +45,7 @@ async fn node(dir: &std::path::Path, name: &str) -> Node {
 /// Denylist v2 signée bannissant une clé entière (aucun CID direct).
 fn moderation_blocking_key(issuer_key: &std::path::Path, blocked: PeerId) -> Moderation {
     let issuer = load_or_generate(issuer_key).unwrap();
-    let dl = Denylist::build_signed("test", UPDATED, &issuer, &[], &[blocked]).unwrap();
+    let dl = Denylist::build_signed("test", UPDATED, &issuer, 1, &[], &[blocked]).unwrap();
     let mut m = Moderation::empty();
     m.subscribe(&dl).unwrap();
     m
@@ -293,7 +293,7 @@ async fn purge_blocked_issuer_keeps_segment_shared_with_another_issuer() {
     .expect("le seed proactif doit retenir les deux publications avant le blocage");
 
     let issuer = load_or_generate(dir.path().join("issuer.key")).unwrap();
-    let dl = Denylist::build_signed("test", UPDATED, &issuer, &[], &[node_a.peer_id()]).unwrap();
+    let dl = Denylist::build_signed("test", UPDATED, &issuer, 1, &[], &[node_a.peer_id()]).unwrap();
     node_test.subscribe_denylist(&dl).await.unwrap();
 
     assert!(
@@ -383,6 +383,7 @@ async fn subscribe_denylist_purges_catalog_and_seeded_stock_including_pins() {
         "test",
         UPDATED,
         &moderation_issuer,
+        1,
         &[],
         &[node_bad.peer_id()],
     )
@@ -450,7 +451,7 @@ async fn subscribe_denylist_does_not_affect_unrelated_issuer() {
     // Denylist à clé visant un tiers totalement étranger au catalogue.
     let unrelated = Keypair::generate_ed25519().public().to_peer_id();
     let issuer = load_or_generate(dir.path().join("issuer.key")).unwrap();
-    let dl = Denylist::build_signed("test", UPDATED, &issuer, &[], &[unrelated]).unwrap();
+    let dl = Denylist::build_signed("test", UPDATED, &issuer, 1, &[], &[unrelated]).unwrap();
     let purged = node_b.subscribe_denylist(&dl).await.unwrap();
 
     assert_eq!(purged, 0);
