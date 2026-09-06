@@ -138,7 +138,7 @@ impl FeedEntry {
     }
 }
 
-/// Feed signé d'un créateur (format unique `champinium-feed/v3`).
+/// Feed signé d'un créateur (format unique `champinium-feed/v4`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Feed {
     /// Identifiant de schéma ; toujours [`SCHEMA`].

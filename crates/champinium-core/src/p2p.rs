@@ -937,8 +937,9 @@ impl Node {
 
     /// Publie un feed v2 signé avec métadonnées (titre, tags) : l'ajoute au
     /// catalogue local, le diffuse en gossipsub, le PUT dans la DHT, et
-    /// **s'annonce fournisseur de chaque tag** (`/champinium/tag/<tag>`) pour la
-    /// découverte par tag hors gossip. Le `seq` est incrémenté à chaque appel.
+    /// **s'annonce fournisseur de chaque tag et de chaque outil déclaré**
+    /// (`/champinium/tag/<tag>`) pour la découverte hors gossip. Le `seq` est
+    /// incrémenté à chaque appel.
     pub async fn publish_feed_with(&self, entries: &[FeedEntry]) -> CoreResult<()> {
         // Incrément et persistance sous le même verrou : deux publications
         // concurrentes ne peuvent pas réordonner le seq écrit sur disque (sinon,
@@ -977,15 +978,21 @@ impl Node {
                 tx: put_tx,
             })
             .await;
-        // Annonce des tags (best-effort, plafonné) : le fournisseur du tag est
-        // l'émetteur lui-même ; un chercheur récupère ensuite son feed SIGNÉ et
-        // filtre — un tag annoncé à tort ne fait perdre qu'une requête.
-        for tag in feed.all_tags().into_iter().take(MAX_PROVIDED_TAGS) {
+        // Annonce des tags ET des outils déclarés (best-effort, plafonné) : un
+        // outil est une clé de découverte comme un tag, sous le même préfixe.
+        // Le fournisseur est l'émetteur lui-même ; un chercheur récupère
+        // ensuite son feed SIGNÉ et filtre — une clé annoncée à tort ne fait
+        // perdre qu'une requête.
+        let mut keys = feed.all_tags();
+        keys.extend(feed.all_tools());
+        keys.sort();
+        keys.dedup();
+        for key in keys.into_iter().take(MAX_PROVIDED_TAGS) {
             let (tx, _rx) = oneshot::channel();
             let _ = self
                 .cmd_tx
                 .send(Command::Provide {
-                    key: tag_provider_key(&tag),
+                    key: tag_provider_key(&key),
                     tx,
                 })
                 .await;
@@ -1005,9 +1012,10 @@ impl Node {
             .search(query)
     }
 
-    /// Recherche par tag **via la DHT** (hors gossip) : retrouve les émetteurs
-    /// annoncés fournisseurs du tag, récupère et vérifie leurs feeds signés,
-    /// alimente le catalogue, et renvoie les contenus portant ce tag.
+    /// Recherche par tag **ou outil** via la DHT (hors gossip) : retrouve les
+    /// émetteurs annoncés fournisseurs de cette clé, récupère et vérifie leurs
+    /// feeds signés, alimente le catalogue, et renvoie les contenus dont un
+    /// tag ou un outil déclaré correspond.
     pub async fn search_tag(&self, tag: &str) -> CoreResult<Vec<crate::catalog::SearchHit>> {
         let tag = crate::feed::normalize_tag(tag);
         if tag.is_empty() {
@@ -1028,7 +1036,8 @@ impl Node {
                 continue;
             };
             for e in &feed.entries {
-                if e.tags.iter().any(|t| t == &tag) {
+                if e.tags.iter().any(|t| t == &tag) || e.provenance.tools.iter().any(|t| t == &tag)
+                {
                     if let Ok(cid) = e.cid.parse::<Cid>() {
                         hits.push(crate::catalog::SearchHit {
                             issuer,
