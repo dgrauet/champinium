@@ -21,7 +21,8 @@ internal static class ProvenanceText
         FfiProvenanceMode.Generated => "IA",
         FfiProvenanceMode.Assisted => "Assisté IA",
         FfiProvenanceMode.Captured => "Capturé",
-        _ => "Non déclaré",
+        FfiProvenanceMode.Undeclared => "Non déclaré",
+        _ => "Mode inconnu",
     };
 }
 

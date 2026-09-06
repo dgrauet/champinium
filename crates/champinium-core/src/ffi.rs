@@ -819,7 +819,7 @@ mod tests {
 
         tokio::time::timeout(std::time::Duration::from_secs(5), rx)
             .await
-            .expect("le listener doit être rappelé après publish_feed")
+            .expect("le listener doit être rappelé après publish_feed_with")
             .unwrap();
     }
 
@@ -1123,8 +1123,9 @@ mod tests {
             .await
             .unwrap();
         // `ingest_file` seede/épingle le contenu propre mais ne publie pas de
-        // feed : sans `publish_feed`, aucune entrée de catalogue ne référence
-        // le manifeste (le catalogue reconstruit uniquement depuis les feeds).
+        // feed : sans `publish_feed_with`, aucune entrée de catalogue ne
+        // référence le manifeste (le catalogue reconstruit uniquement depuis
+        // les feeds).
         node.publish_feed_with(vec![FfiContentItem {
             cid: manifest_cid.clone(),
             title: String::new(),

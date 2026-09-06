@@ -33,4 +33,9 @@ Content Credentials, en conservant la déclaration comme repli.
   qualifier de « vérifiée ». La modération ne la lit pas.
 - Zéro-compat : les feeds v3 sont rejetés. Contrat FFI v12, `publish_feed`
   sans métadonnées retiré.
+- Conséquence du zéro-compat : un pair qui émet encore `champinium-feed/v3`
+  voit ses feeds rejetés au parsing, ce que la validation applicative
+  gossipsub rapporte comme `Reject` — son score de pair se dégrade jusqu'au
+  graylistage. C'est un *flag day* assumé tant qu'il n'y a pas d'utilisateurs
+  réels, pas seulement un feed ignoré.
 - Positionnement reformulé : « contenu à provenance déclarée ».

@@ -34,7 +34,10 @@ struct Cli {
 enum Cmd {
     /// Affiche le PeerId du nœud.
     Id,
-    /// Démarre un nœud qui écoute (et se connecte à des bootstrap), puis reste en ligne.
+    /// Démarre un nœud qui écoute (et se connecte à des bootstrap), puis reste
+    /// en ligne. Le feed rediffusé réutilise les métadonnées déjà déclarées
+    /// (titre/tags/provenance) pour chaque CID connu ; seuls les CIDs jamais
+    /// déclarés apparaissent en « non déclaré ».
     Serve {
         #[arg(long, default_value = "/ip4/0.0.0.0/tcp/0")]
         listen: String,
@@ -42,7 +45,10 @@ enum Cmd {
         #[arg(long)]
         bootstrap: Vec<String>,
     },
-    /// Publie un fichier (stocke + annonce dans la DHT), puis reste en ligne pour le servir.
+    /// Publie un fichier (stocke + annonce dans la DHT), puis reste en ligne
+    /// pour le servir. Le feed rediffusé réutilise les métadonnées déjà
+    /// déclarées (titre/tags/provenance) pour chaque CID connu ; seuls les
+    /// CIDs jamais déclarés apparaissent en « non déclaré ».
     Add {
         path: PathBuf,
         #[arg(long, default_value = "/ip4/0.0.0.0/tcp/0")]
@@ -227,12 +233,15 @@ async fn main() -> Result<()> {
                 .listen(listen.parse().context("multiaddr d'écoute invalide")?)
                 .await?;
             connect_bootstraps(&node, &bootstrap).await?;
-            // Annonce un feed du contenu déjà détenu, rediffusé périodiquement.
+            // Annonce un feed du contenu déjà détenu, rediffusé périodiquement,
+            // en réutilisant les métadonnées déjà déclarées pour chaque CID
+            // connu (jamais d'écrasement d'une déclaration existante).
             let all = node.blockstore().list()?;
             if !all.is_empty() {
-                node.publish_feed(&all).await?;
+                let entries = own_entries_for(&node, &all).await;
+                node.publish_feed_with(&entries).await?;
+                spawn_feed_republisher_with(node.clone(), entries);
             }
-            spawn_feed_republisher(node.clone(), all);
             print_identity(&node, &addr);
             println!("nœud en ligne — Ctrl-C pour arrêter.");
             tokio::signal::ctrl_c().await?;
@@ -248,10 +257,13 @@ async fn main() -> Result<()> {
             let cid = node.add(&bytes).await?;
             println!("CID: {cid}");
             // Annonce un feed signé listant tout le contenu local, rediffusé
-            // périodiquement pour les pairs qui se connectent plus tard.
+            // périodiquement pour les pairs qui se connectent plus tard, en
+            // réutilisant les métadonnées déjà déclarées pour chaque CID connu
+            // (jamais d'écrasement d'une déclaration existante).
             let all = node.blockstore().list()?;
-            node.publish_feed(&all).await?;
-            spawn_feed_republisher(node.clone(), all);
+            let entries = own_entries_for(&node, &all).await;
+            node.publish_feed_with(&entries).await?;
+            spawn_feed_republisher_with(node.clone(), entries);
             print_identity(&node, &addr);
             println!("contenu publié + feed annoncé — ce nœud le sert. Ctrl-C pour arrêter.");
             tokio::signal::ctrl_c().await?;
@@ -597,20 +609,52 @@ async fn open_stream_with_retry(
     }
 }
 
-/// Rediffuse périodiquement un feed listant `cids` (pour les pairs tardifs).
-fn spawn_feed_republisher(node: Node, cids: Vec<Cid>) {
-    if cids.is_empty() {
-        return;
-    }
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            let _ = node.publish_feed(&cids).await;
+/// Construit les entrées de feed pour `cids` en réutilisant les métadonnées
+/// (titre/tags/provenance) déjà déclarées par ce nœud pour chaque CID connu.
+/// Un CID jamais déclaré retombe sur `FeedEntry::undeclared` — jamais
+/// l'inverse : une déclaration existante n'est jamais écrasée par `serve`/
+/// `add` (voir revue finale, point Important 1).
+async fn own_entries_for(node: &Node, cids: &[Cid]) -> Vec<champinium_core::feed::FeedEntry> {
+    let self_id = node.peer_id();
+    let mut own = node
+        .catalog_entries()
+        .into_iter()
+        .find(|e| e.issuer == self_id);
+    if own.is_none() {
+        // Après un redémarrage, le catalogue local peut ne pas encore
+        // connaître le propre feed du nœud (il ne vit que dans la DHT tant
+        // qu'aucun feed n'a été republié) : une tentative de récupération.
+        // `fetch_feed` alimente le catalogue lui-même quand il trouve un feed.
+        if let Ok(Some(_)) = node.fetch_feed(self_id).await {
+            own = node
+                .catalog_entries()
+                .into_iter()
+                .find(|e| e.issuer == self_id);
         }
-    });
+    }
+    let by_cid: std::collections::HashMap<String, &champinium_core::catalog::CatalogItem> = own
+        .as_ref()
+        .map(|e| e.items.iter().map(|i| (i.cid.to_string(), i)).collect())
+        .unwrap_or_default();
+    cids.iter()
+        .map(|cid| {
+            let key = cid.to_string();
+            match by_cid.get(&key) {
+                Some(item) => champinium_core::feed::FeedEntry {
+                    cid: key,
+                    title: item.title.clone(),
+                    tags: item.tags.clone(),
+                    provenance: item.provenance.clone(),
+                },
+                None => {
+                    champinium_core::feed::FeedEntry::undeclared(key, String::new(), Vec::new())
+                }
+            }
+        })
+        .collect()
 }
 
-/// Variante avec métadonnées (titre/tags rediffusés avec le feed).
+/// Rediffuse périodiquement un feed avec métadonnées (titre/tags/provenance).
 fn spawn_feed_republisher_with(node: Node, entries: Vec<champinium_core::feed::FeedEntry>) {
     if entries.is_empty() {
         return;
