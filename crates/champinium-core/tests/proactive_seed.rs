@@ -26,7 +26,7 @@ const CONVERGE: Duration = Duration::from_secs(30);
 async fn node(dir: &Path, name: &str) -> Node {
     let kp = load_or_generate(dir.join(format!("{name}.key"))).unwrap();
     let bs = Blockstore::open(dir.join(name)).unwrap();
-    Node::with_moderation_and_intervals(kp, bs, Moderation::empty(), FAST, FAST)
+    Node::with_moderation_and_intervals(kp, bs, Moderation::empty(), FAST, FAST, None)
         .await
         .unwrap()
 }
@@ -38,7 +38,7 @@ async fn node_with_quota(dir: &Path, name: &str, quota_bytes: u64) -> Node {
     let kp = load_or_generate(dir.join(format!("{name}.key"))).unwrap();
     let bs = Blockstore::open(dir.join(name)).unwrap();
     seeding::save_seed_quota(&bs, quota_bytes).unwrap();
-    Node::with_moderation_and_intervals(kp, bs, Moderation::empty(), FAST, FAST)
+    Node::with_moderation_and_intervals(kp, bs, Moderation::empty(), FAST, FAST, None)
         .await
         .unwrap()
 }
