@@ -25,9 +25,10 @@ Toute la logique vit dans **`crates/champinium-core`** (Rust, tokio/libp2p),
 exposée aux UI via **UniFFI**. Le ×3 ne touche QUE la présentation — **aucune
 logique métier dans les fronts.**
 
-- **P2P** : rust-libp2p (TCP/QUIC) — Kademlia (provider records), gossipsub,
-  bitswap, relay-v2 + DCUtR, identify/ping.
-- **Discovery** : provider records Kademlia (qui détient quel CID).
+- **P2P** : rust-libp2p (TCP/QUIC) — Kademlia (provider records de racines,
+  protocole dédié), gossipsub, bitswap, relay-v2 + DCUtR, identify/ping.
+- **Discovery** : provider records Kademlia par racine (qui détient quel
+  manifeste/CID de tag — pas chaque segment, voir ADR 0012).
 - **Feeds** : records gossip signés (primaire) + IPNS durable (différé post-MVP).
 - **Catalogue** : CRDT *maison* reconstruit localement par écoute gossipsub.
 - **Stockage** : content-addressed (CID) + cache LRU local.
@@ -184,9 +185,11 @@ sur deux machines physiques.
   sont acceptées sans adresse). `infra/relay` = binaire réel. **Testé** : un nœud
   derrière « NAT » écoute via circuit, un autre l'atteint *via le relais* et
   récupère un bloc (`block_transfer_over_relay_circuit`).
-- **Seeding en arrière-plan ✔** : `Node::reprovide_all` réannonce tous les CIDs
-  détenus (le store de providers Kademlia est volatile → indispensable au
-  redémarrage). Démon `champinium-seed` (réannonce + republication périodiques,
+- **Seeding en arrière-plan ✔** : `Node::reprovide_all` réannonce les CIDs
+  racines détenus (le store de providers Kademlia est volatile → indispensable
+  au redémarrage ; depuis ADR 0012 les segments indexés par le `SeedIndex` en
+  sont exclus, seules les racines sont annoncées). Démon `champinium-seed`
+  (réannonce + republication périodiques,
   hors UI) ; fichiers de service par OS dans `infra/services/` (launchd / systemd
   user / Windows). Testé : `reprovide_makes_stored_blocks_discoverable`.
 - **Feed records DHT (PUT/GET) ✔** : `publish_feed` PUT le feed signé dans la
@@ -432,6 +435,14 @@ sur deux machines physiques.
   projet reste possible. Un nœud neuf n'est protégé qu'après la première
   récupération de la liste projet (ou jamais si aucune liste n'est publiée).
   Spec : `~/Work/.superpowers/champinium/specs/2026-09-06-moderation-lists-design.md`.
+- **Hygiène DHT ✔ (ADR 0012)** : protocole Kademlia dédié
+  `/champinium/kad/1.0.0` (la DHT Champinium est séparée de la DHT IPFS
+  publique — un pair kubo croisé n'y stocke plus nos records ni l'inverse) ;
+  annonce par **racine** seule (manifestes, blocs nus, CIDs de feed/tag) au
+  lieu d'un provider record par segment HLS. `get_with`/`get_from` prennent un
+  indice de racine (fournisseurs du manifeste, repli sur les fournisseurs du
+  CID) ; `reprovide_all` exclut les segments indexés par le `SeedIndex`. CLI :
+  `get <cid> --root <manifeste>`. **Contrat FFI inchangé.**
 - **Packaging Linux — Flatpak ✔ (fonctionnel, palier gratuit)** : manifeste
   [`packaging/flatpak/org.champinium.Champinium.yml`](packaging/flatpak/org.champinium.Champinium.yml)
   (app-id `org.champinium.Champinium`, runtime GNOME 48, rustc via rustup au
@@ -501,7 +512,7 @@ par clé + blocage local + signalements par channel ✔ ; aperçu de channel par
 lien ✔ (`resolve_channel`, contrat v9 ; partie B — scheme OS — ✔) ; durabilité
 du record de feed ✔ (`republish_known_feeds`) ; IPNS #21 close, voir ADR 0007 ;
 lecture progressive ✔ (ADR 0009) ; provenance déclarée ✔ (ADR 0010) ;
-modération réputationnelle ✔ (ADR 0011)).
+modération réputationnelle ✔ (ADR 0011) ; hygiène DHT ✔ (ADR 0012)).
 Voir le spec.
 
 **Dernière release : voir `.release-please-manifest.json` / CHANGELOG** —
