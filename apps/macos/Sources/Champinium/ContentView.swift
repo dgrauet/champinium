@@ -24,6 +24,8 @@ struct ContentView: View {
     @State private var showSeedSettings = false
     @State private var quotaField: String = ""
     @State private var showBlockedChannels = false
+    @State private var showModerationLists = false
+    @State private var denylistField: String = ""
     @State private var blockTarget: FfiCatalogEntry?
     @State private var showBlockConfirm = false
     @State private var channelPreview: FfiChannelPreview?
@@ -199,6 +201,11 @@ struct ContentView: View {
                 .popover(isPresented: $showBlockedChannels) {
                     blockedChannelsPopover
                 }
+            Button("Listes de modération") { showModerationLists = true }
+                .font(.caption)
+                .popover(isPresented: $showModerationLists) {
+                    moderationListsPopover
+                }
         }
     }
 
@@ -225,6 +232,45 @@ struct ContentView: View {
         }
         .padding()
         .frame(width: 320)
+    }
+
+    /// Éditeurs de denylist suivis (lot modération) : la liste projet
+    /// verrouillée (`locked`, non retirable, cadenas) et les éditeurs suivis
+    /// par lien (retirables). Champ + bouton pour suivre un nouvel éditeur par
+    /// lien `champinium://denylist/…` ou PeerId nu.
+    private var moderationListsPopover: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Listes de modération").font(.headline)
+            List(model.denylistSources, id: \.peerId) { s in
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(s.fetched ? s.name : truncated(s.peerId))
+                        Text(s
+                            .fetched ? "\(s.entryCount) CIDs · \(s.keyCount) clés · \(s.updated)" :
+                            "jamais récupérée")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if s.locked {
+                        Label("Liste projet", systemImage: "lock.fill").font(.caption)
+                    } else {
+                        Button("Retirer") { Task { await model.unfollowDenylist(s.peerId) } }
+                            .font(.caption).buttonStyle(.bordered)
+                    }
+                }
+            }
+            .frame(minHeight: 140)
+            HStack {
+                TextField("champinium://denylist/… ou PeerId", text: $denylistField)
+                    .textFieldStyle(.roundedBorder)
+                Button("Suivre") {
+                    Task { await model.followDenylist(denylistField); denylistField = "" }
+                }
+                .disabled(denylistField.isEmpty)
+            }
+        }
+        .padding()
+        .frame(width: 380)
     }
 
     /// Réglage du quota de seeding (GB) + affichage de l'usage courant. Vue
@@ -535,6 +581,13 @@ struct ContentView: View {
     /// nœud nul et le lien serait perdu en silence. On attend donc la fin du
     /// démarrage (parité Linux/Windows).
     private func openChannelLink(_ url: URL) async {
+        if isDenylistLink(url) {
+            // Ouvre le volet modération avec le champ prérempli, SANS
+            // souscrire — l'utilisateur choisit explicitement « Suivre ».
+            denylistField = url.absoluteString
+            showModerationLists = true
+            return
+        }
         let opened = await model.waitUntilStarted()
         channelLinkField = url.absoluteString
         guard opened else {
@@ -544,6 +597,13 @@ struct ContentView: View {
             return
         }
         await previewByLink()
+    }
+
+    /// Un lien `champinium://denylist/<clé>` (chemin denylist, cf. lien de
+    /// channel `champinium://channel/<clé>`) ouvre le volet modération plutôt
+    /// que l'aperçu de channel.
+    private func isDenylistLink(_ url: URL) -> Bool {
+        url.host == "denylist" || url.path.hasPrefix("/denylist/")
     }
 
     /// Résout l'aperçu du lien/PeerId collé (état de chargement pendant le
