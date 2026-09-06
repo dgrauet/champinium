@@ -625,7 +625,7 @@ Autour, trois mécanismes d'écosystème :
   catalogue borné à 1024 émetteurs (refus-quand-plein, pas d'éviction), c'est
   la défense contre l'inondation par clés jetables.
 
-## 8. La frontière FFI : le contrat v13
+## 8. La frontière FFI : le contrat v14
 
 La surface UniFFI de [`ffi.rs`](../crates/champinium-core/src/ffi.rs) est
 **le contrat** entre le noyau et les fronts (tableau exhaustif et protocole de
@@ -697,6 +697,15 @@ changement dans [`AGENTS.md`](../AGENTS.md)). Ce qui la caractérise :
   « Retirer » pour les autres, champ de collage + « Suivre », état « jamais
   récupérée » tant que rien n'est en cache) ; un lien
   `champinium://denylist/<peerid>` ouvre le volet prérempli **sans souscrire**.
+- **Découverte initiale (v14, ADR 0013)** : `bootstrap() -> u32` (async —
+  compose vers la liste effective compilée ∪ persistée puis
+  `kademlia.bootstrap()`, renvoie le nombre de bootstraps joints),
+  `connected_peers() -> u32` (async), `add_bootstrap(multiaddr)` (async —
+  `InvalidInput` sans `/p2p/` ou au-delà de 64 entrées), `bootstraps() ->
+  Vec<String>` (sync), `mdns_enabled() -> bool` / `set_mdns(enabled)` (sync,
+  persiste dans `.mdns_enabled`, effet au prochain démarrage). Les trois
+  fronts appellent `bootstrap()` après `listen`, affichent « réseau : N
+  pair(s) » et exposent l'interrupteur mDNS dans les réglages de seed.
 - **Abonnements (v6)** : `subscribe_channel`/`unsubscribe_channel` (lien
   `champinium://channel/<peerid>` ou PeerId nu), `subscriptions` (liste
   locale), `catalog_subscribed` (catalogue restreint aux émetteurs souscrits)
