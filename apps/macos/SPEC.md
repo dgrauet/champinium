@@ -15,11 +15,15 @@ UI. Consomme les bindings Swift générés à partir du contrat UniFFI.
 ## Interfaces
 
 - **Consomme** : module Swift `ChampiniumCore` + `ChampiniumCoreFFI.xcframework`
-  générés par `just macos-prepare` (**non commités**). Contrat actuel **v11** :
+  générés par `just macos-prepare` (**non commités**). Contrat actuel **v12** :
   objet `ChampiniumNode` (`openNode`, `listen`, `connect`, `catalog`,
-  `ingestFile`, `publishFeed`, `openStream`/`closeStream`/`streamStatus`,
+  `ingestFile`, `publishFeedWith`, `openStream`/`closeStream`/`streamStatus`,
   `setStreamListener`, …) + record `FfiCatalogEntry`. `fetchHls` a été retiré
-  du FFI (ADR 0009) — la lecture passe désormais par `openStream`.
+  du FFI (ADR 0009) — la lecture passe désormais par `openStream`. Chaque
+  contenu de `FfiCatalogEntry.items` porte désormais une `provenance`
+  (`FfiProvenance { mode, tools }`, ADR 0010) : l'UI l'affiche en badge
+  (« IA / Assisté IA / Capturé / Non déclaré » + outils), sans champ de
+  saisie — la publication reste CLI-only.
 - **Produit** : rien pour les autres agents (feuille de l'arbre).
 
 ## Definition of Done — Phase 3 (MVP macOS)

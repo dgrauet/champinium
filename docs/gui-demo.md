@@ -48,8 +48,13 @@ ffmpeg -f lavfi -i "testsrc=duration=30:size=1280x720:rate=25" \
 
 ./champinium-cli --data-dir ./machine-a \
     ingest demo.mp4 --listen /ip4/0.0.0.0/tcp/4711 \
-    --title "Démo Champinium" --tag demo --tag nature
+    --title "Démo Champinium" --tag demo --tag nature \
+    --provenance generated --tool sora
 ```
+
+`--provenance` est **obligatoire** (ADR 0010, aucun défaut implicite) ;
+`--tool` est répétable. Le badge **IA · sora** apparaît dans la liste du
+catalogue des trois fronts pour cette publication.
 
 Noter les deux lignes de sortie :
 

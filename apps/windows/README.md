@@ -57,7 +57,9 @@ Le `.csproj` :
 session de lecture progressive servie par le noyau sur `127.0.0.1` (ADR 0009),
 dont l'URL est passée directement au `MediaPlayerElement` ; une ligne de
 progression affiche « segments : x/y » et **Arrêter**/fermeture appelle
-`CloseStream`.
+`CloseStream`. Chaque entrée du catalogue affiche un badge de provenance
+déclarée (« IA / Assisté IA / Capturé / Non déclaré » + outils, ADR 0010) —
+pas de champ de saisie, la publication reste CLI-only.
 
 ## Vérification de compilation — IMPORTANT
 

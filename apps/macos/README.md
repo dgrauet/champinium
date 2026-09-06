@@ -26,7 +26,9 @@ et `Sources/ChampiniumCore/ChampiniumCore.swift`.
 et lecture progressive d'un contenu (`openStream` ouvre une session HLS servie
 par le noyau sur `127.0.0.1`, ADR 0009) avec **AVPlayer**, avec une ligne
 « segments : x/y » de progression et fermeture de la session (`closeStream`) à
-l'arrêt de la lecture. Toute la logique reste dans le noyau ; ce front
-n'orchestre que des appels UniFFI.
+l'arrêt de la lecture. Chaque contenu du catalogue affiche un badge de
+provenance déclarée (« IA / Assisté IA / Capturé / Non déclaré » + outils,
+ADR 0010) — pas de champ de saisie, la publication reste CLI-only. Toute la
+logique reste dans le noyau ; ce front n'orchestre que des appels UniFFI.
 
 Packaging Phase 6 : `.app`/`.dmg` + notarisation Apple (Developer ID).
