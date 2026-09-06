@@ -26,6 +26,9 @@ UI. Consomme les bindings Swift générés à partir du contrat UniFFI.
   saisie — la publication reste CLI-only.
 - **Produit** : rien pour les autres agents (feuille de l'arbre).
 
+Contrat FFI v13 (ADR 0011) : volet « Listes de modération » (`denylistSources`,
+`subscribeDenylistIssuer`/`unsubscribeDenylistIssuer`, `ModerationListener`).
+
 ## Definition of Done — Phase 3 (MVP macOS)
 
 - [x] Package SwiftPM lie l'XCFramework + le wrapper généré ; `swift build` OK.

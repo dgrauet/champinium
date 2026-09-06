@@ -852,9 +852,9 @@ impl Node {
     ///
     /// Renvoie le nombre total de blocs supprimés du magasin.
     ///
-    /// Chemin **manuel** (fichier local, front, CLI `--denylist`) : aucun
-    /// réseau. Le chemin réseau ([`Node::fetch_denylist`]) applique exactement
-    /// la même purge, via la même fonction libre.
+    /// Chemin **manuel** (liste signée déjà en main, ex. CLI `denylist show`) :
+    /// aucun réseau. Le chemin réseau ([`Node::fetch_denylist`]) applique
+    /// exactement la même purge, via la même fonction libre.
     pub async fn subscribe_denylist(&self, list: &Denylist) -> CoreResult<usize> {
         let state = self.moderation_state();
         let applied = {

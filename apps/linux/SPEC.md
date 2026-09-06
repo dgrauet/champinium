@@ -20,6 +20,10 @@ pas de FFI).
   `champinium_core::core_version()`, `contract_version()`, `core_handshake(...)`.
 - **Produit** : rien pour les autres agents (feuille de l'arbre).
 
+Volet « Listes de modération » (ADR 0011) : `denylist_sources`,
+`subscribe_denylist_issuer`/`unsubscribe_denylist_issuer`, écoute réactive du
+moteur de modération — même API Rust directe que le reste.
+
 ## Definition of Done — Phase 4 (UI GTK4)
 
 - [x] UI GTK4 (feature `gui`) : ouverture nœud → `listen` → `connect` → catalogue

@@ -109,6 +109,32 @@ Pendant que B garde son app ouverte, **couper A** (Ctrl-C). Puis, au choix :
 - ✅ Si `fetch-hls` réussit avec A éteint : **le contenu a survécu à son
   publieur** — seed-what-you-consume constaté sur du vrai matériel.
 
+## 4. Listes de modération (ADR 0011)
+
+Sur les deux mêmes machines, valider la distribution réseau d'une denylist :
+
+1. **Machine A — signer et publier une liste** :
+
+   ```sh
+   ./champinium-cli denylist sign \
+       --key ./editeur.key --name "Démo" --seq 1 \
+       --key-entry <PeerId-à-bannir> \
+       --out ./demo-denylist.json
+   ./champinium-cli --data-dir ./ingest denylist publish ./demo-denylist.json \
+       --peer /ip4/<IP-LAN-de-A>/tcp/<port-de-A>/p2p/<PeerId-de-A>
+   ```
+
+2. **Machine B (app GUI ou CLI) — suivre l'éditeur** : coller le PeerId de la
+   clé `editeur.key` (ou `champinium://denylist/<peerid>`) dans le volet
+   « Listes de modération » → **Suivre** (ou `champinium-cli denylist follow
+   <lien-ou-peerid> --peer <adresse-A>`).
+3. ✅ **Suivi périodique** : dans la minute qui suit (`FOLLOW_INTERVAL`), le
+   channel de l'émetteur banni disparaît des vues de B (Abonnements et
+   Explorer), sans action supplémentaire côté B.
+4. ✅ **Redémarrage hors ligne** : couper A, **fermer puis rouvrir** l'app de
+   B. Le channel banni reste absent — le cache (`.denylists/<peerid>.json`)
+   protège avant tout accès réseau.
+
 ## Grille de validation
 
 | # | Critère | Constat attendu |

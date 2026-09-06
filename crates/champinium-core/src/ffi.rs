@@ -265,8 +265,11 @@ pub struct ChampiniumNode {
     inner: Node,
 }
 
-/// Ouvre (ou crée) un nœud sous `data_dir` : identité persistée + blocs, avec la
-/// modération par défaut active (non désactivable).
+/// Ouvre (ou crée) un nœud sous `data_dir` : identité persistée + blocs, avec le
+/// moteur de modération actif par défaut (non désactivable) — l'éditeur de la
+/// liste projet est souscrit d'office (ADR 0011) ; sa liste signée doit encore
+/// être récupérée depuis le réseau pour être appliquée (état « jamais
+/// récupérée » tant qu'aucune n'est en cache).
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn open_node(data_dir: String) -> Result<Arc<ChampiniumNode>, FfiError> {
     let inner = Node::open(&PathBuf::from(data_dir)).await?;

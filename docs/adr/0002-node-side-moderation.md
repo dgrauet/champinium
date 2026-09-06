@@ -1,6 +1,6 @@
 # 0002 — Modération côté nœud, active par défaut
 
-- Statut : accepté
+- Statut : accepté — partiellement remplacé par [0011](0011-reputational-moderation.md) (denylist compilée)
 - Date : 2026-06-24
 
 ## Contexte

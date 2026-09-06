@@ -28,6 +28,9 @@ pour le seeding hors UI. Consomme les bindings C# générés par `uniffi-bindgen
   dans la classe statique `ChampiniumCoreMethods`.
 - **Produit** : rien pour les autres agents (feuille de l'arbre).
 
+Contrat FFI v13 (ADR 0011) : volet « Listes de modération » (`DenylistSources`,
+`SubscribeDenylistIssuer`/`UnsubscribeDenylistIssuer`, `ModerationListener`).
+
 ## Definition of Done — Phase 4 (UI catalogue + lecture)
 
 - [x] Vraie solution WinUI 3 (`Champinium.sln` + `Champinium.csproj`,
