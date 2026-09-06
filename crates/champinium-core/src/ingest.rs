@@ -57,8 +57,15 @@ impl HlsManifest {
     }
 
     /// Reconstruit un playlist `.m3u8` jouable, chaque segment pointant vers un
-    /// fichier local nommé `<cid>.ts`.
+    /// fichier local nommé `<cid>.ts` (forme utilisée par `fetch_hls`).
     pub fn to_m3u8(&self) -> String {
+        self.to_m3u8_with_uris(|_, seg| format!("{}.ts", seg.cid))
+    }
+
+    /// Playlist VOD complète (`#EXT-X-ENDLIST`), l'URI de chaque segment étant
+    /// produite par `uri_for(index, segment)` — le serveur HLS local de la
+    /// lecture progressive nomme les segments par index (`<n>.ts`).
+    pub fn to_m3u8_with_uris(&self, uri_for: impl Fn(usize, &HlsSegment) -> String) -> String {
         let target = self
             .target_duration
             .max(
@@ -72,8 +79,12 @@ impl HlsManifest {
         s.push_str("#EXTM3U\n#EXT-X-VERSION:3\n");
         s.push_str(&format!("#EXT-X-TARGETDURATION:{target}\n"));
         s.push_str("#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n");
-        for seg in &self.segments {
-            s.push_str(&format!("#EXTINF:{:.3},\n{}.ts\n", seg.duration, seg.cid));
+        for (i, seg) in self.segments.iter().enumerate() {
+            s.push_str(&format!(
+                "#EXTINF:{:.3},\n{}\n",
+                seg.duration,
+                uri_for(i, seg)
+            ));
         }
         s.push_str("#EXT-X-ENDLIST\n");
         s
@@ -199,5 +210,29 @@ mod tests {
         assert!(pl.contains("#EXTM3U"));
         assert!(pl.contains("cidA.ts"));
         assert!(pl.contains("#EXT-X-ENDLIST"));
+    }
+
+    #[test]
+    fn to_m3u8_with_uris_uses_index_names_and_vod_markers() {
+        let m = HlsManifest::new(
+            4.0,
+            vec![
+                HlsSegment {
+                    cid: "cidA".into(),
+                    duration: 3.5,
+                },
+                HlsSegment {
+                    cid: "cidB".into(),
+                    duration: 1.2,
+                },
+            ],
+        );
+        let out = m.to_m3u8_with_uris(|i, _| format!("{i}.ts"));
+        assert!(out.contains("#EXT-X-PLAYLIST-TYPE:VOD\n"));
+        assert!(out.contains("#EXTINF:3.500,\n0.ts\n"));
+        assert!(out.contains("#EXTINF:1.200,\n1.ts\n"));
+        assert!(out.ends_with("#EXT-X-ENDLIST\n"));
+        // L'ancienne forme (fetch_hls) reste inchangée : URIs par CID.
+        assert!(m.to_m3u8().contains("cidA.ts\n"));
     }
 }

@@ -20,7 +20,7 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
   capacité absente, ils **ouvrent une demande de changement de contrat** (voir
   protocole plus bas) — ils ne contournent pas via du code natif ad hoc.
 
-### Contrat actuel — v10 (`CONTRACT_VERSION = 10`)
+### Contrat actuel — v11 (`CONTRACT_VERSION = 11`)
 
 > v1 → v2 : ajout de `subscribe_denylist(json) -> u64` sur `ChampiniumNode`
 > (modération fédérée activable depuis les fronts). Purement additif.
@@ -107,6 +107,19 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
 > réseau réel — l'appel à une gateway d'archive — dépend de la feature). Les
 > fronts affichent une case « Récupération d'archive froide » dans les réglages
 > de seed. Purement additif.
+>
+> v10 → v11 : **lecture progressive** (spec 2026-09-05). **Retrait** de
+> `fetch_hls` (rupture : le téléchargement complet reste au CLI, `fetch-hls`,
+> comme export hors ligne). `open_stream(manifest_cid) -> FfiStreamSession
+> { id, url, total_segments }` (async — récupère le manifeste, `Moderated`/
+> `NotFound` sortent ici ; `url` = playlist HLS VOD servie sur
+> `127.0.0.1`, à passer telle quelle au lecteur natif, seek libre),
+> `close_stream(id)` (async, idempotent — arrête le serveur, purge le cache de
+> session), `stream_status(id) -> FfiStreamStatus { fetched_segments,
+> total_segments, failed_reason }` (sync ; inconnu → `NotFound`), callback
+> interface **`StreamListener`** (`on_stream_updated(id)`) via
+> `set_stream_listener(listener)` (async). Politique de stockage inchangée :
+> `Seed` si channel souscrit, `Stream` sinon.
 
 Fonctions libres (smoke test async, conservées de v0) :
 
@@ -127,7 +140,6 @@ Objet **`ChampiniumNode`** (méthodes) :
 | `connect(peer) -> ()` | **async** | se connecte à `/…/p2p/<id>` |
 | `ingest_file(path) -> String` | **async** | ffmpeg → HLS, renvoie le CID du manifeste |
 | `publish_feed(cids) -> ()` | **async** | publie un feed signé |
-| `fetch_hls(manifest_cid, out_dir) -> String` | **async** | reconstruit un HLS jouable, renvoie le playlist |
 | `subscribe_denylist(json) -> u64` | **async** | souscrit une denylist signée, renvoie le nb de blocs purgés |
 | `set_catalog_listener(listener) -> ()` | **async** | enregistre un `CatalogListener` (rafraîchissement réactif) |
 | `publish_feed_with(items) -> ()` | **async** | publie un feed v2 (titre/tags signés) + annonce les tags DHT |
@@ -152,6 +164,10 @@ Objet **`ChampiniumNode`** (méthodes) :
 | `resolve_channel(link_or_peer_id) -> FfiChannelPreview` | **async** | aperçu d'un channel par lien ou PeerId nu (catalogue d'abord, sinon DHT) |
 | `cold_retrieval_enabled() -> bool` | sync | le repli de récupération froide est-il actif ? (défaut vrai, persisté) |
 | `set_cold_retrieval(enabled) -> ()` | sync | débraye le repli froid, persiste (`.cold_enabled`) ; surface identique avec ou sans la feature `cold-storage` |
+| `open_stream(manifest_cid) -> FfiStreamSession` | **async** | ouvre une session de lecture progressive, renvoie l'URL HLS locale |
+| `close_stream(id) -> ()` | **async** | ferme la session (idempotent) |
+| `stream_status(id) -> FfiStreamStatus` | sync | progression / échec de la session |
+| `set_stream_listener(listener) -> ()` | **async** | enregistre un `StreamListener` |
 
 Records `FfiCatalogEntry { issuer, seq, cids, items, channel, seeded_count,
 total_count, pinned }`, `FfiContentItem { cid, title, tags }`,

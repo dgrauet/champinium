@@ -27,9 +27,12 @@ cargo build -p champinium-linux                   # build « stub » sans GTK (C
 ## UI (Phase 4)
 
 `gui.rs` : ouverture du nœud → `listen` → connexion à un pair → catalogue
-reconstruit → bouton « Lire » → `fetch_hls` puis lecture **GStreamer**. Un runtime
-tokio exécute les appels async du noyau ; les résultats reviennent sur le thread
-GTK via `glib::spawn_future_local` + oneshot.
+reconstruit → bouton « Lire » → `open_stream` ouvre une session de lecture
+progressive servie par le noyau sur `127.0.0.1` (ADR 0009), dont l'URL est
+passée directement à `playbin` (**GStreamer**), avec une ligne de progression
+« segments : x/y » et `close_stream` à l'arrêt. Un runtime tokio exécute les
+appels async du noyau ; les résultats reviennent sur le thread GTK via
+`glib::spawn_future_local` + oneshot.
 
 ## Statut de vérification
 

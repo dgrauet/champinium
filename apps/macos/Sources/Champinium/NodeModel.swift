@@ -36,6 +36,20 @@ private final class SeedRefresher: SeedListener {
     }
 }
 
+/// Pont vers le callback de session de lecture (contrat v11) : même patron
+/// que `SeedRefresher` — re-dispatch vers le thread principal.
+private final class StreamRefresher: StreamListener {
+    private let onUpdate: @Sendable (UInt64) -> Void
+
+    init(onUpdate: @escaping @Sendable (UInt64) -> Void) {
+        self.onUpdate = onUpdate
+    }
+
+    func onStreamUpdated(id: UInt64) {
+        onUpdate(id)
+    }
+}
+
 @MainActor
 final class NodeModel: ObservableObject {
     @Published var status: String = "démarrage…"
@@ -49,23 +63,19 @@ final class NodeModel: ObservableObject {
     @Published var storageStats = FfiStorageStats(usedBytes: 0, quotaBytes: 0)
     @Published var coldRetrievalEnabled: Bool = true
     @Published var player: AVPlayer?
+    @Published var streamProgress: String = ""
 
     private var node: ChampiniumNode?
     private var listener: CatalogListener?
     private var seedListener: SeedListener?
+    private var currentStreamId: UInt64?
+    private var streamListener: StreamListener?
 
     /// Résultat de `start()` une fois terminé (vrai = nœud ouvert), `nil` tant
     /// qu'il tourne. Voir `waitUntilStarted()`.
     private var startOutcome: Bool?
     /// Attentes en cours sur la fin de `start()` (voir `waitUntilStarted()`).
     private var startWaiters: [CheckedContinuation<Bool, Never>] = []
-    /// Répertoire de la lecture en cours (supprimé au changement de contenu).
-    private var currentPlayDir: String?
-
-    /// Racine des répertoires de lecture temporaires.
-    private var playRoot: String {
-        NSTemporaryDirectory() + "champinium-play"
-    }
 
     /// Ouvre le nœud, commence à écouter et s'abonne aux mises à jour du
     /// catalogue (rafraîchissement réactif, pas de délai gossip codé en dur).
@@ -75,9 +85,6 @@ final class NodeModel: ObservableObject {
         // jamais attendre indéfiniment.
         defer { finishStart() }
 
-        // Purge les répertoires de lecture des exécutions précédentes (ils ne
-        // servent qu'à la session en cours et s'accumuleraient sinon).
-        try? FileManager.default.removeItem(atPath: playRoot)
         do {
             // Répertoire durable par OS (jamais le tmp : sinon perte du PeerId
             // et régression du seq de feed au nettoyage du système).
@@ -96,6 +103,11 @@ final class NodeModel: ObservableObject {
             }
             seedListener = seedRefresher
             await node.setSeedListener(listener: seedRefresher)
+            let streamRefresher = StreamRefresher { [weak self] id in
+                Task { @MainActor in self?.refreshStream(id: id) }
+            }
+            streamListener = streamRefresher
+            await node.setStreamListener(listener: streamRefresher)
             status = "nœud en ligne"
         } catch {
             status = "erreur d'ouverture: \(error)"
@@ -231,27 +243,24 @@ final class NodeModel: ObservableObject {
         searchHits = query.isEmpty ? [] : (node?.search(query: query) ?? [])
     }
 
-    /// Récupère et lit un contenu (manifeste HLS) via AVPlayer. Le répertoire
-    /// de la lecture précédente est supprimé au passage (pas d'accumulation).
+    /// Ouvre une session de lecture progressive et la donne à AVPlayer. La
+    /// session précédente est fermée (le cœur purge son cache).
     func play(manifestCid: String) async {
         guard let node else { return }
-        if let previous = currentPlayDir {
-            player?.pause()
-            player = nil
-            try? FileManager.default.removeItem(atPath: previous)
-            currentPlayDir = nil
-        }
+        await stopPlayback()
         do {
-            let out = playRoot + "/" + UUID().uuidString
-            let playlist = try await node.fetchHls(manifestCid: manifestCid, outDir: out)
-            currentPlayDir = out
-            let player = AVPlayer(url: URL(fileURLWithPath: playlist))
+            let session = try await node.openStream(manifestCid: manifestCid)
+            currentStreamId = session.id
+            guard let url = URL(string: session.url) else {
+                status = "lecture: URL de session invalide"
+                return
+            }
+            let player = AVPlayer(url: url)
             self.player = player
             player.play()
             status = "lecture en cours"
+            streamProgress = "0/\(session.totalSegments)"
         } catch let e as FfiError {
-            // Erreur typée du contrat : un refus de modération est un blocage
-            // volontaire, présenté comme tel (pas comme une panne technique).
             switch e {
             case .Moderated:
                 self.status = "contenu bloqué par la modération"
@@ -260,6 +269,28 @@ final class NodeModel: ObservableObject {
             }
         } catch {
             status = "lecture: \(error)"
+        }
+    }
+
+    /// Arrête le lecteur et ferme la session courante (idempotent côté cœur).
+    func stopPlayback() async {
+        player?.pause()
+        player = nil
+        streamProgress = ""
+        if let id = currentStreamId, let node {
+            currentStreamId = nil
+            await node.closeStream(id: id)
+        }
+    }
+
+    private func refreshStream(id: UInt64) {
+        guard id == currentStreamId, let node else { return }
+        guard let st = try? node.streamStatus(id: id) else { return }
+        if let reason = st.failedReason {
+            status = "lecture interrompue : \(reason)"
+            streamProgress = ""
+        } else {
+            streamProgress = "\(st.fetchedSegments)/\(st.totalSegments)"
         }
     }
 }

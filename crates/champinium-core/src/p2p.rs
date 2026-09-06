@@ -22,6 +22,7 @@ use crate::ingest::{self, HlsManifest, HlsSegment};
 use crate::moderation::{Denylist, Moderation};
 use crate::report::{Report, ReportBook};
 use crate::seeding::{self, eviction_order, SeedIndex, SeededPublication};
+use crate::stream::{self, StreamSession, StreamSessionInfo, StreamStatus};
 use cid::Cid;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -39,7 +40,7 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -304,6 +305,71 @@ pub struct Node {
     /// soit la feature de build, seul le repli réseau lui-même reste gaté
     /// (`cold`, ci-dessus).
     cold_retrieval_enabled: Arc<AtomicBool>,
+    /// Sessions de lecture progressive ouvertes (spec 2026-09-05). Aucune
+    /// session ne détient de `Node` (voir `Fetcher`) : lâcher la dernière
+    /// poignée lâche la table, donc arrête serveurs et boucles.
+    streams: Arc<Mutex<HashMap<u64, StreamSession>>>,
+    stream_next_id: Arc<AtomicU64>,
+    /// Tic par session (`id`) à chaque changement d'état (listener FFI).
+    stream_events: tokio::sync::broadcast::Sender<u64>,
+}
+
+/// Ce qu'il faut pour récupérer un bloc (P2P + repli froid) **sans** détenir
+/// une poignée `Node` : utilisé par les tâches de fond qui ne doivent pas
+/// retenir le nœud en vie (boucle de fetch d'une session de lecture).
+#[derive(Clone)]
+pub(crate) struct Fetcher {
+    blockstore: Blockstore,
+    moderation: Arc<RwLock<Moderation>>,
+    cmd_tx: mpsc::Sender<Command>,
+    peer_id: PeerId,
+    keypair: Keypair,
+    reports: Arc<Mutex<ReportBook>>,
+    #[cfg(feature = "cold-storage")]
+    cold: Option<Arc<dyn ColdStore>>,
+    #[cfg_attr(not(feature = "cold-storage"), allow(dead_code))]
+    cold_retrieval_enabled: Arc<AtomicBool>,
+}
+
+impl Fetcher {
+    pub(crate) async fn get_with(&self, cid: Cid, policy: StorePolicy) -> CoreResult<Vec<u8>> {
+        let result = get_with_inner(
+            &self.blockstore,
+            &self.moderation,
+            &self.cmd_tx,
+            self.peer_id,
+            &self.keypair,
+            &self.reports,
+            cid,
+            policy,
+        )
+        .await;
+        // Repli de récupération froide (ADR 0008, CS-a tâche 3) : uniquement
+        // sur `NoProviders` (plus aucun fournisseur P2P), jamais sur les
+        // autres erreurs (`Moderated` en particulier reste un refus ferme).
+        // No-op garanti si la feature est absente ou si aucun `ColdStore`
+        // n'est câblé : `result` est alors renvoyé tel quel, comportement
+        // identique à avant cette tâche.
+        #[cfg(feature = "cold-storage")]
+        if matches!(&result, Err(CoreError::NoProviders(_)))
+            && self.cold_retrieval_enabled.load(Ordering::Relaxed)
+        {
+            if let Some(cold) = self.cold.as_ref() {
+                return cold_fallback_inner(
+                    &self.blockstore,
+                    &self.moderation,
+                    &self.cmd_tx,
+                    &self.reports,
+                    &self.keypair,
+                    cold,
+                    cid,
+                    policy,
+                )
+                .await;
+            }
+        }
+        result
+    }
 }
 
 /// Aperçu d'un channel résolu par lien (spec 2026-07-23, partie A), voir
@@ -529,6 +595,10 @@ impl Node {
         // feature.
         let cold_retrieval_enabled = Arc::new(AtomicBool::new(load_cold_enabled(&blockstore)));
 
+        // Purge des sessions de lecture orphelines (un front qui n'a pas fermé).
+        let _ = std::fs::remove_dir_all(stream::streams_root(&blockstore));
+        let (stream_events, _) = tokio::sync::broadcast::channel(64);
+
         Ok(Self {
             peer_id,
             keypair,
@@ -550,6 +620,9 @@ impl Node {
             #[cfg(feature = "cold-storage")]
             cold: None,
             cold_retrieval_enabled,
+            streams: Arc::new(Mutex::new(HashMap::new())),
+            stream_next_id: Arc::new(AtomicU64::new(0)),
+            stream_events,
         })
     }
 
@@ -1154,6 +1227,78 @@ impl Node {
         }
         let _ = self.seed_events.send(());
         Ok(manifest_cid)
+    }
+
+    /// Ouvre une session de lecture progressive : récupère et parse le
+    /// manifeste (→ `Moderated`/`NotFound` sortent ici), démarre serveur et
+    /// ordonnanceur, rend l'URL de la playlist VOD. Politique `Seed` si le
+    /// manifeste appartient à un channel souscrit (comme `fetch_hls`),
+    /// `Stream` sinon (cache de session éphémère, rien au blockstore).
+    pub async fn open_stream(&self, manifest_cid: Cid) -> CoreResult<StreamSessionInfo> {
+        let subscribed = self
+            .catalog_subscribed()
+            .into_iter()
+            .any(|e| e.cids.contains(&manifest_cid));
+        let policy = if subscribed {
+            StorePolicy::Seed
+        } else {
+            StorePolicy::Stream
+        };
+        let bytes = self.get_with(manifest_cid, policy).await?;
+        let manifest = HlsManifest::from_json(&bytes)?;
+        let id = self.stream_next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let dir = stream::streams_root(&self.blockstore).join(id.to_string());
+        let (session, info) = StreamSession::open(
+            id,
+            &manifest,
+            policy,
+            dir,
+            self.blockstore.clone(),
+            self.fetcher(),
+            self.stream_events.clone(),
+            self.seed_wake.clone(),
+        )
+        .await?;
+        self.streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, session);
+        let _ = self.stream_events.send(id);
+        Ok(info)
+    }
+
+    /// Ferme une session (idempotent) : serveur arrêté, boucle annulée,
+    /// répertoire de session supprimé.
+    pub async fn close_stream(&self, id: u64) {
+        let session = self
+            .streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
+        if let Some(session) = session {
+            let dir = session.dir().to_path_buf();
+            drop(session);
+            if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+                tracing::debug!("purge du répertoire de session {id}: {e}");
+            }
+            let _ = self.stream_events.send(id);
+        }
+    }
+
+    /// État d'une session ; inconnue → `BlockNotFound` (mappé `NotFound`).
+    pub fn stream_status(&self, id: u64) -> CoreResult<StreamStatus> {
+        self.streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&id)
+            .map(StreamSession::status)
+            .ok_or_else(|| CoreError::BlockNotFound(format!("session de lecture {id}")))
+    }
+
+    /// Tics de session (`id`) à chaque changement d'état — point d'accroche du
+    /// `StreamListener` FFI, même patron que `subscribe_seed`.
+    pub fn subscribe_stream(&self) -> tokio::sync::broadcast::Receiver<u64> {
+        self.stream_events.subscribe()
     }
 
     /// Reconstruit un HLS jouable depuis un manifeste : récupère le manifeste et
@@ -1804,44 +1949,24 @@ impl Node {
     /// **signalé** aux pairs (rapport signé sur le topic des signalements,
     /// best-effort).
     pub(crate) async fn get_with(&self, cid: Cid, policy: StorePolicy) -> CoreResult<Vec<u8>> {
-        let result = get_with_inner(
-            &self.blockstore,
-            &self.moderation,
-            &self.cmd_tx,
-            self.peer_id,
-            &self.keypair,
-            &self.reports,
-            cid,
-            policy,
-        )
-        .await;
+        self.fetcher().get_with(cid, policy).await
+    }
 
-        // Repli de récupération froide (ADR 0008, CS-a tâche 3) : uniquement
-        // sur `NoProviders` (plus aucun fournisseur P2P), jamais sur les
-        // autres erreurs (`Moderated` en particulier reste un refus ferme).
-        // No-op garanti si la feature est absente ou si aucun `ColdStore`
-        // n'est câblé : `result` est alors renvoyé tel quel, comportement
-        // identique à avant cette tâche.
-        #[cfg(feature = "cold-storage")]
-        if matches!(&result, Err(CoreError::NoProviders(_)))
-            && self.cold_retrieval_enabled.load(Ordering::Relaxed)
-        {
-            if let Some(cold) = self.cold.as_ref() {
-                return cold_fallback_inner(
-                    &self.blockstore,
-                    &self.moderation,
-                    &self.cmd_tx,
-                    &self.reports,
-                    &self.keypair,
-                    cold,
-                    cid,
-                    policy,
-                )
-                .await;
-            }
+    /// Extrait un [`Fetcher`] clonable, indépendant de la poignée `Node` :
+    /// utilisé par les tâches de fond (boucle de fetch d'une session de
+    /// lecture) qui ne doivent pas retenir le nœud en vie.
+    pub(crate) fn fetcher(&self) -> Fetcher {
+        Fetcher {
+            blockstore: self.blockstore.clone(),
+            moderation: self.moderation.clone(),
+            cmd_tx: self.cmd_tx.clone(),
+            peer_id: self.peer_id,
+            keypair: self.keypair.clone(),
+            reports: self.reports.clone(),
+            #[cfg(feature = "cold-storage")]
+            cold: self.cold.clone(),
+            cold_retrieval_enabled: self.cold_retrieval_enabled.clone(),
         }
-
-        result
     }
 
     /// Active/désactive le repli de récupération froide et persiste le choix
@@ -3826,5 +3951,56 @@ mod tests {
         // Réouverture : le dotfile .cold_enabled doit relire false.
         let node = Node::open(dir.path()).await.unwrap();
         assert!(!node.cold_retrieval_enabled(), "persisté à la réouverture");
+    }
+
+    /// Ouverture d'une session de lecture progressive : la playlist servie par
+    /// le serveur local pointe sur des noms d'index, un segment déjà présent
+    /// localement est servi tel quel, et `close_stream` purge le répertoire de
+    /// session (puis reste idempotent).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_stream_serves_playlist_and_close_purges_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let kp = Keypair::generate_ed25519();
+        let bs = Blockstore::open(dir.path().join("blocks")).unwrap();
+        let node = Node::with_moderation(kp, bs, Moderation::empty())
+            .await
+            .unwrap();
+        let seg = node.add(b"segment local").await.unwrap();
+        let manifest = HlsManifest::new(
+            1.0,
+            vec![crate::ingest::HlsSegment {
+                cid: seg.to_string(),
+                duration: 1.0,
+            }],
+        );
+        let mcid = node
+            .add(manifest.to_json().unwrap().as_bytes())
+            .await
+            .unwrap();
+
+        let info = node.open_stream(mcid).await.unwrap();
+        assert_eq!(info.total_segments, 1);
+        let playlist = reqwest::get(&info.url).await.unwrap().text().await.unwrap();
+        assert!(playlist.contains("0.ts"), "playlist inattendue: {playlist}");
+        let seg_url = info.url.replace("index.m3u8", "0.ts");
+        assert_eq!(
+            reqwest::get(&seg_url)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            b"segment local"
+        );
+        let st = node.stream_status(info.id).unwrap();
+        assert_eq!(st.total_segments, 1);
+
+        let session_dir = crate::stream::streams_root(node.blockstore()).join(info.id.to_string());
+        assert!(session_dir.exists());
+        node.close_stream(info.id).await;
+        assert!(!session_dir.exists());
+        assert!(node.stream_status(info.id).is_err());
+        node.close_stream(info.id).await; // idempotent
     }
 }

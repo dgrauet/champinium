@@ -149,8 +149,10 @@ dur — le risque #1, async/callbacks via FFI, est éprouvé vers Swift ET C#).
 Bindings Swift **et** C# générés et vérifiés pour toute la surface.
 **UI macOS (SwiftUI) ✔ (compile)** : `apps/macos` consomme l'XCFramework + le
 wrapper généré (`just macos-prepare`) ; `ContentView` fait openNode → listen →
-connect → catalogue → `fetchHls` → lecture **AVPlayer**. `swift build` OK
-(compile + link contre le binding réel). Lecture GUI à valider hors headless.
+connect → catalogue → `openStream` → lecture progressive **AVPlayer** (voir
+lecture progressive, ADR 0009, plus bas — `fetchHls` a depuis été retiré du
+FFI). `swift build` OK (compile + link contre le binding réel). Lecture GUI à
+valider hors headless.
 Voir [`AGENTS.md`](AGENTS.md) pour le tableau du contrat.
 
 **Critère de sortie MVP (Phase 3) déroulé (historique)** — à l'origine prouvé
@@ -371,6 +373,16 @@ sur deux machines physiques.
   pratique est déjà assurée par le point ci-dessus, l'interop IPFS public
   reste bloquée par ailleurs — voir [`docs/adr/0007-ipns-deferred.md`](docs/adr/0007-ipns-deferred.md)).
   **La refonte channels (lots a–d) est intégralement livrée.**
+- **Lecture progressive ✔ (ADR 0009)** : `Node::open_stream` sert une playlist
+  HLS VOD sur `127.0.0.1` (jeton d'URL, GET/HEAD, `Range`) et récupère les
+  segments à la demande (priorité au segment demandé, préchargement 90 s,
+  seek libre) via `get_with` — modération #2, politique Seed/Stream et repli
+  froid inchangés ; complétion d'une session `Seed` → réveil du seed proactif.
+  `fetch_hls` retiré du FFI (reste au CLI en export hors ligne). **Contrat
+  FFI v11** (`open_stream`/`close_stream`/`stream_status`/`StreamListener`) ;
+  CLI `stream <cid> --peer …`. Les trois fronts lisent l'URL dans leur
+  lecteur natif et affichent « segments : x/y ». Spec :
+  `~/Work/.superpowers/champinium/specs/2026-09-05-hls-streaming-design.md`.
 - **Packaging Linux — Flatpak ✔ (fonctionnel, palier gratuit)** : manifeste
   [`packaging/flatpak/org.champinium.Champinium.yml`](packaging/flatpak/org.champinium.Champinium.yml)
   (app-id `org.champinium.Champinium`, runtime GNOME 48, rustc via rustup au
@@ -438,7 +450,8 @@ mesurée ✔, recherche ✔ (#20) ; **refonte channels COMPLÈTE** — lot (a) i
 ✔, lot (b) abonnements ✔, lot (c) seed proactif/quota/pins ✔, lot (d) modération
 par clé + blocage local + signalements par channel ✔ ; aperçu de channel par
 lien ✔ (`resolve_channel`, contrat v9 ; partie B — scheme OS — ✔) ; durabilité
-du record de feed ✔ (`republish_known_feeds`) ; IPNS #21 close, voir ADR 0007).
+du record de feed ✔ (`republish_known_feeds`) ; IPNS #21 close, voir ADR 0007 ;
+lecture progressive ✔ (ADR 0009)).
 Voir le spec.
 
 **Dernière release : voir `.release-please-manifest.json` / CHANGELOG** —
@@ -446,4 +459,4 @@ pas de version en dur ici, elle dérive (règle intendant DG006). Release-please
 gère le versionnement (`bump-minor-pre-major` actif :
 un breaking change bumpe la mineure tant qu'on est < 1.0.0 — la 1.0 sera un
 choix délibéré de stabilisation d'API). Versionnement du contrat FFI distinct :
-`CONTRACT_VERSION = 10` (voir `AGENTS.md`).
+`CONTRACT_VERSION = 11` (voir `AGENTS.md`).

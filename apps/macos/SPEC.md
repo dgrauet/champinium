@@ -15,16 +15,19 @@ UI. Consomme les bindings Swift générés à partir du contrat UniFFI.
 ## Interfaces
 
 - **Consomme** : module Swift `ChampiniumCore` + `ChampiniumCoreFFI.xcframework`
-  générés par `just macos-prepare` (**non commités**). Contrat **v1** : objet
-  `ChampiniumNode` (`openNode`, `listen`, `connect`, `catalog`, `ingestFile`,
-  `publishFeed`, `fetchHls`) + record `FfiCatalogEntry`.
+  générés par `just macos-prepare` (**non commités**). Contrat actuel **v11** :
+  objet `ChampiniumNode` (`openNode`, `listen`, `connect`, `catalog`,
+  `ingestFile`, `publishFeed`, `openStream`/`closeStream`/`streamStatus`,
+  `setStreamListener`, …) + record `FfiCatalogEntry`. `fetchHls` a été retiré
+  du FFI (ADR 0009) — la lecture passe désormais par `openStream`.
 - **Produit** : rien pour les autres agents (feuille de l'arbre).
 
 ## Definition of Done — Phase 3 (MVP macOS)
 
 - [x] Package SwiftPM lie l'XCFramework + le wrapper généré ; `swift build` OK.
-- [x] UI SwiftUI : `openNode` → `listen` → `connect` → liste du `catalog` → `fetchHls`
-  → lecture **AVPlayer**.
+- [x] UI SwiftUI : `openNode` → `listen` → `connect` → liste du `catalog` →
+  `openStream` → lecture progressive **AVPlayer** sur l'URL locale servie par
+  le noyau.
 - [x] Aucune logique métier dans le code Swift (orchestration d'appels UniFFI).
 - [ ] Exécution/lecture validée sur une vraie session graphique (hors CI headless).
 

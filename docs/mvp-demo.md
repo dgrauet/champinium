@@ -98,6 +98,17 @@ contenu depuis son propre `SeedIndex`, sans dépendre de A.
 
 ```sh
 champinium-cli --data-dir ./machine-c subscribe <PeerId_A> --peer <ADRESSE_B>
+champinium-cli --data-dir ./machine-c stream <CID_manifeste> --peer <ADRESSE_B> | xargs ffplay
+```
+
+Pour la **lecture**, `stream` ouvre une session servie sur `127.0.0.1` et
+imprime l'URL sur stdout (progression sur stderr) — le premier segment joue en
+quelques secondes, avant la fin du transfert du contenu. Pour la
+**vérification d'intégrité** (octets identiques, hors lecteur), `fetch-hls`
+reste l'outil : il télécharge tout puis reconstruit un `index.m3u8` local que
+`ffprobe` peut inspecter directement :
+
+```sh
 champinium-cli --data-dir ./machine-c fetch-hls <CID_manifeste> --peer <ADRESSE_B> --out ./out-c
 ffprobe -v error -show_entries format=format_name,duration ./out-c/index.m3u8
 # format_name=hls, duration=10.000000 — jouable (AVPlayer/GStreamer/ffplay)
@@ -116,17 +127,18 @@ complet (vue **Explorer**, opt-in derrière un avertissement) et lire son
 contenu tant qu'un fournisseur (ici B) est joignable :
 
 ```sh
-champinium-cli --data-dir ./machine-d fetch-hls <CID_manifeste> --peer <ADRESSE_B> --out ./out-d
+champinium-cli --data-dir ./machine-d stream <CID_manifeste> --peer <ADRESSE_B> | xargs ffplay
 champinium-cli --data-dir ./machine-d replication <CID_manifeste> --peer <ADRESSE_B>
 # facteur de réplication: 2 fournisseur(s)   ← INCHANGÉ après la lecture de D
 ```
 
-`out-d` est identique octet pour octet à `out-c`/`out-b` (`shasum`), mais le
-PeerId de D **n'apparaît pas** parmi les fournisseurs du CID après coup :
-`get` en politique `Stream` (le défaut de toute lecture) ne met pas le bloc en
-cache chez D et ne l'annonce pas comme fournisseur. Regarder en vue Explorer
-ne persiste plus rien — seul un abonnement retenu par un nœud en ligne (étapes
-2-3) le fait.
+D lit la vidéo sans erreur, mais le PeerId de D **n'apparaît pas** parmi les
+fournisseurs du CID après coup : `stream` en politique `Stream` (le défaut de
+toute lecture non souscrite) sert les segments dans le cache de session
+`<blocs>/.streams/<id>/` (purgé à `close_stream`), **ne met aucun bloc dans le
+blockstore** et n'annonce aucun provider record pour D. Regarder en vue
+Explorer ne persiste plus rien — seul un abonnement retenu par un nœud en
+ligne (étapes 2-3) le fait.
 
 ## 7. Désabonnement — la purge (pins exceptés)
 

@@ -35,6 +35,7 @@ pub mod paths;
 pub mod relay;
 pub mod report;
 pub mod seeding;
+pub mod stream;
 
 pub use blockstore::Blockstore;
 pub use catalog::{Catalog, CatalogEntry};
@@ -46,6 +47,7 @@ pub use p2p::Node;
 pub use relay::{start_relay, RelayHandle};
 pub use report::Report;
 pub use seeding::{SeedIndex, SeededPublication};
+pub use stream::{StreamSessionInfo, StreamStatus};
 
 // Réexports pratiques pour les consommateurs Rust du crate (cli, front Linux).
 pub use cid::Cid;
@@ -54,7 +56,7 @@ pub use libp2p::{Multiaddr, PeerId};
 /// Version de la SURFACE de contrat UniFFI (distincte de la version du paquet).
 /// Tout changement de la surface exportée incrémente cette constante ET est
 /// annoncé dans AGENTS.md (voir « Protocole de changement de contrat »).
-pub const CONTRACT_VERSION: u32 = 10;
+pub const CONTRACT_VERSION: u32 = 11;
 
 /// CONTRAT v0 — version du noyau. Première fonction exposée : valide de bout en
 /// bout la chaîne de génération et de chargement des bindings sur les 3 fronts.

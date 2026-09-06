@@ -148,16 +148,38 @@ public sealed class NodeViewModel : INotifyPropertyChanged
         public void OnSeedUpdated() => _onUpdate();
     }
 
+    /// <summary>Pont vers le callback de session de lecture progressive — même
+    /// patron que <see cref="SeedRefresher"/> : re-dispatch, puis le VM relit
+    /// `StreamStatus(id)`.</summary>
+    private sealed class StreamRefresher : StreamListener
+    {
+        private readonly Action<ulong> _onUpdate;
+
+        public StreamRefresher(Action<ulong> onUpdate) => _onUpdate = onUpdate;
+
+        public void OnStreamUpdated(ulong id) => _onUpdate(id);
+    }
+
     private ChampiniumNode? _node;
     private Microsoft.UI.Dispatching.DispatcherQueue? _dispatcher;
     private CatalogRefresher? _listener;
     private SeedRefresher? _seedListener;
+    private StreamListener? _streamListener;
 
-    /// <summary>Répertoire de la lecture en cours (supprimé au changement de contenu).</summary>
-    private string? _currentPlayDir;
+    /// <summary>Identifiant de la session de lecture progressive en cours (ou
+    /// <c>null</c> hors lecture) — le core ferme les sessions par id, plus de
+    /// répertoire de lecture local à gérer côté front (voir `OpenStream`).</summary>
+    private ulong? _currentStreamId;
 
-    /// <summary>Racine des répertoires de lecture temporaires.</summary>
-    private static string PlayRoot => Path.Combine(Path.GetTempPath(), "champinium-play");
+    private string _streamProgress = "";
+
+    /// <summary>Progression de la session en cours (« segments : x/y » ou
+    /// « lecture interrompue : &lt;raison&gt; ») — liée sous le lecteur média.</summary>
+    public string StreamProgress
+    {
+        get => _streamProgress;
+        private set => Set(ref _streamProgress, value);
+    }
 
     private string _status = "démarrage…";
     public string Status
@@ -352,15 +374,6 @@ public sealed class NodeViewModel : INotifyPropertyChanged
     /// <summary>Ouvre le nœud sous le répertoire de données durable de l'OS et commence à écouter.</summary>
     public async Task StartAsync()
     {
-        // Purge (best-effort) les répertoires de lecture des exécutions
-        // précédentes : ils ne servent qu'à la session en cours.
-        try
-        {
-            Directory.Delete(PlayRoot, recursive: true);
-        }
-        catch (IOException) { } // couvre aussi DirectoryNotFoundException
-        catch (UnauthorizedAccessException) { }
-
         try
         {
             // Répertoire durable choisi par le noyau (%LocalAppData%\Champinium
@@ -387,6 +400,10 @@ public sealed class NodeViewModel : INotifyPropertyChanged
             _seedListener = new SeedRefresher(
                 () => _dispatcher?.TryEnqueue(RefreshCatalog));
             await node.SetSeedListener(_seedListener);
+
+            _streamListener = new StreamRefresher(
+                id => _dispatcher?.TryEnqueue(() => RefreshStream(id)));
+            await node.SetStreamListener(_streamListener);
 
             Status = "nœud en ligne";
             RefreshCatalog();
@@ -718,7 +735,9 @@ public sealed class NodeViewModel : INotifyPropertyChanged
         }
     }
 
-    /// <summary>Récupère un HLS (manifeste) et signale qu'il est prêt à lire.</summary>
+    /// <summary>Ouvre une session de lecture progressive et signale l'URL à
+    /// lire (`OpenStream` — plus de reconstruction locale d'un `index.m3u8` :
+    /// l'URL se donne telle quelle au lecteur natif).</summary>
     public async Task PlayAsync(string manifestCid)
     {
         if (_node is null)
@@ -726,29 +745,15 @@ public sealed class NodeViewModel : INotifyPropertyChanged
             return;
         }
 
-        // Supprime (best-effort) le répertoire de la lecture précédente : le
-        // lecteur peut encore verrouiller un segment ; le reliquat éventuel est
-        // repris par la purge du prochain démarrage.
-        if (_currentPlayDir is not null)
-        {
-            try
-            {
-                Directory.Delete(_currentPlayDir, recursive: true);
-            }
-            catch (IOException) { }
-            catch (UnauthorizedAccessException) { }
-            _currentPlayDir = null;
-        }
+        await StopPlaybackAsync();
 
         try
         {
-            var outDir = Path.Combine(PlayRoot, Guid.NewGuid().ToString());
-            Directory.CreateDirectory(outDir);
-
-            var playlist = await _node.FetchHls(manifestCid, outDir);
-            _currentPlayDir = outDir;
+            var session = await _node.OpenStream(manifestCid);
+            _currentStreamId = session.id;
+            StreamProgress = $"segments : 0/{session.totalSegments}";
             Status = "lecture en cours";
-            PlaybackReady?.Invoke(playlist);
+            PlaybackReady?.Invoke(session.url);
         }
         // Erreur typée du contrat : un refus de modération est un blocage
         // volontaire, présenté comme tel (pas comme une panne technique).
@@ -760,6 +765,40 @@ public sealed class NodeViewModel : INotifyPropertyChanged
         {
             Status = $"lecture: {ex.Message}";
         }
+    }
+
+    /// <summary>Ferme la session de lecture courante (idempotent côté cœur —
+    /// le core purge lui-même le répertoire de session, plus rien à nettoyer
+    /// côté front). Appelée avant d'ouvrir une nouvelle session, et à la
+    /// fermeture de la fenêtre.</summary>
+    public async Task StopPlaybackAsync()
+    {
+        StreamProgress = "";
+        if (_currentStreamId is ulong id && _node is not null)
+        {
+            _currentStreamId = null;
+            await _node.CloseStream(id);
+        }
+    }
+
+    /// <summary>Relit l'état de la session en cours après une notification du
+    /// <see cref="StreamRefresher"/> — ignore les notifications d'une session
+    /// déjà remplacée/fermée (course avec <see cref="PlayAsync"/>/<see cref="StopPlaybackAsync"/>).</summary>
+    private void RefreshStream(ulong id)
+    {
+        if (_node is null || _currentStreamId != id)
+        {
+            return;
+        }
+
+        try
+        {
+            var st = _node.StreamStatus(id);
+            StreamProgress = st.failedReason is string reason
+                ? $"lecture interrompue : {reason}"
+                : $"segments : {st.fetchedSegments}/{st.totalSegments}";
+        }
+        catch (FfiException) { }
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;

@@ -16,11 +16,13 @@ pour le seeding hors UI. Consomme les bindings C# générés par `uniffi-bindgen
 
 - **Consomme** : bindings C# `Champinium.Core` générés par `just gen-csharp`
   (`bindings/csharp/`, **non commité**) + la `champinium_core.dll`. Contrat
-  actuel **v1** : objet `ChampiniumNode` (`OpenNode`, `PeerId`, `Catalog`,
-  `Listen`, `Connect`, `IngestFile`, `PublishFeed`, `FetchHls`), record
-  `FfiCatalogEntry { Issuer, Seq, Cids }`, erreur `FfiError`. Les fonctions libres
-  (dont `OpenNode`) sont exposées par uniffi-bindgen-cs dans la classe statique
-  `ChampiniumCoreMethods`.
+  actuel **v11** : objet `ChampiniumNode` (`OpenNode`, `PeerId`, `Catalog`,
+  `Listen`, `Connect`, `IngestFile`, `PublishFeed`, `OpenStream`/`CloseStream`/
+  `StreamStatus`, `SetStreamListener`, …), record
+  `FfiCatalogEntry { Issuer, Seq, Cids }`, erreur `FfiError`. `FetchHls` a été
+  retiré du FFI (ADR 0009) — la lecture passe désormais par `OpenStream`. Les
+  fonctions libres (dont `OpenNode`) sont exposées par uniffi-bindgen-cs dans
+  la classe statique `ChampiniumCoreMethods`.
 - **Produit** : rien pour les autres agents (feuille de l'arbre).
 
 ## Definition of Done — Phase 4 (UI catalogue + lecture)
@@ -34,8 +36,10 @@ pour le seeding hors UI. Consomme les bindings C# générés par `uniffi-bindgen
   **Lire**), `MediaPlayerElement` (Media Foundation).
 - [x] VM (`NodeViewModel`, MVVM léger via `INotifyPropertyChanged`) : au lancement
   `await OpenNode(<LocalAppData>\Champinium)` puis `Listen("/ip4/0.0.0.0/tcp/0")` ;
-  **Connecter** → `Connect` ; **Rafraîchir** → `Catalog` ; **Lire** → `FetchHls`
-  puis `MediaPlayerElement.Source = MediaSource.CreateFromUri(...)` + lecture.
+  **Connecter** → `Connect` ; **Rafraîchir** → `Catalog` ; **Lire** → `OpenStream`
+  puis `MediaPlayerElement.Source = MediaSource.CreateFromUri(...)` sur l'URL
+  locale de la session, avec une progression « segments : x/y » et
+  `CloseStream` à l'arrêt.
 - [x] `.csproj` référence les bindings générés
   (`<Compile Include="..\..\..\bindings\csharp\**\*.cs" />`) et copie la dll native
   à côté de l'exe.
