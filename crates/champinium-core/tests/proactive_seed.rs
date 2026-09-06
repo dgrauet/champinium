@@ -128,11 +128,22 @@ async fn subscribing_proactively_seeds_publication_without_any_read() {
     .await
     .expect("le seed proactif doit récupérer manifeste + segment sans lecture explicite");
 
-    // B doit s'être annoncé fournisseur (Seed, pas Stream).
-    let providers = node_b.get_providers(seg_cid).await.unwrap();
+    // B doit s'être annoncé fournisseur (Seed, pas Stream). Annonce par
+    // racine (ADR 0012) : c'est le MANIFESTE (le root) qui porte l'annonce
+    // d'une publication seedée — le segment, lui, est retenu et resservi mais
+    // jamais annoncé.
+    let providers = node_b.get_providers(manifest_cid).await.unwrap();
     assert!(
         providers.contains(&node_b.peer_id()),
-        "B doit devenir fournisseur du segment après l'avoir seedé"
+        "B doit devenir fournisseur du manifeste après l'avoir seedé"
+    );
+    assert!(
+        !node_b
+            .get_providers(seg_cid)
+            .await
+            .unwrap()
+            .contains(&node_b.peer_id()),
+        "B ne doit PAS s'annoncer fournisseur du segment (annonce par racine)"
     );
 
     let (seeded, total) = node_b.seed_status(node_a.peer_id());
@@ -177,16 +188,25 @@ async fn offline_publisher_content_survives_via_proactive_seeder() {
     let node_c = node(dir.path(), "c").await;
     connect(&node_b, &node_c).await;
 
-    let fetched = tokio::time::timeout(CONVERGE, async {
+    // C récupère la publication par sa RACINE (annonce par racine, ADR 0012 :
+    // le segment n'a plus de provider record, il se découvre via les
+    // fournisseurs du manifeste — ici B seul). `fetch_hls` est exactement ce
+    // chemin ; ce que le test prouve est inchangé : le contenu de A survit à
+    // son extinction grâce au seed proactif de B.
+    let out = dir.path().join("c-out");
+    tokio::time::timeout(CONVERGE, async {
         loop {
-            if let Ok(bytes) = node_c.get(seg_cid).await {
-                return bytes;
+            if node_c.fetch_hls(manifest_cid, &out).await.is_ok() {
+                return;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     })
     .await
     .expect("C doit récupérer le contenu depuis B seul, A étant hors ligne");
+    let fetched = tokio::fs::read(out.join(format!("{seg_cid}.ts")))
+        .await
+        .expect("le segment reconstruit doit être écrit sur disque");
     assert_eq!(fetched, payload);
 }
 
