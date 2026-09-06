@@ -121,6 +121,7 @@ struct ContentView: View {
                             Text(item.tags.joined(separator: " · "))
                                 .font(.caption2).foregroundStyle(.secondary)
                         }
+                        provenanceBadge(item.provenance)
                     }
                 }
                 .frame(minHeight: 160)
@@ -355,7 +356,8 @@ struct ContentView: View {
                     ForEach(entry.items, id: \.cid) { item in
                         contentRow(
                             title: item.title, tags: item.tags, cid: item.cid,
-                            isPinned: tab == .subscriptions ? entry.pinned.contains(item.cid) : nil
+                            isPinned: tab == .subscriptions ? entry.pinned.contains(item.cid) : nil,
+                            provenance: item.provenance
                         )
                     }
                 }
@@ -436,7 +438,10 @@ struct ContentView: View {
     private var searchResults: some View {
         List {
             ForEach(model.searchHits, id: \.cid) { hit in
-                contentRow(title: hit.title, tags: hit.tags, cid: hit.cid, isPinned: nil)
+                contentRow(
+                    title: hit.title, tags: hit.tags, cid: hit.cid, isPinned: nil,
+                    provenance: hit.provenance
+                )
             }
             if model.searchHits.isEmpty {
                 Text("aucun résultat").foregroundStyle(.secondary)
@@ -448,7 +453,7 @@ struct ContentView: View {
     /// et bouton Garder/Oublier (pin) quand `isPinned` est fourni (Abonnements
     /// uniquement — épingler un contenu hors abonnement n'a pas de sens ici).
     private func contentRow(title: String, tags: [String], cid: String,
-                            isPinned: Bool?) -> some View
+                            isPinned: Bool?, provenance: FfiProvenance) -> some View
     {
         HStack {
             VStack(alignment: .leading, spacing: 2) {
@@ -459,6 +464,7 @@ struct ContentView: View {
                     Text(tags.joined(separator: " · "))
                         .font(.caption2).foregroundStyle(.secondary)
                 }
+                provenanceBadge(provenance)
             }
             Spacer()
             if let isPinned {
@@ -469,6 +475,28 @@ struct ContentView: View {
                 .buttonStyle(.bordered)
             }
             Button("Lire") { Task { await model.play(manifestCid: cid) } }
+        }
+    }
+
+    private func provenanceLabel(_ p: FfiProvenance) -> String {
+        switch p.mode {
+        case .generated: "IA"
+        case .assisted: "Assisté IA"
+        case .captured: "Capturé"
+        case .undeclared: "Non déclaré"
+        }
+    }
+
+    private func provenanceBadge(_ p: FfiProvenance) -> some View {
+        HStack(spacing: 6) {
+            Text(provenanceLabel(p))
+                .font(.caption2).bold()
+                .padding(.horizontal, 6).padding(.vertical, 2)
+                .background(Capsule().fill(Color.accentColor.opacity(0.15)))
+            if !p.tools.isEmpty {
+                Text(p.tools.joined(separator: " · "))
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
         }
     }
 
