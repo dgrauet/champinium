@@ -1535,8 +1535,10 @@ impl Node {
         let playlist = out_dir.join("index.m3u8");
         tokio::fs::write(&playlist, manifest.to_m3u8()).await?;
 
-        // M1 (revue finale lot c) : `get_with(Seed)` ci-dessus met déjà les
-        // blocs en cache et les réannonce, mais ne touchait pas le SeedIndex —
+        // M1 (revue finale lot c) : `get_with(Seed)` ci-dessus met déjà le
+        // manifeste en cache et le réannonce (les segments, récupérés sous un
+        // indice de racine, sont seulement mis en cache — jamais réannoncés,
+        // annonce par racine, ADR 0012), mais ne touchait pas le SeedIndex —
         // la publication restait invisible du quota (`storage_stats`) et
         // survivait à un désabonnement (`unsubscribe` ne purge que ce que le
         // SeedIndex connaît). On l'y enregistre si elle n'y est pas déjà.
@@ -2264,6 +2266,18 @@ impl Node {
         root: Option<Cid>,
     ) -> CoreResult<Vec<u8>> {
         self.fetcher().get_with(cid, policy, root).await
+    }
+
+    /// [`Node::get`] avec un **indice de racine** explicite (annonce par
+    /// racine, ADR 0012) : `root` est le CID du manifeste qui liste `cid`
+    /// quand celui-ci est un segment, `None` s'il est lui-même un root.
+    /// Politique `Stream` (comme `get`) — jamais de mise en cache ni
+    /// d'annonce. Point d'entrée public pour un consommateur (le CLI) qui
+    /// connaît déjà le manifeste d'un segment et veut éviter un
+    /// `NoProviders` inutile : `StorePolicy` restant `pub(crate)`,
+    /// `get_with_root` lui-même ne peut pas être exposé tel quel.
+    pub async fn get_from(&self, cid: Cid, root: Option<Cid>) -> CoreResult<Vec<u8>> {
+        self.get_with_root(cid, StorePolicy::Stream, root).await
     }
 
     /// Extrait un [`Fetcher`] clonable, indépendant de la poignée `Node` :

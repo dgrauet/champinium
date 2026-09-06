@@ -59,6 +59,10 @@ enum Cmd {
         /// Fichier de sortie (sinon: nombre d'octets sur stdout).
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Manifeste dont ce CID est un segment (les segments ne sont pas
+        /// annoncés, seule leur racine l'est).
+        #[arg(long)]
+        root: Option<String>,
     },
     /// Liste les fournisseurs d'un CID via la DHT.
     FindProviders {
@@ -306,12 +310,21 @@ async fn main() -> Result<()> {
             println!("contenu publié + feed annoncé — ce nœud le sert. Ctrl-C pour arrêter.");
             tokio::signal::ctrl_c().await?;
         }
-        Cmd::Get { cid, peer, out } => {
+        Cmd::Get {
+            cid,
+            peer,
+            out,
+            root,
+        } => {
             let cid: Cid = cid.parse().context("CID invalide")?;
+            let root = root
+                .map(|r| r.parse::<Cid>())
+                .transpose()
+                .context("CID de racine invalide")?;
             let node = build_node(&cli.data_dir).await?;
             node.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap()).await?;
             connect_peer(&node, &peer).await?;
-            let bytes = fetch_with_retry(&node, cid).await?;
+            let bytes = fetch_with_retry(&node, cid, root).await?;
             match out {
                 Some(p) => {
                     tokio::fs::write(&p, &bytes).await?;
@@ -882,12 +895,14 @@ async fn search_tag_with_retry(
     }
 }
 
-/// Récupère un bloc en retentant le temps que la connexion et Kademlia convergent.
-async fn fetch_with_retry(node: &Node, cid: Cid) -> Result<Vec<u8>> {
+/// Récupère un bloc en retentant le temps que la connexion et Kademlia
+/// convergent. `root` : indice de racine (annonce par racine, ADR 0012) —
+/// CID du manifeste quand `cid` est l'un de ses segments, `None` sinon.
+async fn fetch_with_retry(node: &Node, cid: Cid, root: Option<Cid>) -> Result<Vec<u8>> {
     let deadline = std::time::Duration::from_secs(20);
     let start = std::time::Instant::now();
     loop {
-        match node.get(cid).await {
+        match node.get_from(cid, root).await {
             Ok(bytes) => return Ok(bytes),
             Err(e) if start.elapsed() < deadline => {
                 tracing::debug!("get en attente ({e}) — nouvelle tentative");
