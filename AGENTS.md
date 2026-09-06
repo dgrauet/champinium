@@ -20,7 +20,7 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
   capacité absente, ils **ouvrent une demande de changement de contrat** (voir
   protocole plus bas) — ils ne contournent pas via du code natif ad hoc.
 
-### Contrat actuel — v12 (`CONTRACT_VERSION = 12`)
+### Contrat actuel — v13 (`CONTRACT_VERSION = 13`)
 
 > v1 → v2 : ajout de `subscribe_denylist(json) -> u64` sur `ChampiniumNode`
 > (modération fédérée activable depuis les fronts). Purement additif.
@@ -131,6 +131,17 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
 > `search(query)` et `search_tag(tag)` matchent aussi les outils déclarés ;
 > les outils sont annoncés dans la DHT sous le même préfixe que les tags.
 > Une déclaration est une **affirmation signée du publieur**, pas une preuve.
+>
+> v12 → v13 : **listes de modération distribuées** (ADR 0011). **Retrait** de
+> `subscribe_denylist(json)` : une liste ne se souscrit plus par fichier mais
+> par **éditeur** (clé), récupérée dans la DHT et suivie. Record
+> `FfiDenylistSource { peer_id, name, seq, entry_count, key_count, updated,
+> locked, fetched }` ; `denylist_sources()` (sync — l'éditeur projet, verrouillé,
+> toujours présent), `subscribe_denylist_issuer(link_or_peer_id)` (async —
+> `champinium://denylist/<peerid>` ou PeerId nu), `unsubscribe_denylist_issuer
+> (peer_id)` (async — `InvalidInput` sur l'éditeur projet), `denylist_link
+> (peer_id)` (sync), callback interface **`ModerationListener`**
+> (`on_moderation_updated()`) via `set_moderation_listener(listener)` (async).
 
 Fonctions libres (smoke test async, conservées de v0) :
 
@@ -150,7 +161,6 @@ Objet **`ChampiniumNode`** (méthodes) :
 | `listen(addr) -> String` | **async** | écoute, renvoie l'adresse liée |
 | `connect(peer) -> ()` | **async** | se connecte à `/…/p2p/<id>` |
 | `ingest_file(path) -> String` | **async** | ffmpeg → HLS, renvoie le CID du manifeste |
-| `subscribe_denylist(json) -> u64` | **async** | souscrit une denylist signée, renvoie le nb de blocs purgés |
 | `set_catalog_listener(listener) -> ()` | **async** | enregistre un `CatalogListener` (rafraîchissement réactif) |
 | `publish_feed_with(items) -> ()` | **async** | publie un feed v4 (titre/tags/provenance signés) + annonce tags et outils DHT |
 | `search(query) -> Vec<FfiSearchHit>` | sync | recherche locale (titres, tags et outils du catalogue reconstruit) |
@@ -178,6 +188,11 @@ Objet **`ChampiniumNode`** (méthodes) :
 | `close_stream(id) -> ()` | **async** | ferme la session (idempotent) |
 | `stream_status(id) -> FfiStreamStatus` | sync | progression / échec de la session |
 | `set_stream_listener(listener) -> ()` | **async** | enregistre un `StreamListener` |
+| `denylist_sources() -> Vec<FfiDenylistSource>` | sync | éditeurs de denylist souscrits (éditeur projet en premier, verrouillé) avec leur dernier instantané connu |
+| `denylist_link(peer_id) -> String` | sync | lien partageable `champinium://denylist/<peerid>` |
+| `subscribe_denylist_issuer(link_or_peer_id) -> ()` | **async** | s'abonne à un éditeur de denylist (lien ou PeerId nu) : persiste + fetch immédiat en tâche de fond |
+| `unsubscribe_denylist_issuer(peer_id) -> ()` | **async** | se désabonne d'un éditeur de denylist ; `InvalidInput` sur l'éditeur projet |
+| `set_moderation_listener(listener) -> ()` | **async** | enregistre un `ModerationListener` (rafraîchissement réactif de la modération) |
 
 Records `FfiCatalogEntry { issuer, seq, cids, items, channel, seeded_count,
 total_count, pinned }`, `FfiContentItem { cid, title, tags }`,

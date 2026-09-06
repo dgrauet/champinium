@@ -7,7 +7,7 @@
 //! Le risque #1 (async via FFI) est éprouvé ici : la plupart des méthodes sont
 //! `async` (runtime tokio) et exposées vers Swift ET C#.
 
-use crate::{Denylist, Node};
+use crate::Node;
 use cid::Cid;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -78,6 +78,32 @@ pub trait SeedListener: Send + Sync {
 #[uniffi::export(with_foreign)]
 pub trait StreamListener: Send + Sync {
     fn on_stream_updated(&self, id: u64);
+}
+
+/// Callback implémenté par les fronts : rappelé à chaque changement effectif
+/// de la modération (souscription/désabonnement d'un éditeur de denylist,
+/// liste rafraîchie). Même contrat que `SeedListener` : tic fusionnable, le
+/// front re-dispatche puis relit `denylist_sources()`.
+#[uniffi::export(with_foreign)]
+pub trait ModerationListener: Send + Sync {
+    fn on_moderation_updated(&self);
+}
+
+/// Instantané des entrées connues pour un éditeur de denylist souscrit
+/// (contrat v13, ADR 0011). `locked = true` pour l'éditeur projet (denylist
+/// par défaut, désabonnement refusé). `fetched = false` tant qu'aucune liste
+/// n'a encore été récupérée pour cet éditeur : les autres champs sont alors
+/// vides/zéro plutôt que d'inventer une valeur.
+#[derive(uniffi::Record)]
+pub struct FfiDenylistSource {
+    pub peer_id: String,
+    pub name: String,
+    pub seq: u64,
+    pub entry_count: u32,
+    pub key_count: u32,
+    pub updated: String,
+    pub locked: bool,
+    pub fetched: bool,
 }
 
 /// Session de lecture ouverte : `url` se donne telle quelle au lecteur natif
@@ -332,6 +358,47 @@ impl ChampiniumNode {
         Ok(crate::channel_link::format(&peer))
     }
 
+    /// Lien partageable d'un éditeur de denylist (bouton « copier le lien de
+    /// cette liste »).
+    pub fn denylist_link(&self, peer_id: String) -> Result<String, FfiError> {
+        let peer = parse_peer_id(&peer_id)?;
+        Ok(crate::channel_link::denylist_link(&peer))
+    }
+
+    /// Éditeurs de denylist souscrits (éditeur projet en premier, verrouillé)
+    /// avec leur dernier instantané connu (contrat v13, ADR 0011).
+    pub fn denylist_sources(&self) -> Vec<FfiDenylistSource> {
+        self.inner
+            .denylist_issuers()
+            .into_iter()
+            .map(|issuer| {
+                let locked = Some(issuer) == self.inner.project_issuer();
+                match self.inner.denylist_source(&issuer) {
+                    Some(src) => FfiDenylistSource {
+                        peer_id: issuer.to_string(),
+                        name: src.name,
+                        seq: src.seq,
+                        entry_count: src.entry_count as u32,
+                        key_count: src.key_count as u32,
+                        updated: src.updated,
+                        locked,
+                        fetched: true,
+                    },
+                    None => FfiDenylistSource {
+                        peer_id: issuer.to_string(),
+                        name: String::new(),
+                        seq: 0,
+                        entry_count: 0,
+                        key_count: 0,
+                        updated: String::new(),
+                        locked,
+                        fetched: false,
+                    },
+                }
+            })
+            .collect()
+    }
+
     /// Recherche **locale** (titres et tags du catalogue reconstruit). Limite
     /// assumée : ne couvre que ce que ce nœud a vu passer.
     pub fn search(&self, query: String) -> Vec<FfiSearchHit> {
@@ -448,14 +515,42 @@ impl ChampiniumNode {
         });
     }
 
-    /// Souscrit à une denylist signée (JSON `champinium-denylist/v1`) : active une
-    /// modération fédérée côté front (au-delà de la denylist par défaut). La
-    /// signature est vérifiée ; les blocs déjà en cache que la liste couvre sont
-    /// purgés. Renvoie le nombre de blocs purgés.
-    pub async fn subscribe_denylist(&self, denylist_json: String) -> Result<u64, FfiError> {
-        let dl = Denylist::from_json(&denylist_json)?;
-        let purged = self.inner.subscribe_denylist(&dl).await?;
-        Ok(purged as u64)
+    /// Souscrit à un éditeur de denylist (lien `champinium://denylist/<peerid>`
+    /// ou PeerId nu) : ajoute l'éditeur à `.denylist_issuers`, persisté, puis
+    /// déclenche un fetch immédiat en tâche de fond (contrat v13, ADR 0011).
+    pub async fn subscribe_denylist_issuer(&self, link_or_peer_id: String) -> Result<(), FfiError> {
+        let peer = crate::channel_link::parse_denylist(&link_or_peer_id).map_err(|_| {
+            FfiError::InvalidInput {
+                msg: format!("lien/PeerId de denylist invalide: {link_or_peer_id}"),
+            }
+        })?;
+        self.inner.subscribe_denylist_issuer(peer)?;
+        Ok(())
+    }
+
+    /// Se désabonne d'un éditeur de denylist. Refuse l'éditeur projet (denylist
+    /// par défaut, non désactivable) avec `InvalidInput`.
+    pub async fn unsubscribe_denylist_issuer(&self, peer_id: String) -> Result<(), FfiError> {
+        let peer = parse_peer_id(&peer_id)?;
+        self.inner.unsubscribe_denylist_issuer(peer).await?;
+        Ok(())
+    }
+
+    /// Enregistre un listener de modération : même patron que
+    /// `set_catalog_listener` — remplace le polling côté front par un
+    /// rafraîchissement réactif de `denylist_sources()`.
+    pub async fn set_moderation_listener(&self, listener: Arc<dyn ModerationListener>) {
+        let mut events = self.inner.subscribe_moderation();
+        tokio::spawn(async move {
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                match events.recv().await {
+                    Ok(()) => listener.on_moderation_updated(),
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        });
     }
 
     /// Définit le profil de channel : persisté, republie le feed courant.
@@ -779,7 +874,7 @@ mod tests {
             hits[0].provenance.mode,
             FfiProvenanceMode::Generated
         ));
-        assert_eq!(crate::contract_version(), 12);
+        assert_eq!(crate::contract_version(), 13);
     }
 
     /// Le listener enregistré est rappelé quand le catalogue change — c'est le
@@ -1425,6 +1520,37 @@ mod tests {
         assert!(node.cold_retrieval_enabled());
         node.set_cold_retrieval(false).unwrap();
         assert!(!node.cold_retrieval_enabled());
+    }
+
+    /// Contrat v13 : l'éditeur projet est toujours présent, verrouillé, et
+    /// non abonné avant premier fetch (`fetched = false`) ; un nouvel éditeur
+    /// s'ajoute via `subscribe_denylist_issuer` (lien) et n'est pas verrouillé.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn denylist_sources_list_locked_project_issuer() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = open_node(dir.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        let sources = node.denylist_sources();
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].locked && !sources[0].fetched);
+        assert!(matches!(
+            node.unsubscribe_denylist_issuer(sources[0].peer_id.clone())
+                .await,
+            Err(FfiError::InvalidInput { .. })
+        ));
+        let other = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        node.subscribe_denylist_issuer(node.denylist_link(other.to_string()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(node.denylist_sources().len(), 2);
+        assert!(matches!(
+            node.subscribe_denylist_issuer("pas-un-peerid".into()).await,
+            Err(FfiError::InvalidInput { .. })
+        ));
+        assert_eq!(crate::contract_version(), 13);
     }
 
     async fn ffmpeg_available() -> bool {
