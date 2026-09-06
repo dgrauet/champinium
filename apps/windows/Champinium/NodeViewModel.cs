@@ -43,7 +43,7 @@ public sealed class CatalogCid
     public bool CanPin { get; init; }
 
     /// <summary>Mode de provenance déclaré par le créateur (feed v4).</summary>
-    public FfiProvenanceMode ProvenanceMode { get; init; } = FfiProvenanceMode.Undeclared;
+    internal FfiProvenanceMode ProvenanceMode { get; init; } = FfiProvenanceMode.Undeclared;
 
     /// <summary>Outils déclarés (normalisés, peut être vide).</summary>
     public IReadOnlyList<string> Tools { get; init; } = Array.Empty<string>();
@@ -120,7 +120,7 @@ public sealed class ChannelPreviewItem
     public string Cid { get; init; } = "";
     public string Title { get; init; } = "";
     public IReadOnlyList<string> Tags { get; init; } = Array.Empty<string>();
-    public FfiProvenanceMode ProvenanceMode { get; init; } = FfiProvenanceMode.Undeclared;
+    internal FfiProvenanceMode ProvenanceMode { get; init; } = FfiProvenanceMode.Undeclared;
     public IReadOnlyList<string> Tools { get; init; } = Array.Empty<string>();
     public string Display => Title.Length > 0 ? Title : Cid;
     public string TagsText => string.Join(" · ", Tags);
