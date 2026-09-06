@@ -366,6 +366,39 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    /// <summary>Suit une source de denylist (bouton « Suivre », panneau
+    /// « Listes de modération »).</summary>
+    private async void OnFollowDenylistClick(object sender, RoutedEventArgs e)
+    {
+        await Model.FollowDenylistAsync();
+    }
+
+    /// <summary>Retire le suivi d'une source de denylist (bouton « Retirer »,
+    /// masqué pour les sources verrouillées — même patron d'accès au
+    /// DataContext que <see cref="OnUnblockClick"/>).</summary>
+    private async void OnUnfollowDenylistClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement { DataContext: DenylistSourceVm source })
+        {
+            await Model.UnfollowDenylistAsync(source.PeerId);
+        }
+    }
+
+    /// <summary>
+    /// Lien `champinium://denylist/…` reçu de l'OS (voir <see cref="App.HandleActivation"/>) —
+    /// préremplit le champ de suivi et ouvre le panneau « Listes de modération »,
+    /// SANS suivre automatiquement (même prudence que l'aperçu de channel : c'est
+    /// l'utilisateur qui déclenche « Suivre »).
+    /// </summary>
+    public async Task OpenDenylistLinkAsync(string uri)
+    {
+        await _xamlRootReady.Task;
+        await Model.NodeReady;
+
+        Model.DenylistField = uri;
+        ModerationButton.Flyout.ShowAt(ModerationButton);
+    }
+
     /// <summary>
     /// Bascule l'épinglage d'une publication. Même patron que
     /// <see cref="OnToggleSubscriptionClick"/> : le conteneur d'item du gabarit
