@@ -20,3 +20,9 @@ Utiliser **rust-libp2p** : provider records Kademlia natifs, gossipsub, et
 - Compatibilité CID (CIDv1 raw/sha2-256) avec l'écosystème IPFS.
 - Du contenu peut provenir de pairs non-Champinium → la modération s'applique à la
   réception quelle que soit la source (voir [ADR-0002](0002-node-side-moderation.md)).
+
+## Conséquence révisée (2026-09-06)
+
+L'interop IPFS publique reste différée (ADR 0006/0007) ; la DHT Kademlia est
+désormais séparée de la DHT IPFS publique (protocole dédié) — voir
+[ADR-0012](0012-dedicated-dht-and-root-providing.md).

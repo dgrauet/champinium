@@ -45,6 +45,11 @@ pub fn streams_root(blockstore: &Blockstore) -> PathBuf {
 /// État partagé entre le serveur (lecture) et la boucle de fetch (écriture).
 pub(crate) struct SessionState {
     id: u64,
+    /// Root de la publication lue : les segments n'étant plus annoncés dans
+    /// la DHT (annonce par racine, ADR 0012), c'est l'indice passé à
+    /// `Fetcher::get_with` pour les découvrir chez les fournisseurs du
+    /// manifeste.
+    manifest_cid: Cid,
     segments: Vec<Cid>,
     playlist: String,
     policy: StorePolicy,
@@ -212,6 +217,7 @@ impl StreamSession {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn open(
         id: u64,
+        manifest_cid: Cid,
         manifest: &HlsManifest,
         policy: StorePolicy,
         dir: PathBuf,
@@ -230,6 +236,7 @@ impl StreamSession {
         let (changed, _) = watch::channel(0u64);
         let state = Arc::new(SessionState {
             id,
+            manifest_cid,
             segments,
             playlist: manifest.to_m3u8_with_uris(|i, _| format!("{i}.ts")),
             policy,
@@ -291,7 +298,11 @@ async fn fetch_loop(fetcher: Fetcher, state: Arc<SessionState>) {
             let f = fetcher.clone();
             let cid = state.segments[idx];
             let policy = state.policy;
-            let handle = inflight.spawn(async move { (idx, f.get_with(cid, policy).await) });
+            // Indice de racine (ADR 0012) : cloné AVANT le spawn — la tâche
+            // ne doit rien emprunter à `state`.
+            let root = state.manifest_cid;
+            let handle =
+                inflight.spawn(async move { (idx, f.get_with(cid, policy, Some(root)).await) });
             task_index.insert(handle.id(), idx);
         }
 

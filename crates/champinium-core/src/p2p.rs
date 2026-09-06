@@ -46,6 +46,11 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 const BLOCK_PROTOCOL: &str = "/champinium/block/1.0.0";
+/// Protocole Kademlia dédié : sans lui, `kad::Config::default()` parle
+/// `/ipfs/kad/1.0.0` et le nœud rejoint la DHT IPFS publique dès qu'il croise
+/// un pair kubo, mélangeant nos records avec le réseau public. DHT séparée
+/// (ADR 0012) ; interop IPFS différée.
+const KAD_PROTOCOL: &str = "/champinium/kad/1.0.0";
 const IDENTIFY_PROTOCOL: &str = "/champinium/0.1.0";
 const FEEDS_TOPIC: &str = "champinium/feeds/v1";
 const REPORTS_TOPIC: &str = "champinium/reports/v1";
@@ -58,8 +63,10 @@ const MAX_BLOCK_REQUEST_SIZE: u64 = 4 * 1024;
 /// Taille max d'un feed diffusé en gossipsub. Le défaut (64 KiB) plafonne à
 /// ~1000 CIDs ; on vise beaucoup plus haut pour un créateur prolifique.
 const MAX_FEED_SIZE: usize = 4 * 1024 * 1024;
-/// Nombre max de provider records annoncés (le défaut 1024 est atteint par un
-/// seeder réel — des heures de vidéo = des milliers de segments).
+/// Nombre max de provider records annoncés. Depuis l'annonce par racine
+/// (ADR 0012), un manifeste HLS ne coûte plus qu'UN provider record (ses
+/// segments ne sont plus annoncés individuellement) ; la valeur reste haute
+/// pour couvrir un seeder réel avec beaucoup de publications distinctes.
 const MAX_PROVIDED_KEYS: usize = 1_000_000;
 /// Nombre max de records DHT stockés localement (feeds d'autres créateurs).
 const MAX_DHT_RECORDS: usize = 100_000;
@@ -109,7 +116,7 @@ impl Behaviour {
         // écraser le record de feed d'autrui chez les nœuds stockeurs (déni de
         // découverte). Les records sont validés dans la boucle d'évènements
         // (voir `EventLoop::handle_inbound_kad_request`).
-        let mut kad_cfg = kad::Config::default();
+        let mut kad_cfg = kad::Config::new(StreamProtocol::new(KAD_PROTOCOL));
         kad_cfg.set_record_filtering(kad::StoreInserts::FilterBoth);
         let store_cfg = kad::store::MemoryStoreConfig {
             max_provided_keys: MAX_PROVIDED_KEYS,
@@ -347,7 +354,15 @@ pub(crate) struct Fetcher {
 }
 
 impl Fetcher {
-    pub(crate) async fn get_with(&self, cid: Cid, policy: StorePolicy) -> CoreResult<Vec<u8>> {
+    /// `root` : indice de racine (annonce par racine, ADR 0012) — pour un
+    /// segment, le CID du manifeste qui le liste ; `None` pour un root
+    /// (manifeste, bloc nu). Voir [`Node::get_with_root`].
+    pub(crate) async fn get_with(
+        &self,
+        cid: Cid,
+        policy: StorePolicy,
+        root: Option<Cid>,
+    ) -> CoreResult<Vec<u8>> {
         let result = get_with_inner(
             &self.blockstore,
             &self.moderation,
@@ -357,6 +372,7 @@ impl Fetcher {
             &self.reports,
             cid,
             policy,
+            root,
         )
         .await;
         // Repli de récupération froide (ADR 0008, CS-a tâche 3) : uniquement
@@ -379,6 +395,7 @@ impl Fetcher {
                     cold,
                     cid,
                     policy,
+                    root,
                 )
                 .await;
             }
@@ -1341,8 +1358,10 @@ impl Node {
     }
 
     /// Ingestion : segmente `input` en HLS via ffmpeg, stocke chaque segment
-    /// (CID, checkpoint modération #1 via `add`) et un manifeste, puis renvoie le
-    /// CID du manifeste (l'identité du « contenu »).
+    /// (CID, checkpoint modération #1 via `put_block` — sans annonce, voir
+    /// ADR 0012) et un manifeste (checkpoint modération #1 via `add`, annoncé
+    /// comme root), puis renvoie le CID du manifeste (l'identité du
+    /// « contenu »).
     pub async fn ingest_file(&self, input: &Path) -> CoreResult<Cid> {
         let work = tempfile::tempdir().map_err(CoreError::Io)?;
         let playlist = ingest::run_ffmpeg_hls(input, work.path(), 4).await?;
@@ -1354,7 +1373,9 @@ impl Node {
         let mut total_bytes = 0u64;
         for (path, duration) in segs {
             let bytes = tokio::fs::read(&path).await?;
-            let cid = self.add(&bytes).await?; // modération #1 + store + provide
+            // Modération #1 + store, PAS d'annonce : le root annoncé est le
+            // manifeste construit ci-dessous (annonce par racine, ADR 0012).
+            let cid = self.put_block(&bytes).await?;
             total_bytes += self.blockstore.size_of(&cid).unwrap_or(bytes.len() as u64);
             segment_cids.push(cid.to_string());
             segments.push(HlsSegment {
@@ -1421,6 +1442,7 @@ impl Node {
         let dir = stream::streams_root(&self.blockstore).join(id.to_string());
         let (session, info) = StreamSession::open(
             id,
+            manifest_cid,
             &manifest,
             policy,
             dir,
@@ -1509,14 +1531,18 @@ impl Node {
         tokio::fs::create_dir_all(out_dir).await?;
         for seg in &manifest.segments {
             let cid: Cid = seg.cid.parse().map_err(CoreError::Cid)?;
-            let data = self.get_with(cid, policy).await?;
+            // Indice de racine (ADR 0012) : les segments ne sont pas annoncés,
+            // ce sont les fournisseurs du manifeste qui les servent.
+            let data = self.get_with_root(cid, policy, Some(manifest_cid)).await?;
             tokio::fs::write(out_dir.join(format!("{}.ts", seg.cid)), &data).await?;
         }
         let playlist = out_dir.join("index.m3u8");
         tokio::fs::write(&playlist, manifest.to_m3u8()).await?;
 
-        // M1 (revue finale lot c) : `get_with(Seed)` ci-dessus met déjà les
-        // blocs en cache et les réannonce, mais ne touchait pas le SeedIndex —
+        // M1 (revue finale lot c) : `get_with(Seed)` ci-dessus met déjà le
+        // manifeste en cache et le réannonce (les segments, récupérés sous un
+        // indice de racine, sont seulement mis en cache — jamais réannoncés,
+        // annonce par racine, ADR 0012), mais ne touchait pas le SeedIndex —
         // la publication restait invisible du quota (`storage_stats`) et
         // survivait à un désabonnement (`unsubscribe` ne purge que ce que le
         // SeedIndex connaît). On l'y enregistre si elle n'y est pas déjà.
@@ -2031,16 +2057,44 @@ impl Node {
         Ok(cid)
     }
 
-    /// Réannonce dans la DHT TOUS les CIDs détenus localement (provider records).
-    /// Indispensable au démarrage d'un seeder : le store de providers Kademlia est
-    /// volatile, donc après un redémarrage les blocs détenus ne sont plus annoncés
-    /// tant qu'on ne les republie pas. Renvoie le nombre de CIDs réannoncés.
-    pub async fn reprovide_all(&self) -> CoreResult<usize> {
-        let cids = self.blockstore.list()?;
-        for cid in &cids {
-            self.provide(*cid).await?;
+    /// Stocke un bloc **sans l'annoncer** — checkpoint modération #1
+    /// inchangé (un contenu matché est refusé, ni stocké ni annoncé).
+    ///
+    /// C'est la voie des SEGMENTS d'un manifeste : seul le root (le
+    /// manifeste, ajouté par [`Node::add`]) est annoncé fournisseur, les
+    /// segments se récupèrent via l'indice de racine de
+    /// [`Node::get_with_root`] (annonce par racine, ADR 0012). Une heure de
+    /// vidéo produit ainsi UN provider record, pas plusieurs centaines.
+    pub(crate) async fn put_block(&self, bytes: &[u8]) -> CoreResult<Cid> {
+        let cid = cid_for(bytes);
+        if self.is_blocked(&cid) {
+            return Err(CoreError::Moderated(cid.to_string()));
         }
-        Ok(cids.len())
+        self.blockstore.put(bytes)
+    }
+
+    /// Réannonce dans la DHT les **roots** détenus localement : tout bloc du
+    /// blockstore SAUF les segments connus du `SeedIndex` (annonce par
+    /// racine, ADR 0012 — manifestes, blocs nus et blocs non indexés restent
+    /// annoncés). Indispensable au démarrage d'un seeder : le store de
+    /// providers Kademlia est volatile, donc après un redémarrage les roots
+    /// détenus ne sont plus annoncés tant qu'on ne les republie pas. Renvoie
+    /// le nombre de roots réannoncés.
+    pub async fn reprovide_all(&self) -> CoreResult<usize> {
+        let segments = self
+            .seed_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .all_segment_cids();
+        let mut count = 0usize;
+        for cid in self.blockstore.list()? {
+            if segments.contains(&cid.to_string()) {
+                continue;
+            }
+            self.provide(cid).await?;
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// Réannonce dans la DHT les feeds SIGNÉS que ce nœud détient
@@ -2143,6 +2197,11 @@ impl Node {
     }
 
     /// Recherche les fournisseurs d'un CID via la DHT.
+    ///
+    /// **À appeler sur un ROOT** (manifeste, bloc nu) : depuis l'annonce par
+    /// racine (ADR 0012), un segment de manifeste n'a aucun provider record —
+    /// la réponse serait vide alors que le contenu est bel et bien disponible
+    /// chez les fournisseurs de son manifeste.
     pub async fn get_providers(&self, cid: Cid) -> CoreResult<HashSet<PeerId>> {
         get_providers_inner(&self.cmd_tx, cid).await
     }
@@ -2151,6 +2210,11 @@ impl Node {
     /// annoncés dans la DHT (soi-même compris). Observabilité de la mitigation
     /// du risque #1 (persistance) : un `get_with(Seed)` doit le faire croître,
     /// un `get` (Stream) par défaut ne le doit plus.
+    ///
+    /// **À appeler sur un ROOT** (manifeste, bloc nu), comme
+    /// [`Node::get_providers`] : un segment n'est plus annoncé (ADR 0012),
+    /// son facteur mesuré serait toujours nul. C'est la réplication du
+    /// MANIFESTE qui mesure celle d'une publication.
     pub async fn replication_factor(&self, cid: Cid) -> CoreResult<usize> {
         Ok(self.get_providers(cid).await?.len())
     }
@@ -2168,21 +2232,60 @@ impl Node {
     /// Récupère un bloc : cache local → sinon découverte DHT + transfert + vérif.
     /// Interroge **tous les fournisseurs en parallèle** et retient la première
     /// réponse valide. `policy` gouverne le sort d'un bloc nouvellement récupéré
-    /// depuis le réseau : `Seed` le met en cache et le réannonce (le nœud
-    /// devient fournisseur), `Stream` se contente de rendre les octets.
+    /// depuis le réseau : `Seed` le met en cache et — SEULEMENT s'il s'agit d'un
+    /// root (`root.is_none()`, voir `get_with_root`/ADR 0012) — le réannonce (le
+    /// nœud devient fournisseur) ; un segment récupéré sous un indice de racine
+    /// est mis en cache mais jamais annoncé individuellement. `Stream` se
+    /// contente de rendre les octets, sans mise en cache ni annonce.
     ///
     /// Exception : si le bloc était présent localement mais **corrompu**, la
-    /// réparation stocke et réannonce toujours, indépendamment de `policy` — le
-    /// nœud le détenait déjà légitimement (par `add` ou un `get_with(Seed)`
-    /// antérieur), la réparation restaure cet état plutôt que d'en décider un
-    /// nouveau.
+    /// réparation stocke toujours, indépendamment de `policy` — le nœud le
+    /// détenait déjà légitimement (par `add`/`put_block` ou un
+    /// `get_with(Seed)` antérieur) — et ne réannonce que dans le même cas
+    /// (`root.is_none()`), la réparation restaurant cet état plutôt que d'en
+    /// décider un nouveau.
     ///
     /// CHECKPOINT MODÉRATION #2 (réception) : un contenu matché n'est ni récupéré,
     /// ni mis en cache, ni fourni — quelle que soit `policy` — et le refus est
     /// **signalé** aux pairs (rapport signé sur le topic des signalements,
     /// best-effort).
     pub(crate) async fn get_with(&self, cid: Cid, policy: StorePolicy) -> CoreResult<Vec<u8>> {
-        self.fetcher().get_with(cid, policy).await
+        self.get_with_root(cid, policy, None).await
+    }
+
+    /// [`Node::get_with`] avec un **indice de racine** (annonce par racine,
+    /// ADR 0012). `root` est le CID du manifeste qui liste `cid` quand `cid`
+    /// est un segment ; `None` quand `cid` est lui-même un root (manifeste,
+    /// bloc nu).
+    ///
+    /// Les segments n'étant plus annoncés dans la DHT, la découverte se fait
+    /// sur les fournisseurs du root — le service de blocs, lui, ne change pas
+    /// (tout bloc détenu est servi), ce qui rend l'indice suffisant. Si le
+    /// root n'a aucun fournisseur, on retombe sur ceux du CID lui-même
+    /// (compat avec un pair qui annoncerait encore par segment).
+    ///
+    /// Conséquence en politique `Seed` : un bloc récupéré avec un indice de
+    /// racine est mis en cache mais **pas** annoncé — le manifeste seul porte
+    /// l'annonce de la publication.
+    pub(crate) async fn get_with_root(
+        &self,
+        cid: Cid,
+        policy: StorePolicy,
+        root: Option<Cid>,
+    ) -> CoreResult<Vec<u8>> {
+        self.fetcher().get_with(cid, policy, root).await
+    }
+
+    /// [`Node::get`] avec un **indice de racine** explicite (annonce par
+    /// racine, ADR 0012) : `root` est le CID du manifeste qui liste `cid`
+    /// quand celui-ci est un segment, `None` s'il est lui-même un root.
+    /// Politique `Stream` (comme `get`) — jamais de mise en cache ni
+    /// d'annonce. Point d'entrée public pour un consommateur (le CLI) qui
+    /// connaît déjà le manifeste d'un segment et veut éviter un
+    /// `NoProviders` inutile : `StorePolicy` restant `pub(crate)`,
+    /// `get_with_root` lui-même ne peut pas être exposé tel quel.
+    pub async fn get_from(&self, cid: Cid, root: Option<Cid>) -> CoreResult<Vec<u8>> {
+        self.get_with_root(cid, StorePolicy::Stream, root).await
     }
 
     /// Extrait un [`Fetcher`] clonable, indépendant de la poignée `Node` :
@@ -2977,6 +3080,7 @@ async fn get_with_inner(
     reports: &Arc<Mutex<ReportBook>>,
     cid: Cid,
     policy: StorePolicy,
+    root: Option<Cid>,
 ) -> CoreResult<Vec<u8>> {
     if is_blocked_inner(moderation, &cid) {
         emit_report_inner(cmd_tx, reports, keypair, &cid, "denylist").await;
@@ -2993,29 +3097,97 @@ async fn get_with_inner(
             Err(e) => return Err(e),
         }
     }
-    let providers = get_providers_inner(cmd_tx, cid).await?;
-    if providers.is_empty() {
-        return Err(CoreError::NoProviders(cid.to_string()));
-    }
-
-    let mut inflight: FuturesUnordered<_> = providers
+    // Annonce par racine (ADR 0012) : les segments ne sont pas annoncés — ce
+    // sont les fournisseurs de leur ROOT (le manifeste) qu'on interroge, et
+    // tout bloc détenu reste servi sur `/champinium/block/1.0.0`. Un second
+    // groupe de candidats (fournisseurs du CID nu) sert de repli : un bloc
+    // nu, un pair annonçant encore par segment, OU — cas important — un
+    // manifeste dont AUCUN fournisseur ne détient plus le segment demandé
+    // (`inflight` s'épuise sans succès). Sans ce second essai, le repli de
+    // stockage froid (déclenché uniquement sur `NoProviders`, jamais sur
+    // `BlockNotFound`) deviendrait inatteignable pour un segment perdu par
+    // tous les détenteurs du manifeste (issue I1, revue finale).
+    let root_providers = get_providers_inner(cmd_tx, root.unwrap_or(cid)).await?;
+    let mut tried: std::collections::HashSet<PeerId> = std::collections::HashSet::new();
+    let root_candidates: Vec<PeerId> = root_providers
         .into_iter()
         .filter(|peer| *peer != self_peer_id)
+        .collect();
+    tried.extend(root_candidates.iter().copied());
+
+    if let Some(bytes) = first_valid_block_inner(cmd_tx, root_candidates, cid).await {
+        if repairing_corruption || policy == StorePolicy::Seed {
+            blockstore.put(&bytes)?;
+            // Annonce par racine (ADR 0012) : un bloc récupéré SOUS un
+            // indice de racine est un segment — mis en cache pour être
+            // resservi, jamais annoncé. Seul un root (`root.is_none()`)
+            // l'est.
+            if root.is_none() {
+                let _ = provide_inner(cmd_tx, moderation, cid).await;
+            }
+        }
+        return Ok(bytes);
+    }
+
+    // Le groupe racine est épuisé (ou vide dès le départ). `root.is_none()` :
+    // pas de second groupe possible, `tried` vide veut dire qu'aucun pair
+    // n'a même pu être interrogé (couvre aussi le cas dégénéré « seul
+    // fournisseur = soi », issue I1) → `NoProviders` ; sinon `BlockNotFound`.
+    if root.is_none() {
+        return if tried.is_empty() {
+            Err(CoreError::NoProviders(cid.to_string()))
+        } else {
+            Err(CoreError::BlockNotFound(cid.to_string()))
+        };
+    }
+
+    // Repli (root.is_some()) : fournisseurs du CID nu, moins ceux déjà
+    // essayés sous le root — couvre un bloc nu, un pair annonçant encore par
+    // segment, OU un manifeste dont AUCUN fournisseur ne détient plus le
+    // segment demandé (issue I1). Un repli vide signifie qu'il n'existe
+    // aucun autre chemin P2P à tenter : c'est le signal `NoProviders` qui
+    // rebranche le repli de récupération froide (ADR 0008) ; un repli
+    // non-vide qui échoue quand même reste `BlockNotFound`.
+    let fallback_providers = get_providers_inner(cmd_tx, cid).await?;
+    let fallback_candidates: Vec<PeerId> = fallback_providers
+        .into_iter()
+        .filter(|peer| *peer != self_peer_id && !tried.contains(peer))
+        .collect();
+    if fallback_candidates.is_empty() {
+        return Err(CoreError::NoProviders(cid.to_string()));
+    }
+    if let Some(bytes) = first_valid_block_inner(cmd_tx, fallback_candidates, cid).await {
+        if repairing_corruption || policy == StorePolicy::Seed {
+            blockstore.put(&bytes)?;
+            if root.is_none() {
+                let _ = provide_inner(cmd_tx, moderation, cid).await;
+            }
+        }
+        return Ok(bytes);
+    }
+    Err(CoreError::BlockNotFound(cid.to_string()))
+}
+
+/// Interroge `peers` en parallèle pour `cid` et retient la première réponse
+/// valide (le CID a déjà été vérifié par `request_block_inner`) ; `None` si
+/// `peers` est vide ou si tous ont échoué (fournisseur hors ligne, bloc
+/// absent chez lui, etc).
+async fn first_valid_block_inner(
+    cmd_tx: &mpsc::Sender<Command>,
+    peers: Vec<PeerId>,
+    cid: Cid,
+) -> Option<Vec<u8>> {
+    let mut inflight: FuturesUnordered<_> = peers
+        .into_iter()
         .map(|peer| request_block_inner(cmd_tx, peer, cid))
         .collect();
     while let Some(result) = inflight.next().await {
         match result {
-            Ok(bytes) => {
-                if repairing_corruption || policy == StorePolicy::Seed {
-                    blockstore.put(&bytes)?;
-                    let _ = provide_inner(cmd_tx, moderation, cid).await;
-                }
-                return Ok(bytes);
-            }
+            Ok(bytes) => return Some(bytes),
             Err(e) => tracing::debug!("fournisseur rejeté pour {cid}: {e}"),
         }
     }
-    Err(CoreError::BlockNotFound(cid.to_string()))
+    None
 }
 
 /// Repli de récupération froide (ADR 0008, CS-a tâche 3) : appelé par
@@ -3039,6 +3211,7 @@ async fn cold_fallback_inner(
     cold: &Arc<dyn ColdStore>,
     cid: Cid,
     policy: StorePolicy,
+    root: Option<Cid>,
 ) -> CoreResult<Vec<u8>> {
     let Some(bytes) = cold.retrieve(cid).await? else {
         return Err(CoreError::NoProviders(cid.to_string()));
@@ -3059,7 +3232,13 @@ async fn cold_fallback_inner(
     }
     if policy == StorePolicy::Seed {
         blockstore.put(&bytes)?;
-        let _ = provide_inner(cmd_tx, moderation, cid).await;
+        // Même règle que le chemin P2P (annonce par racine, ADR 0012) : la
+        // RÉCUPÉRATION froide est inchangée (`retrieve` reçoit toujours le CID
+        // du bloc), mais l'ANNONCE suit le root — un segment reconstitué
+        // depuis le froid est mis en cache, jamais annoncé.
+        if root.is_none() {
+            let _ = provide_inner(cmd_tx, moderation, cid).await;
+        }
     }
     Ok(bytes)
 }
@@ -3279,6 +3458,7 @@ async fn seed_publication(
         &state.reports,
         manifest_cid,
         StorePolicy::Seed,
+        None, // le manifeste EST le root : récupéré et annoncé comme tel.
     )
     .await?;
     let manifest = HlsManifest::from_json(&manifest_bytes)?;
@@ -3316,6 +3496,9 @@ async fn seed_publication(
             &state.reports,
             cid,
             StorePolicy::Seed,
+            // Segment : découvert via les fournisseurs du manifeste, mis en
+            // cache pour être resservi mais JAMAIS annoncé (ADR 0012).
+            Some(manifest_cid),
         )
         .await
         {
@@ -4171,6 +4354,23 @@ mod tests {
     use crate::blockstore::Blockstore;
     use crate::content::cid_for;
 
+    /// La DHT Champinium ne doit PAS parler `/ipfs/kad/1.0.0` (le protocole par
+    /// défaut de libp2p-kad) : rejoindre la DHT IPFS publique par accident
+    /// exposerait nos records à n'importe quel nœud kubo. Voir ADR 0012.
+    #[test]
+    fn kademlia_uses_champinium_protocol() {
+        let key = Keypair::generate_ed25519();
+        let swarm = build_swarm(key).expect("build_swarm");
+        let names: Vec<String> = swarm
+            .behaviour()
+            .kademlia
+            .protocol_names()
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+        assert_eq!(names, vec![KAD_PROTOCOL.to_string()]);
+    }
+
     /// Le point de commit du seed ne retient une publication que si l'émetteur
     /// est toujours abonné ET non banni ; le ban prime sur l'abonnement (garde
     /// déterministe du TOCTOU purge/seed, non forçable en test d'intégration).
@@ -4355,12 +4555,15 @@ mod tests {
             .denylist_source(&editor_peer)
             .expect("éditeur connu du moteur après application");
         assert_eq!((source.seq, source.entry_count), (3, 1));
-        // Au moins un tic (souscription, puis application) ; on les draine tous
-        // pour que l'assertion « périmé = pas de tic » plus bas soit nette : le
-        // fetch immédiat lancé par `subscribe_denylist_issuer` peut avoir
-        // gagné la course avec celui de la boucle ci-dessus.
+        // Au moins un tic (souscription, puis application) ; on les draine
+        // jusqu'au silence (300ms sans tic) plutôt qu'en une seule passe :
+        // `subscribe_denylist_issuer` lance un fetch de fond qui court avec
+        // la boucle ci-dessus, et son tic peut arriver APRÈS un `try_recv`
+        // ponctuel, laissant un tic en attente au moment de l'assertion
+        // « périmé = pas de tic » plus bas (flake I2, revue finale).
         let mut seen = 0usize;
-        while ticks.try_recv().is_ok() {
+        while let Ok(Ok(())) = tokio::time::timeout(Duration::from_millis(300), ticks.recv()).await
+        {
             seen += 1;
         }
         assert!(seen >= 1, "un tic de modération est émis à l'application");
@@ -4742,6 +4945,156 @@ mod tests {
         })
         .await
         .expect("Seed doit faire de B un fournisseur découvrable");
+    }
+
+    /// Annonce par racine (ADR 0012) : un segment stocké par `put_block`
+    /// n'est JAMAIS annoncé — seul son manifeste (root) l'est. Il reste
+    /// récupérable via l'indice de racine (les fournisseurs du manifeste sont
+    /// interrogés, et tout bloc détenu est servi), et un segment récupéré en
+    /// `Seed` sous indice est mis en cache SANS être annoncé.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn segments_are_not_provided_but_fetchable_via_root_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let node_a = spawn_node(dir.path(), "roota").await;
+        let node_b = spawn_node(dir.path(), "rootb").await;
+
+        let addr_a = node_a
+            .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        node_b
+            .add_address(node_a.peer_id(), addr_a.clone())
+            .await
+            .unwrap();
+        node_b.dial(addr_a).await.unwrap();
+
+        let payload = b"segment jamais annonce".to_vec();
+        let seg = node_a.put_block(&payload).await.unwrap();
+        let manifest = HlsManifest::new(
+            1.0,
+            vec![HlsSegment {
+                cid: seg.to_string(),
+                duration: 1.0,
+            }],
+        );
+        let m = node_a
+            .add(manifest.to_json().unwrap().as_bytes())
+            .await
+            .unwrap();
+
+        // Le manifeste est annoncé, pas le segment.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if node_b
+                    .get_providers(m)
+                    .await
+                    .map(|p| p.contains(&node_a.peer_id()))
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+        .await
+        .expect("le manifeste (root) doit être annoncé par A");
+        assert!(
+            node_b.get_providers(seg).await.unwrap().is_empty(),
+            "un segment ne doit jamais avoir de fournisseur annoncé"
+        );
+
+        // Sans indice : introuvable. Avec indice de racine : récupéré.
+        assert!(
+            matches!(
+                node_b.get_with_root(seg, StorePolicy::Stream, None).await,
+                Err(CoreError::NoProviders(_))
+            ),
+            "sans indice de racine, un segment non annoncé est introuvable"
+        );
+        assert_eq!(
+            node_b
+                .get_with_root(seg, StorePolicy::Stream, Some(m))
+                .await
+                .unwrap(),
+            payload
+        );
+
+        // Seed sous indice de racine : mis en cache, mais PAS annoncé.
+        node_b
+            .get_with_root(seg, StorePolicy::Seed, Some(m))
+            .await
+            .unwrap();
+        assert!(
+            node_b.blockstore().has(&seg),
+            "Seed doit mettre le segment en cache"
+        );
+        // Laisse le temps à une éventuelle (mauvaise) annonce de se propager.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            node_b.get_providers(seg).await.unwrap().is_empty(),
+            "un segment seedé sous indice de racine ne doit pas être annoncé"
+        );
+    }
+
+    /// I1 (revue finale, ADR 0012) : un segment perdu par TOUS les
+    /// fournisseurs du manifeste doit rendre `NoProviders` (déclencheur du
+    /// repli de récupération froide, ADR 0008) — pas `BlockNotFound`. B
+    /// annonce un manifeste (devient son seul fournisseur) mais ne détient
+    /// jamais le segment qu'il référence ; C, armé du seul indice de racine,
+    /// épuise le fournisseur du root (B répond « pas trouvé »), retombe sur
+    /// les fournisseurs du CID nu (vide — personne n'a jamais annoncé le
+    /// segment), et doit conclure à `NoProviders`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn segment_unheld_by_every_manifest_provider_yields_no_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let node_b = spawn_node(dir.path(), "i1b").await;
+        let node_c = spawn_node(dir.path(), "i1c").await;
+
+        let addr_b = node_b
+            .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        node_c
+            .add_address(node_b.peer_id(), addr_b.clone())
+            .await
+            .unwrap();
+        node_c.dial(addr_b).await.unwrap();
+
+        // B annonce un manifeste mais ne détient (ni n'annonce) jamais le
+        // segment qu'il référence : aucun fournisseur du segment n'existera.
+        let m = node_b.add(b"manifeste sans son segment").await.unwrap();
+        let seg = cid_for(b"segment jamais detenu par personne");
+        assert!(
+            !node_b.blockstore().has(&seg),
+            "précondition : B ne détient jamais ce segment"
+        );
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if node_c
+                    .get_providers(m)
+                    .await
+                    .map(|p| p.contains(&node_b.peer_id()))
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+        .await
+        .expect("le manifeste (root) doit être annoncé par B");
+
+        assert!(
+            matches!(
+                node_c
+                    .get_with_root(seg, StorePolicy::Stream, Some(m))
+                    .await,
+                Err(CoreError::NoProviders(_))
+            ),
+            "un segment introuvable chez tous les fournisseurs du root doit \
+             rendre NoProviders (repli froid), pas BlockNotFound"
+        );
     }
 
     /// Le checkpoint modération #2 s'applique dans les deux politiques : un

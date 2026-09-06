@@ -116,3 +116,24 @@ Idem pour le relay en remplaçant le binaire, le port (4201) et le
 - Volet juridique : voir le README du repo (responsabilité d'hébergeur,
   cadre DSA/UE) — un opérateur de bootstrap/relay fournit de la connectivité,
   pas du contenu.
+
+## Mise à niveau — DHT dédiée (ADR 0012)
+
+Depuis cette version, le protocole Kademlia du réseau est
+`/champinium/kad/1.0.0` (auparavant celui, générique, d'IPFS public — voir
+[`docs/adr/0012-dedicated-dht-and-root-providing.md`](adr/0012-dedicated-dht-and-root-providing.md)).
+**C'est une rupture protocolaire dure** : un nœud sur l'ancien protocole et un
+nœud sur le nouveau ne partagent plus aucune DHT — plus aucun `get_providers`
+ni fetch de feed/denylist entre les deux, dans les deux sens. Le reste de la
+pile (`identify`, topics gossipsub) est inchangé, donc les deux versions
+continuent de se connecter et d'échanger des feeds par gossip : un ancien nœud
+voit le catalogue d'un créateur récent se peupler normalement, mais **son
+contenu n'est jamais récupérable** (aucun fournisseur découvrable) — un échec
+silencieux, pas un rejet net.
+
+**Mettez à jour bootstrap, relays et clients ensemble.** Un bootstrap ou un
+relay resté sur l'ancien binaire continue de fonctionner comme point de
+rendez-vous/relais générique (ces rôles ne dépendent pas du protocole Kademlia
+applicatif), mais n'aide plus à la découverte de contenu pour les clients déjà
+mis à jour : mettez-les à niveau en même temps que le reste du réseau plutôt
+qu'en différé.

@@ -111,7 +111,7 @@ Comportements libp2p et leurs rôles :
 
 | Behaviour | Sert à |
 |---|---|
-| **Kademlia** (mode serveur) | provider records (« qui détient quel CID / quel tag ») + records de feed `/champinium/feed/<peerid>` ; stores **bornés** et **filtrés** (un record entrant est validé avant stockage) |
+| **Kademlia** (mode serveur, protocole dédié `/champinium/kad/1.0.0`) | provider records de **racines** (manifestes, blocs nus, CIDs de feed/tag — pas les segments individuels, ADR 0012) + records de feed `/champinium/feed/<peerid>` ; stores **bornés** et **filtrés** (un record entrant est validé avant stockage) |
 | **gossipsub** | topics `champinium/feeds/v1` et `champinium/reports/v1`, messages signés ; **validation applicative** (un message n'est relayé qu'après verdict Accept) + **peer scoring** (un émetteur d'invalide est pénalisé puis graylisté) |
 | **request-response** (cbor) | transfert de blocs `/champinium/block/1.0.0` (interim — bitswap différé, ADR 0006), plafonds 64 MiB/bloc |
 | **relay-client + DCUtR** | écouter/joindre via un relais et tenter le direct (NAT) |
@@ -178,7 +178,7 @@ fichier → [modération #1] → ffmpeg (segments HLS) → blocs CID + manifeste
             ├─► gossipsub feeds/v1                     (live, secondes)
             ├─► DHT PUT /champinium/feed/<peerid>      (découverte hors gossip)
             └─► DHT provide /champinium/tag/<tag>      (découverte par tag)
-       + provider records pour chaque bloc (« je détiens »)
+       + provider record pour le manifeste seul (annonce par racine, ADR 0012)
 ```
 
 ### Découverte (spectateur) — trois chemins
@@ -290,6 +290,16 @@ simplement un déplacement de la tête de priorité. `fetch_hls` (téléchargeme
 complet en `index.m3u8` local) est retiré du FFI et reste au CLI comme export
 hors ligne.
 
+Depuis l'annonce par racine (ADR 0012), un segment n'est pas annoncé
+fournisseur individuellement : `open_stream`/`get_with` passent le CID du
+**manifeste** comme indice de racine, et chaque segment se récupère auprès
+des fournisseurs de ce manifeste (repli sur les fournisseurs du CID du
+segment lui-même si l'indice ne donne rien). Un segment mis en cache sous cet
+indice reste **jamais annoncé** lui-même (seule la racine l'est) — cohérent
+avec `StorePolicy::Seed` qui met en cache sans forcément annoncer chaque
+bloc. CLI : `get <cid> --root <manifeste>` ; noyau : `Node::get_from(cid,
+root)`.
+
 `get` prend une politique de stockage explicite (`crate::p2p::StorePolicy`,
 interne) : **`Stream`** (défaut de toute lecture/consommation — rend les
 octets, ne cache pas, n'annonce pas) ou **`Seed`** (met en cache et s'annonce
@@ -359,6 +369,12 @@ channels **auxquels il est abonné**.
   dampener cherche à éviter. (Ce choix est **propre à l'éviction de quota** : la
   purge de **modération**, elle, appelle bien `stop_providing` pour cesser
   d'annoncer un contenu banni — voir §7.)
+- **Annonce par racine (ADR 0012)** : le « provider record Kademlia » ci-dessus
+  ne porte que sur le **manifeste** de la publication, pas sur chacun de ses
+  segments — l'annonce par racine évite les centaines de records par heure de
+  vidéo qu'une annonce par segment produirait. Les segments se récupèrent
+  auprès des fournisseurs du manifeste (indice de racine transmis à
+  `get_with`), avec repli sur les fournisseurs du CID du segment lui-même.
 - **Réplication toutes-directions supprimée à dessein** : le lot (c) retire
   aussi `replicate_under_provided` et les flags de démon associés
   (`--replication-target`/`--replicate-max`) — un nœud ne réplique plus
@@ -375,8 +391,11 @@ le seed proactif des abonnés et les pins, pas sur la lecture.
 - **`champinium-seed`** (démon, fichiers de service dans
   [`infra/services/`](../infra/services)) : depuis le retrait de
   seed-what-you-consume, le démon **resert seulement ce qu'il détient déjà** —
-  il réannonce périodiquement tous les CIDs détenus (le store de providers
-  Kademlia est volatil) via `reprovide_all`. Il **ne publie plus de feed**
+  il réannonce périodiquement les **racines** qu'il détient (le store de
+  providers Kademlia est volatil) via `reprovide_all` — les segments indexés
+  par le `SeedIndex` sont exclus de cette réannonce (annonce par racine,
+  ADR 0012) ; `reprovide_all` retourne le nombre de racines réannoncées. Il
+  **ne publie plus de feed**
   (la publication reste le rôle du nœud créateur, pas du démon) et **ne fait
   plus de réplication opportuniste** au-delà des abonnements (voir §6 bis,
   ci-dessus) : ce qu'il détient à seeder est entièrement décidé par la boucle
@@ -759,6 +778,7 @@ qui compte vit dans le réseau, chaque nœud n'en garde qu'une vue.
 | Lecture progressive | serveur HLS local (`open_stream`/`close_stream`/`stream_status`), `fetch_hls` retiré du FFI (reste au CLI, export hors ligne) — **implémenté** (contrat FFI v11) | §6, [ADR 0009](adr/0009-progressive-hls-local-server.md) |
 | Provenance déclarée | déclaration obligatoire et signée par entrée (mode + outils), feed v4, `publish_feed` sans métadonnées retiré du FFI — **implémenté** (contrat FFI v12) | §5, §8, [ADR 0010](adr/0010-declared-provenance.md) |
 | Modération réputationnelle | ancre de confiance compilée (`deny/project.issuer`) + denylist v3 distribuée par le réseau (`seq` signé, LWW, cache hors ligne, suivi périodique), souscription par fichier JSON retirée du FFI — **implémenté** (contrat FFI v13) | §7, [ADR 0011](adr/0011-reputational-moderation.md) |
+| Hygiène DHT | DHT Champinium **séparée** de la DHT IPFS publique (protocole dédié `/champinium/kad/1.0.0`) ; annonce par **racine** seule (manifestes, blocs nus, CIDs de feed/tag) — un segment sans indice de racine n'est plus découvrable seul (`get --root`) — **implémenté**, contrat FFI inchangé | §4, §6, [ADR 0012](adr/0012-dedicated-dht-and-root-providing.md) |
 
 ## 12. Carte des documents
 
@@ -768,7 +788,7 @@ qui compte vit dans le réseau, chaque nœud n'en garde qu'une vue.
   nœud (0002, partiellement remplacé par 0011), feeds signés (0003), transport
   de blocs (0006), IPNS (0007), stockage froid Arweave (0008), lecture
   progressive par serveur HLS local (0009), provenance déclarée (0010),
-  modération réputationnelle (0011)…
+  modération réputationnelle (0011), DHT dédiée et annonce par racine (0012)…
 - [`docs/mvp-demo.md`](mvp-demo.md) / [`docs/gui-demo.md`](gui-demo.md) —
   démos de bout en bout (CLI validée ; GUI deux machines à dérouler).
 - [`docs/deploy-bootstrap-relay.md`](deploy-bootstrap-relay.md) — opérer

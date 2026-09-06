@@ -123,6 +123,19 @@ impl SeedIndex {
         out
     }
 
+    /// CIDs de SEGMENTS de toutes les publications indexées (sans les
+    /// manifestes) — exactement ce que `reprovide_all` ne réannonce PAS :
+    /// seul un root (manifeste, bloc nu) est annoncé fournisseur, les
+    /// segments se récupèrent via l'indice de racine (annonce par racine,
+    /// ADR 0012).
+    pub fn all_segment_cids(&self) -> std::collections::HashSet<String> {
+        self.publications
+            .values()
+            .flatten()
+            .flat_map(|p| p.segment_cids.iter().cloned())
+            .collect()
+    }
+
     /// Purge toutes les publications d'un émetteur (ex. désabonnement).
     /// Si `keep_pinned`, les publications épinglées sont conservées dans
     /// l'index ; dans tous les cas, les publications évincées sont renvoyées
@@ -232,6 +245,38 @@ mod tests {
     fn store() -> (Blockstore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         (Blockstore::open(dir.path()).unwrap(), dir)
+    }
+
+    /// Annonce par racine (ADR 0012) : `all_segment_cids` rend l'union des
+    /// segments indexés — jamais les manifestes, qui eux restent réannoncés
+    /// par `reprovide_all`.
+    #[test]
+    fn all_segment_cids_excludes_manifests() {
+        let mut idx = SeedIndex::default();
+        idx.insert(
+            "issuer",
+            SeededPublication {
+                manifest_cid: "m1".into(),
+                segment_cids: vec!["s1".into(), "s2".into()],
+                total_bytes: 3,
+                order: 0,
+            },
+        );
+        idx.insert(
+            "issuer",
+            SeededPublication {
+                manifest_cid: "m2".into(),
+                segment_cids: vec!["s2".into()],
+                total_bytes: 1,
+                order: 0,
+            },
+        );
+        let segs = idx.all_segment_cids();
+        assert_eq!(segs.len(), 2, "un segment partagé n'est compté qu'une fois");
+        assert!(segs.contains("s1"));
+        assert!(segs.contains("s2"));
+        assert!(!segs.contains("m1"));
+        assert!(!segs.contains("m2"));
     }
 
     #[test]
