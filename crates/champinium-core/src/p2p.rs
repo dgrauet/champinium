@@ -1897,9 +1897,38 @@ impl Node {
 
     /// Injecte un feed tiers directement dans le catalogue local, hors réseau
     /// (tests uniquement : simule la réception d'un feed sans dépendre du
-    /// gossip ou de la DHT).
+    /// gossip ou de la DHT). Applique le même CHECKPOINT MODÉRATION que les
+    /// vrais chemins d'ingestion (`handle_feed_message`/`fetch_feed_inner`) :
+    /// signature vérifiée en premier, puis un émetteur bloqué (denylist ou
+    /// blocage local de channel) est refusé AVANT `Catalog::apply` — sinon ce
+    /// raccourci de test prouverait l'inverse de ce que le checkpoint
+    /// garantit en production.
     #[doc(hidden)]
     pub fn apply_feed_for_tests(&self, feed: Feed) -> CoreResult<bool> {
+        feed.verify()?;
+        let issuer = feed.issuer_peer_id()?;
+        if is_key_blocked_inner(&self.moderation, &self.blocked_channels, &issuer) {
+            return Err(CoreError::Moderated("émetteur banni".into()));
+        }
+        let subs = self.subscriptions_snapshot();
+        let changed = self
+            .catalog
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .apply(feed, &subs)?;
+        if changed {
+            let _ = self.catalog_events.send(());
+        }
+        Ok(changed)
+    }
+
+    /// Comme [`Node::apply_feed_for_tests`] mais SANS le checkpoint par clé —
+    /// contournement explicite, réservé aux tests qui doivent construire un
+    /// état « feed d'un émetteur banni présent au catalogue » pour éprouver un
+    /// filtre défensif en aval (`republish_known_feeds`). Ne jamais l'utiliser
+    /// pour autre chose.
+    #[doc(hidden)]
+    pub fn apply_feed_unchecked_for_tests(&self, feed: Feed) -> CoreResult<bool> {
         let subs = self.subscriptions_snapshot();
         let changed = self
             .catalog

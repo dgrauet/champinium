@@ -172,12 +172,12 @@ async fn republish_known_feeds_skips_blocked_issuer() {
         Denylist::build_signed("test-list", "2026-07-23", &signer, 1, &[], &[victim_peer]).unwrap();
     node.subscribe_denylist(&list).await.unwrap();
 
-    // Réinjection directe du feed au catalogue (test uniquement, bypasse la
-    // modération à l'ingestion) pour isoler le filtre de
-    // `republish_known_feeds` de celui, déjà couvert ailleurs, de
-    // `Catalog::apply`/`fetch_feed_inner`.
+    // Réinjection directe du feed au catalogue via `apply_feed_unchecked_for_tests`
+    // (bypasse délibérément le checkpoint de modération à l'ingestion, contrairement
+    // à `apply_feed_for_tests`) pour isoler le filtre de `republish_known_feeds` de
+    // celui, déjà couvert ailleurs, de `Catalog::apply`/`fetch_feed_inner`.
     let feed = Feed::build_signed(&victim, 1, &[cid_for(b"blocked")]).unwrap();
-    node.apply_feed_for_tests(feed).unwrap();
+    node.apply_feed_unchecked_for_tests(feed).unwrap();
 
     let count = node.republish_known_feeds().await.unwrap();
     assert_eq!(
