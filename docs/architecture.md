@@ -123,7 +123,7 @@ Comportements libp2p et leurs rôles :
 | **request-response** (cbor) | transfert de blocs `/champinium/block/1.0.0` (interim — bitswap différé, ADR 0006), plafonds 64 MiB/bloc |
 | **relay-client + DCUtR** | écouter/joindre via un relais et tenter le direct (NAT) |
 | **identify / ping** | peuplement de la table de routage / liveness |
-| **mDNS** (`Toggle`, débrayable, ADR 0013) | découverte des pairs sur le réseau local (multicast) — un pair trouvé est ajouté à la table Kademlia et composé, best-effort |
+| **mDNS** (`Toggle`, débrayable, ADR 0013) | découverte des pairs sur le réseau local (multicast) — un pair trouvé est ajouté à la table Kademlia et composé, best-effort ; actif par défaut pour `Node::open` (fronts, CLI) seulement, `champinium-seed`/`champinium-bootstrap` (via `Node::new`) ne l'activent que si `.mdns_enabled` vaut `true` |
 | **transport DNS** (`with_dns()`, feature `dns`) | résolution des multiaddrs `/dns4/`, `/dns6/`, `/dnsaddr/` au dial — pas un `Behaviour`, une couche du transport |
 
 ## 5. Les données et leurs formats
@@ -699,13 +699,15 @@ changement dans [`AGENTS.md`](../AGENTS.md)). Ce qui la caractérise :
   `champinium://denylist/<peerid>` ouvre le volet prérempli **sans souscrire**.
 - **Découverte initiale (v14, ADR 0013)** : `bootstrap() -> u32` (async —
   compose vers la liste effective compilée ∪ persistée puis
-  `kademlia.bootstrap()`, renvoie le nombre de bootstraps joints),
-  `connected_peers() -> u32` (async), `add_bootstrap(multiaddr)` (async —
-  `InvalidInput` sans `/p2p/` ou au-delà de 64 entrées), `bootstraps() ->
+  `kademlia.bootstrap()`, renvoie le nombre de bootstraps dont le dial a été
+  **accepté**, la connexion n'étant pas garantie), `connected_peers() -> u32`
+  (async), `add_bootstrap(multiaddr)` (async — `InvalidInput` sans `/p2p/` ou
+  au-delà de 64 entrées sur l'union dédupliquée), `bootstraps() ->
   Vec<String>` (sync), `mdns_enabled() -> bool` / `set_mdns(enabled)` (sync,
-  persiste dans `.mdns_enabled`, effet au prochain démarrage). Les trois
-  fronts appellent `bootstrap()` après `listen`, affichent « réseau : N
-  pair(s) » et exposent l'interrupteur mDNS dans les réglages de seed.
+  persiste dans `.mdns_enabled`, effet au prochain démarrage ; actif par
+  défaut pour `Node::open` — fronts, CLI — seulement). Les trois fronts
+  appellent `bootstrap()` après `listen`, affichent « réseau : N pair(s) » et
+  exposent l'interrupteur mDNS dans les réglages de seed.
 - **Abonnements (v6)** : `subscribe_channel`/`unsubscribe_channel` (lien
   `champinium://channel/<peerid>` ou PeerId nu), `subscriptions` (liste
   locale), `catalog_subscribed` (catalogue restreint aux émetteurs souscrits)

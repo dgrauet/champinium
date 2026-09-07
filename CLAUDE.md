@@ -452,10 +452,12 @@ sur deux machines physiques.
   pas fatal) ; appelé par les fronts et démons après `listen`, jamais par
   `Node::open`/`new` (pas d'effet réseau implicite à la construction).
   **mDNS** (`Toggle<mdns::tokio::Behaviour>`) découvre les pairs du même
-  réseau local sans rien coller, **actif par défaut**, débrayable par dotfile
-  `.mdns_enabled` (effet au prochain démarrage) — révèle la présence de ce
-  nœud sur le LAN, documenté avec la même franchise que le suivi actif ou le
-  repli froid. **Transport DNS** (`with_dns()`) accepte désormais `/dns4/`,
+  réseau local sans rien coller, **actif par défaut pour `Node::open`**
+  (fronts, CLI) seulement — `champinium-seed` et `champinium-bootstrap` (via
+  `Node::new`) ne l'activent que si `.mdns_enabled` dit explicitement `true`,
+  débrayable par dotfile `.mdns_enabled` (effet au prochain démarrage) —
+  révèle la présence de ce nœud sur le LAN, documenté avec la même franchise
+  que le suivi actif ou le repli froid. **Transport DNS** (`with_dns()`) accepte désormais `/dns4/`,
   `/dns6/`, `/dnsaddr/`. Observabilité : `Node::connected_peers()`,
   `Node::bootstraps()`. **Contrat FFI v14** (`bootstrap()`/`connected_peers()`
   async, `add_bootstrap(multiaddr)` async — `InvalidInput` sans `/p2p/` —,

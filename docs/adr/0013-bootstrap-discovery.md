@@ -43,9 +43,15 @@ changement de comportement pour les nœuds déjà installés.
    sans réseau).
 4. **mDNS** — `libp2p::mdns::tokio::Behaviour` intégré au `Behaviour` via
    `Toggle`. Un pair découvert est ajouté à la table Kademlia et composé,
-   best-effort. **Actif par défaut**, débrayable par dotfile
-   `.mdns_enabled` — au même titre que le repli de récupération froide
-   (ADR 0008), car il révèle la présence de ce nœud sur le réseau local.
+   best-effort (dial ciblé sur le `PeerId` découvert, pas une adresse nue).
+   **Actif par défaut pour `Node::open`** (fronts, CLI), débrayable par
+   dotfile `.mdns_enabled` — au même titre que le repli de récupération
+   froide (ADR 0008), car il révèle la présence de ce nœud sur le réseau
+   local. `Node::new`/`with_moderation*` (donc `champinium-seed` et
+   `champinium-bootstrap`) démarrent, eux, mDNS **désactivé** sauf si
+   `.mdns_enabled` dit explicitement `true` : un nœud construit par ces
+   chemins-là (tests unitaires compris) ne doit ni révéler sa présence sur le
+   LAN ni composer vers des nœuds étrangers sans qu'on le lui demande.
    Réglage exposé aux fronts ; effectif **au prochain démarrage** (le
    `Toggle` est construit une fois pour toutes à l'ouverture du swarm).
 5. **DNS** — transport avec résolution (`with_dns()` du `SwarmBuilder`,
@@ -61,7 +67,7 @@ changement de comportement pour les nœuds déjà installés.
    « Découverte sur le réseau local (mDNS) » à côté du compteur de pairs.
 8. **CLI / démons** — `--bootstrap` reste (ajout ponctuel, non persisté) ;
    `serve`, `champinium-seed` et `champinium-bootstrap` appellent
-   `node.bootstrap()` après `listen` et impriment le nombre de pairs joints ;
+   `node.bootstrap()` après `listen` et impriment le nombre de dials lancés ;
    nouvelle commande `bootstraps [--add <multiaddr>]`.
 
 ## Contrat FFI
