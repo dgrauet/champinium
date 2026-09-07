@@ -4144,21 +4144,52 @@ async fn republish_known_feeds_inner(state: &MaintenanceState) -> CoreResult<usi
 /// jamais un `Node` fort qui empêcherait la boucle d'évènements de s'arrêter.
 ///
 /// Best-effort : l'échec d'une passe (réseau indisponible, aucun pair connu)
-/// est seulement tracé — la passe suivante réessaiera.
+/// est seulement tracé — la passe suivante réessaiera. Les succès sont tracés
+/// en `info!` : pour `champinium-seed`, démon sans interface, le journal est
+/// la SEULE façon de constater que la maintenance tourne encore.
 async fn maintenance_loop(alive: Weak<()>, state: MaintenanceState, reprovide_interval: Duration) {
     loop {
         if alive.upgrade().is_none() {
             return;
         }
         match reprovide_all_inner(&state).await {
-            Ok(n) => tracing::debug!("maintenance : {n} racines réannoncées"),
-            Err(e) => tracing::debug!("maintenance : réannonce des racines échouée: {e}"),
+            Ok(n) => tracing::info!("maintenance : {n} racine(s) réannoncée(s)"),
+            Err(e) => tracing::warn!("maintenance : réannonce des racines échouée: {e}"),
         }
         match republish_known_feeds_inner(&state).await {
-            Ok(n) => tracing::debug!("maintenance : {n} records republiés"),
-            Err(e) => tracing::debug!("maintenance : republication échouée: {e}"),
+            Ok(n) => tracing::info!("maintenance : {n} record(s) republié(s)"),
+            Err(e) => tracing::warn!("maintenance : republication échouée: {e}"),
         }
-        tokio::time::sleep(reprovide_interval).await;
+        if !sleep_while_alive(&alive, reprovide_interval).await {
+            return;
+        }
+    }
+}
+
+/// Granularité de [`sleep_while_alive`] : un nœud tombé est constaté au pire
+/// une seconde plus tard.
+const ALIVE_CHECK_GRANULARITY: Duration = Duration::from_secs(1);
+
+/// Attend `total` en re-vérifiant la vivacité toutes les
+/// [`ALIVE_CHECK_GRANULARITY`] ; renvoie `false` dès que la dernière poignée
+/// `Node` est tombée (l'appelant doit alors sortir de sa boucle).
+///
+/// Un `sleep(total)` nu suffirait à la correction, mais pas à la promptitude
+/// de l'arrêt : la boucle détient un `cmd_tx` fort, et la boucle d'évènements
+/// ne s'arrête que quand tous les émetteurs sont tombés. Avec une attente nue,
+/// le swarm, ses sockets d'écoute et le blockstore d'un nœud abandonné
+/// survivraient jusqu'à une heure ([`REPROVIDE_INTERVAL`]).
+async fn sleep_while_alive(alive: &Weak<()>, total: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + total;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return alive.upgrade().is_some();
+        }
+        tokio::time::sleep((deadline - now).min(ALIVE_CHECK_GRANULARITY)).await;
+        if alive.upgrade().is_none() {
+            return false;
+        }
     }
 }
 
@@ -4975,7 +5006,7 @@ mod tests {
         let cid = a.add(b"maintenance-block").await.unwrap();
 
         // B récupère le bloc en politique Seed (il en devient détenteur), puis
-        // s'éteint en même temps que A : seul le blockstore de B subsiste.
+        // les deux poignées tombent et B repart d'un blockstore froid.
         let b_dir = dir.path().join("b");
         let b = Node::open_isolated(&b_dir).await.unwrap();
         b.listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
@@ -4997,6 +5028,13 @@ mod tests {
         .await
         .expect("B doit récupérer le bloc depuis A");
         assert_eq!(seeded, b"maintenance-block");
+        // Ce qui rend l'assertion finale concluante n'est PAS l'extinction des
+        // swarms de A et B (lâcher les poignées ne les arrête pas
+        // immédiatement) mais l'ISOLEMENT DE ROUTAGE : C ne connaîtra que le B
+        // redémarré, lequel repart d'une table de routage vide (`connect` ne
+        // persiste pas de bootstrap) et ne peut donc relayer aucun provider
+        // record hérité de A. Et l'assertion vise le PeerId de B, que seul B
+        // peut annoncer.
         drop(b);
         drop(a);
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -5048,12 +5086,50 @@ mod tests {
     /// Un nœud ouvert mais qui n'écoute pas n'annonce rien : la maintenance
     /// n'est pas un effet de bord de la construction. Annoncer des racines
     /// depuis un nœud injoignable enverrait les pairs dans le vide.
+    ///
+    /// Vérifié sous sa forme OBSERVABLE (un pair connecté ne voit pas N comme
+    /// fournisseur), pas seulement par le drapeau interne : un spawn ajouté
+    /// ailleurs et qui oublierait de poser le drapeau passerait à travers la
+    /// seule assertion de drapeau.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn maintenance_not_started_without_listen() {
         let dir = tempfile::tempdir().unwrap();
-        let n = Node::open_isolated(dir.path()).await.unwrap();
-        n.add(b"x").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // P écoute et sert de témoin : c'est lui qu'on interrogera.
+        let p = Node::open_isolated(&dir.path().join("p")).await.unwrap();
+        let p_addr = p
+            .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+
+        // N détient un bloc mais n'appelle JAMAIS `listen` — il compose
+        // seulement vers P (une connexion sortante suffit à ce que la DHT de P
+        // puisse recevoir une annonce, si N en émettait une).
+        let n = Node::open_isolated(&dir.path().join("n")).await.unwrap();
+        let cid = n.add(b"x").await.unwrap();
+        let p_full: Multiaddr = format!("{p_addr}/p2p/{}", p.peer_id()).parse().unwrap();
+        n.connect(p_full).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if p.connected_peers().await.unwrap_or(0) >= 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("P doit voir la connexion entrante de N");
+
+        // Laisse largement le temps à une éventuelle passe de maintenance de
+        // s'exécuter et de se propager, puis constate l'absence d'annonce.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !p.get_providers(cid)
+                .await
+                .unwrap_or_default()
+                .contains(&n.peer_id()),
+            "un nœud qui n'écoute pas ne doit s'annoncer fournisseur de rien"
+        );
         assert!(!n.maintenance_started_for_tests());
     }
 

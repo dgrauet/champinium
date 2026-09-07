@@ -51,7 +51,11 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "champinium_seed=info,champinium_core=warn".into()),
+                // `champinium_core=info` et non `warn` : la maintenance est
+                // désormais tracée par le NOYAU (`maintenance_loop`), pas par
+                // ce binaire — la filtrer reviendrait à rendre le démon muet
+                // sur la seule chose qu'il fait.
+                .unwrap_or_else(|_| "champinium_seed=info,champinium_core=info".into()),
         )
         .init();
 
