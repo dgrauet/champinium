@@ -2,7 +2,7 @@
 
 > Public : quiconque veut comprendre comment le projet fonctionne de bout en
 > bout. Les renvois pointent vers le code (chemins cliquables) et les ADRs
-> (`docs/adr/`) pour les décisions. État au contrat FFI **v14** (voir
+> (`docs/adr/`) pour les décisions. État au contrat FFI **v15** (voir
 > `.release-please-manifest.json` / `CHANGELOG.md` pour la version de release
 > — elle dérive, pas de version en dur ici, cf. `CLAUDE.md`).
 
@@ -342,13 +342,19 @@ channels **auxquels il est abonné**.
   liste) ; réveillée aussi par changement de catalogue, de quota ou
   désabonnement (`subscribe_seed`/canal de réveil dédié, pas seulement le
   minuteur).
-- **Éviction sous pression de quota** (`make_room_for`/`eviction_order`) :
-  quand une nouvelle publication ne rentre plus sous quota, la victime est
-  choisie par **réplication décroissante** (ce qui est déjà bien répliqué
-  ailleurs sur le réseau part en premier — mesurée via les providers DHT du
-  manifeste, `get_providers`), puis par ancienneté croissante en cas
-  d'égalité. Les manifestes **épinglés** sont exclus des candidats à
-  l'éviction.
+- **Éviction sous pression de quota, à deux étages** (`make_room_for`/
+  `eviction_order`, [ADR 0014](adr/0014-long-tail-persistence.md)) : quand
+  une nouvelle publication ne rentre plus sous quota, `eviction_order` trie
+  d'abord par **étage** — les publications d'émetteurs **non souscrits**
+  (retenues via seed de ce que je regarde, ci-dessous) partent **avant**
+  celles d'émetteurs souscrits, quelle que soit leur réplication respective —
+  puis, à l'intérieur de chaque étage, par **réplication décroissante** (ce
+  qui est déjà bien répliqué ailleurs sur le réseau part en premier — mesurée
+  via les providers DHT du manifeste, `get_providers`), puis par ancienneté
+  croissante en cas d'égalité. Un abonnement est une intention explicite ;
+  un visionnage, une opportunité — l'étage encode cette différence sans
+  toucher au calcul de réplication existant. Les manifestes **épinglés** sont
+  exclus des candidats à l'éviction, dans les deux étages.
 - **Amortisseur anti-oscillation (dampener)** : l'éviction n'a lieu que si la
   réplication de la victime potentielle est **strictement supérieure** à
   celle du candidat entrant (`victim_replication > candidate_replication`,
@@ -362,11 +368,29 @@ channels **auxquels il est abonné**.
   le nœud lui-même est auto-épinglé à l'ingestion** (`ingest_file`) — un
   créateur ne voit jamais son propre contenu évincé par sa propre boucle de
   seed.
+- **Seed de ce que je regarde, opt-in** (dotfile `.seed_watched`, défaut
+  `false`, [ADR 0014](adr/0014-long-tail-persistence.md)) : activé, une
+  lecture (`open_stream`) d'un manifeste **hors abonnement** dont l'émetteur
+  est identifiable au catalogue prend `StorePolicy::Seed` au lieu de
+  `Stream` ; à la **complétion** de la session, la publication entre au
+  `SeedIndex` sous cet émetteur, **non épinglée**, sous le même quota que les
+  abonnements (canal `seed_now` consommé par `seed_loop`, qui appelle
+  `seed_publication` directement — pas le round-robin des abonnements). Sans
+  émetteur identifiable au catalogue, ou l'option désactivée, la lecture
+  reste `Stream` : rien n'est retenu. Une session fermée avant complétion
+  purge les segments déjà récupérés (`remove_unshared_blocks`) plutôt que de
+  laisser des orphelins hors quota ; pour un manifeste **souscrit**, le
+  comportement est inchangé (le seed proactif complète plus tard). C'est
+  l'étage **non souscrit** de l'éviction ci-dessus qui rend cette rétention
+  sûre à activer : elle cède toujours la place aux abonnements sous pression
+  de quota. `FfiCatalogEntry.seeded_count > 0` sur une entrée non souscrite
+  s'affiche « conservé » côté fronts.
 - **Désabonnement** (`unsubscribe_channel`) : purge du `SeedIndex` les
-  publications **non épinglées** de l'émetteur retiré ; les blocs devenus
-  orphelins (non référencés par une autre publication encore indexée) sont
-  supprimés du blockstore. Les manifestes épinglés de cet émetteur survivent
-  au désabonnement.
+  publications **non épinglées** de l'émetteur retiré, **y compris les
+  publications regardées** retenues via seed de ce que je regarde (elles ne
+  sont jamais épinglées) ; les blocs devenus orphelins (non référencés par
+  une autre publication encore indexée) sont supprimés du blockstore. Les
+  manifestes épinglés de cet émetteur survivent au désabonnement.
 - **Couplage avec les provider records DHT** : l'éviction retire la
   publication du `SeedIndex` et supprime ses blocs devenus orphelins, mais ne
   retire **pas** le provider record Kademlia annoncé pour ce CID (pas
@@ -397,18 +421,32 @@ le seed proactif des abonnés et les pins, pas sur la lecture.
 
 ### Persistance active
 
+- **Maintenance intégrée au nœud** (`maintenance_loop`,
+  [ADR 0014](adr/0014-long-tail-persistence.md)) : réannoncer les **racines**
+  détenues (`reprovide_all` — le store de providers Kademlia étant volatil ;
+  les segments indexés par le `SeedIndex` en sont exclus, annonce par racine,
+  ADR 0012) et republier les feeds signés connus (`republish_known_feeds` —
+  le sien, ceux des abonnements, les listes de modération tierces en cache)
+  n'est plus le rôle du démon `champinium-seed` : c'est une boucle du
+  **nœud** lui-même, démarrée au **premier `listen` réussi** (flag
+  `maintenance_started`, une seule fois par nœud, quel que soit son
+  porteur), qui fait une première passe immédiate puis une passe toutes les
+  `REPROVIDE_INTERVAL` (1 h, injectable pour les tests). Avant ce
+  déplacement, un nœud ouvert par un front (FFI ou GTK) sans démon installé
+  ne réannonçait jamais rien après un redémarrage : ce qu'il seedait devenait
+  introuvable jusqu'au TTL des records Kademlia. `Node::open`/`new` restent
+  sans effet réseau implicite (pas d'appel à `listen`) — la construction d'un
+  `Node` reste inerte pour les tests unitaires.
 - **`champinium-seed`** (démon, fichiers de service dans
-  [`infra/services/`](../infra/services)) : depuis le retrait de
-  seed-what-you-consume, le démon **resert seulement ce qu'il détient déjà** —
-  il réannonce périodiquement les **racines** qu'il détient (le store de
-  providers Kademlia est volatil) via `reprovide_all` — les segments indexés
-  par le `SeedIndex` sont exclus de cette réannonce (annonce par racine,
-  ADR 0012) ; `reprovide_all` retourne le nombre de racines réannoncées. Il
-  **ne publie plus de feed**
-  (la publication reste le rôle du nœud créateur, pas du démon) et **ne fait
-  plus de réplication opportuniste** au-delà des abonnements (voir §6 bis,
-  ci-dessus) : ce qu'il détient à seeder est entièrement décidé par la boucle
-  de seed proactif du nœud, sur ses propres abonnements.
+  [`infra/services/`](../infra/services)) est donc **simplifié** : il ouvre,
+  écoute, bootstrap, puis attend `ctrl_c` — la maintenance périodique tourne
+  déjà dans le nœud dès le `listen`. Sa seule raison d'être restante : **servir
+  quand l'application est fermée**. L'app seede tant qu'elle est ouverte ; le
+  démon, le reste du temps. Il **ne publie pas de feed** (la publication reste
+  le rôle du nœud créateur) et **ne fait pas de réplication opportuniste**
+  au-delà des abonnements (voir §6 bis, ci-dessus) : ce qu'il détient à
+  seeder est entièrement décidé par la boucle de seed proactif du nœud, sur
+  ses propres abonnements (et, opt-in, ce qu'il regarde — §6 bis).
 - Un bloc local **corrompu** (crash pendant écriture) n'est pas fatal : `get`
   détecte l'incohérence d'intégrité et re-télécharge du réseau, ce qui répare
   le fichier.
@@ -511,10 +549,12 @@ vu sur le réseau. D'où le choix **réputationnel primaire** : bannir un
   cache (`.denylists/<peerid>.json`), rechargé **avant tout réseau** à
   l'ouverture du nœud — le cache appliqué au démarrage n'exécute pas de purge
   (les checkpoints lisent les vues agrégées, déjà à jour).
-- **Republication** : `Node::republish_known_feeds` (démon `champinium-seed`)
-  republie aussi les listes tierces en cache — une liste dont l'éditeur est
-  hors ligne ne s'éteint pas au TTL du `MemoryStore` Kademlia tant qu'un
-  abonné tourne.
+- **Republication** : `Node::republish_known_feeds`, appelée par la boucle de
+  maintenance du nœud (`maintenance_loop`, §6 « Persistance active »,
+  [ADR 0014](adr/0014-long-tail-persistence.md)) republie aussi les listes
+  tierces en cache — une liste dont l'éditeur est hors ligne ne s'éteint pas
+  au TTL du `MemoryStore` Kademlia tant qu'un abonné tourne (front, CLI ou
+  démon `champinium-seed`).
 - L'éditeur projet est **toujours réinséré** dans les éditeurs suivis et non
   retirable. Une liste d'un éditeur **non souscrit** récupérée par ailleurs
   n'est **jamais appliquée**.
@@ -625,7 +665,7 @@ Autour, trois mécanismes d'écosystème :
   catalogue borné à 1024 émetteurs (refus-quand-plein, pas d'éviction), c'est
   la défense contre l'inondation par clés jetables.
 
-## 8. La frontière FFI : le contrat v14
+## 8. La frontière FFI : le contrat v15
 
 La surface UniFFI de [`ffi.rs`](../crates/champinium-core/src/ffi.rs) est
 **le contrat** entre le noyau et les fronts (tableau exhaustif et protocole de
@@ -680,7 +720,7 @@ changement dans [`AGENTS.md`](../AGENTS.md)). Ce qui la caractérise :
 - **Bindings générés au build, jamais commités** : Swift via
   UniFFI/XCFramework (`just macos-prepare`), C# via `uniffi-bindgen-cs`
   (`just gen-csharp`). Le front Linux consomme le crate **directement** (pas
-  de FFI). `CONTRACT_VERSION` (=13) permet aux fronts de détecter une
+  de FFI). `CONTRACT_VERSION` (=15) permet aux fronts de détecter une
   incompatibilité au démarrage.
 - **Listes de modération distribuées (v13, ADR 0011)** : **retrait** de la
   souscription par fichier JSON — une liste ne se souscrit plus par fichier
@@ -708,6 +748,17 @@ changement dans [`AGENTS.md`](../AGENTS.md)). Ce qui la caractérise :
   défaut pour `Node::open` — fronts, CLI — seulement). Les trois fronts
   appellent `bootstrap()` après `listen`, affichent « réseau : N pair(s) » et
   exposent l'interrupteur mDNS dans les réglages de seed.
+- **Persistance de la longue traîne (v15, ADR 0014)** : `seed_watched() ->
+  bool` / `set_seed_watched(enabled)` (sync, persiste dans `.seed_watched`,
+  défaut `false`, effet **immédiat** contrairement à `set_mdns`) — active,
+  une lecture hors abonnement dont l'émetteur est identifiable au catalogue
+  passe en `StorePolicy::Seed` et entre au `SeedIndex` à la complétion, sous
+  le même quota que les abonnements mais évincée en premier (éviction à deux
+  étages, §6 bis). Les trois fronts affichent une case « Conserver et
+  resservir ce que je regarde » dans le volet réglages de seed (même patron
+  que la case mDNS : pas d'écriture au chargement) et un badge « conservé »
+  sur une entrée non souscrite dont `seeded_count > 0`. CLI : `seed-watched
+  [--set on|off]`.
 - **Abonnements (v6)** : `subscribe_channel`/`unsubscribe_channel` (lien
   `champinium://channel/<peerid>` ou PeerId nu), `subscriptions` (liste
   locale), `catalog_subscribed` (catalogue restreint aux émetteurs souscrits)
@@ -789,7 +840,7 @@ qui compte vit dans le réseau, chaque nœud n'en garde qu'une vue.
 | bitswap | différé (amont cassé ; le fetch multi-fournisseurs couvre le bénéfice pratique) — débloquable par un bump `multihash-codetable` côté beetswap | ADR 0006 |
 | IPNS | différé, adossé à bitswap (sa valeur = interop IPFS public) ; durabilité déjà couverte par le seed proactif des abonnés + les pins | ADR 0007 |
 | Recherche | locale (ce que le nœud a vu) + tags DHT ; pas d'index global — assumé | risque #4, §6 |
-| Persistance | seed proactif des abonnés (quota + éviction par réplication) + pins ; cold storage Arweave opt-in **livré** cœur+CLI (CS-a, feature `cold-storage`) — repli de dernier recours CID-vérifié ([ADR 0008](adr/0008-cold-storage-arweave.md)) ; fronts (CS-b) à faire | risque #1, §6 |
+| Persistance | seed proactif des abonnés (quota + éviction à deux étages par réplication) + pins + seed opt-in de ce que je regarde ([ADR 0014](adr/0014-long-tail-persistence.md)) + maintenance intégrée au nœud (réannonce/republication dès `listen`) ; cold storage Arweave opt-in **livré** cœur+CLI+fronts (CS-a/CS-b, feature `cold-storage`) — repli de dernier recours CID-vérifié ([ADR 0008](adr/0008-cold-storage-arweave.md)) | risque #1, §6, §6 bis |
 | NAT | relay v2 + DCUtR testés ; relays multipliables | risque #6 |
 | Signature payante | palier gratuit livré ; notarisation/Authenticode différés | `packaging.md` |
 | Windows/C# | validé par CI ; pas de stack intendant | `.intendant.toml` |
@@ -800,17 +851,18 @@ qui compte vit dans le réseau, chaque nœud n'en garde qu'une vue.
 | Modération réputationnelle | ancre de confiance compilée (`deny/project.issuer`) + denylist v3 distribuée par le réseau (`seq` signé, LWW, cache hors ligne, suivi périodique), souscription par fichier JSON retirée du FFI — **implémenté** (contrat FFI v13) | §7, [ADR 0011](adr/0011-reputational-moderation.md) |
 | Hygiène DHT | DHT Champinium **séparée** de la DHT IPFS publique (protocole dédié `/champinium/kad/1.0.0`) ; annonce par **racine** seule (manifestes, blocs nus, CIDs de feed/tag) — un segment sans indice de racine n'est plus découvrable seul (`get --root`) — **implémenté**, contrat FFI inchangé | §4, §6, [ADR 0012](adr/0012-dedicated-dht-and-root-providing.md) |
 | Découverte initiale | bootstraps compilés (liste vide tant qu'aucun n'est publié) ∪ persistés, `Node::bootstrap()` appelé par les fronts/démons après `listen` ; mDNS débrayable ; transport DNS (`/dns4/`, `/dns6/`, `/dnsaddr/`) — **implémenté** (contrat FFI v14) | §2, §4, [ADR 0013](adr/0013-bootstrap-discovery.md) |
+| Persistance de la longue traîne | maintenance (réannonce + republication) intégrée au nœud, démarrée au premier `listen` (le démon `champinium-seed` sert seulement app fermée) ; seed de ce que je regarde opt-in (`.seed_watched`, hors abonnement) ; éviction à deux étages (non souscrit avant souscrit) ; pas de réplication toutes-directions — **implémenté** (contrat FFI v15) | risque #1, §6, §6 bis, [ADR 0014](adr/0014-long-tail-persistence.md) |
 
 ## 12. Carte des documents
 
 - [`CLAUDE.md`](../CLAUDE.md) — principes + état d'avancement (source de vérité).
-- [`AGENTS.md`](../AGENTS.md) — contrat FFI (tableau v14) + garde-fous d'équipe.
+- [`AGENTS.md`](../AGENTS.md) — contrat FFI (tableau v15) + garde-fous d'équipe.
 - [`docs/adr/`](adr/) — décisions : libp2p vs iroh (0001), modération côté
   nœud (0002, partiellement remplacé par 0011), feeds signés (0003), transport
   de blocs (0006), IPNS (0007), stockage froid Arweave (0008), lecture
   progressive par serveur HLS local (0009), provenance déclarée (0010),
   modération réputationnelle (0011), DHT dédiée et annonce par racine (0012),
-  découverte initiale (0013)…
+  découverte initiale (0013), persistance de la longue traîne (0014)…
 - [`docs/mvp-demo.md`](mvp-demo.md) / [`docs/gui-demo.md`](gui-demo.md) —
   démos de bout en bout (CLI validée ; GUI deux machines à dérouler).
 - [`docs/deploy-bootstrap-relay.md`](deploy-bootstrap-relay.md) — opérer

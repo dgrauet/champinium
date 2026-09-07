@@ -96,6 +96,14 @@ Laisser la commande tourner (elle sert le contenu et rediffuse le feed).
 
 ## 3. B est devenu seeder (persistance)
 
+Avant de couper A, activer sur B — depuis le volet réglages de seed — la case
+**« Conserver et resservir ce que je regarde »** (`seed_watched`, ADR 0014,
+défaut désactivé) : B n'a **pas** besoin de s'abonner au channel de A pour ce
+scénario, mais sans cette case cochée, un simple visionnage ne laisse plus
+rien au blockstore de B (`seed-what-you-consume` a été retiré) — voir aussi
+`docs/architecture.md` §6 bis. Un channel **souscrit** n'a pas besoin de cette
+case : le seed proactif des abonnements suffit.
+
 Pendant que B garde son app ouverte, **couper A** (Ctrl-C). Puis, au choix :
 
 - **Depuis A** (ou une 3ᵉ machine), récupérer le contenu **depuis B** — il faut
@@ -112,9 +120,15 @@ Pendant que B garde son app ouverte, **couper A** (Ctrl-C). Puis, au choix :
   utiliser à la place le démon : `champinium-seed --data-dir <data-dir-app>
   --listen /ip4/0.0.0.0/tcp/4712` (le data dir de l'app est indiqué dans
   `docs/packaging.md` ; sur macOS : `~/Library/Application Support/Champinium`).
+  Depuis l'ADR 0014, le démon n'est **plus nécessaire pour que B seede
+  pendant que son app tourne** — la maintenance (réannonce des racines,
+  republication des feeds) est intégrée au nœud et démarre dès que l'app
+  écoute ; il reste utile uniquement pour continuer à servir **une fois
+  l'app fermée**, ou ici pour fixer le port d'écoute.
 
 - ✅ Si `fetch-hls` réussit avec A éteint : **le contenu a survécu à son
-  publieur** — seed-what-you-consume constaté sur du vrai matériel.
+  publieur**, seedé par B via la case « Conserver et resservir ce que je
+  regarde » constatée sur du vrai matériel.
 
 ## 4. Listes de modération (ADR 0011)
 
@@ -153,7 +167,8 @@ Sur les deux mêmes machines, valider la distribution réseau d'une denylist :
 | 4 | B la regarde | vidéo + son dans le lecteur natif, ~30 s |
 | 4bis | Démarrage avant la fin | la vidéo démarre en quelques secondes, avant la fin du téléchargement ; « segments : x/y » progresse |
 | 4ter | Seek vers la fin | sauter à la fin de la vidéo redémarre en quelques secondes |
-| 5 | B seede | `fetch-hls` depuis B réussit **avec A éteint** |
+| 5 | B seede | case « Conserver et resservir ce que je regarde » activée, `fetch-hls` depuis B réussit **avec A éteint** |
+| 5bis | Maintenance sans démon | B redémarre son app (sans `champinium-seed`) : elle resert toujours le contenu conservé — la réannonce des racines démarre dès `listen` (ADR 0014) |
 | 6 | Modération visible *(bonus)* | un CID couvert par une denylist souscrite affiche « contenu bloqué par la modération » (pas une erreur technique) |
 
 ## CLI
@@ -189,6 +204,6 @@ Ctrl-C ferme la session (`close_stream`) et purge le cache de lecture.
   (répertoire de données durable par OS) : la démo est rejouable sans repartir
   de zéro.
 
-Résultat attendu : les 5 (ou 6) cases cochées → le critère MVP est validé
+Résultat attendu : les 5–6 (ou 7) cases cochées → le critère MVP est validé
 **en GUI sur matériel réel**, dernière réserve de la Phase 3 levée (à noter
 dans `CLAUDE.md` et le spec après la session).

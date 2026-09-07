@@ -74,11 +74,16 @@ La suppression centrale est impossible par construction → modération côté n
 ## Risques classés
 
 1. **Persistance** — contenu sans seeder disparaît. Mitigation : seed proactif
-   des abonnés (chaque abonné retient et resert ce qu'il suit, sous quota) +
-   pins (contenu propre auto-épinglé, plus tout manifeste épinglé manuellement) ;
-   cold storage optionnel Arweave (ADR 0008) livré côté cœur+CLI (CS-a) derrière
-   la feature opt-in `cold-storage` **en repli de récupération CID-vérifié seul**
-   (archivage différé, voir « État actuel ») — voir « État actuel ».
+   des abonnés (chaque abonné retient et resert ce qu'il suit, sous quota,
+   éviction à deux étages) + seed opt-in de ce que je regarde, hors abonnement
+   (`seed_watched`, ADR 0014) + pins (contenu propre auto-épinglé, plus tout
+   manifeste épinglé manuellement) ; maintenance (réannonce des racines +
+   republication des feeds) **intégrée au nœud**, démarrée dès `listen` quel
+   que soit son porteur (front, CLI, démon) — un nœud GUI redémarré resert ce
+   qu'il détient sans qu'aucun démon tourne (ADR 0014) ; cold storage optionnel
+   Arweave (ADR 0008) livré côté cœur+CLI (CS-a) derrière la feature opt-in
+   `cold-storage` **en repli de récupération CID-vérifié seul** (archivage
+   différé, voir « État actuel ») — voir « État actuel ».
 2. **Async FFI** — async/streams tokio → Swift ET C#. Mitigé par le spike Phase 0.
 3. **Modération décentralisée** — deux checkpoints, denylists signées.
 4. **Recherche décentralisée non résolue** — tags DHT + index local ; limites assumées.
@@ -188,10 +193,13 @@ sur deux machines physiques.
 - **Seeding en arrière-plan ✔** : `Node::reprovide_all` réannonce les CIDs
   racines détenus (le store de providers Kademlia est volatile → indispensable
   au redémarrage ; depuis ADR 0012 les segments indexés par le `SeedIndex` en
-  sont exclus, seules les racines sont annoncées). Démon `champinium-seed`
-  (réannonce + republication périodiques,
-  hors UI) ; fichiers de service par OS dans `infra/services/` (launchd / systemd
-  user / Windows). Testé : `reprovide_makes_stored_blocks_discoverable`.
+  sont exclus, seules les racines sont annoncées). À l'origine portée par le
+  seul démon `champinium-seed` (réannonce + republication périodiques,
+  hors UI) ; **depuis l'ADR 0014, cette maintenance appartient au nœud
+  lui-même** (`maintenance_loop`, démarrée dès `listen`, quel que soit son
+  porteur) — le démon, simplifié, sert désormais surtout quand l'application
+  est fermée. Fichiers de service par OS dans `infra/services/` (launchd /
+  systemd user / Windows). Testé : `reprovide_makes_stored_blocks_discoverable`.
 - **Feed records DHT (PUT/GET) ✔** : `publish_feed` PUT le feed signé dans la
   Kademlia sous `/champinium/feed/<peerid>` ; `Node::fetch_feed` GET + vérifie
   (signature + émetteur) + alimente le catalogue → découverte de feed **hors
@@ -374,8 +382,10 @@ sur deux machines physiques.
   **Contrat FFI inchangé (v10)** — rien dans le cœur. Test de bout en bout non
   automatisable en CI : procédure manuelle par OS dans
   [`docs/packaging.md`](docs/packaging.md).
-- **Durabilité du record de feed ✔** : `Node::republish_known_feeds`
-  (`champinium-seed`, même boucle que `reprovide_all`) re-PUT dans la DHT le
+- **Durabilité du record de feed ✔** : `Node::republish_known_feeds` (même
+  boucle que `reprovide_all` — **la boucle de maintenance du nœud**,
+  `maintenance_loop`, démarrée dès `listen` depuis l'ADR 0014, portée à
+  l'origine par le seul démon `champinium-seed`) re-PUT dans la DHT le
   feed signé du nœud lui-même et ceux de ses **abonnements** — corrige un
   écart où le record `/champinium/feed/<peerid>` d'un créateur hors ligne
   n'était jamais réannoncé (contrairement à ce que l'ADR 0007 supposait déjà
@@ -416,8 +426,10 @@ sur deux machines physiques.
   à l'entrée ; suivi périodique des éditeurs souscrits (même boucle que les
   abonnements de channel), fetch immédiat à la souscription et au démarrage,
   **cache hors ligne** (`.denylists/<peerid>.json`) rechargé avant tout
-  réseau, republication des listes en cache par `champinium-seed`. Moteur
-  indexé par éditeur (retirer un éditeur ne retire que ses entrées).
+  réseau, republication des listes en cache par la boucle de maintenance du
+  nœud (depuis l'ADR 0014 ; à l'origine, seul le démon `champinium-seed` la
+  portait). Moteur indexé par éditeur (retirer un éditeur ne retire que ses
+  entrées).
   L'éditeur projet est toujours réinséré et non retirable
   (`unsubscribe_denylist_issuer` → `InvalidInput`) ; une liste d'un éditeur
   non souscrit récupérée par ailleurs n'est jamais appliquée. **Contrat FFI
@@ -473,6 +485,33 @@ sur deux machines physiques.
   lever quand libp2p bump vers hickory 0.26+) ; le test mDNS deux-nœuds est
   `#[ignore]` (multicast bloqué sur les runners CI) → validation manuelle
   deux-machines, voir [`docs/gui-demo.md`](docs/gui-demo.md).
+- **Persistance de la longue traîne ✔ (ADR 0014)** : **maintenance intégrée
+  au nœud** — `maintenance_loop` (réannonce `reprovide_all` + republication
+  `republish_known_feeds`) démarre au premier `listen` réussi, quel que soit
+  le porteur (front, CLI, démon), passe immédiate puis toutes les
+  `REPROVIDE_INTERVAL` (1 h, injectable pour les tests) ; `Node::open`/`new`
+  restent sans effet réseau implicite. **`champinium-seed` simplifié** :
+  ouvre/écoute/bootstrap puis attend `ctrl_c`, la maintenance périodique
+  n'est plus la sienne — sa seule raison d'être restante est de servir
+  quand l'application est fermée. **Seed de ce que je regarde, opt-in**
+  (dotfile `.seed_watched`, défaut `false`, effet immédiat) : hors
+  abonnement, `open_stream` d'un manifeste dont l'émetteur est identifiable
+  au catalogue prend `StorePolicy::Seed` au lieu de `Stream` ; à la
+  complétion, la publication entre au `SeedIndex` (non épinglée) via un
+  canal `seed_now` dédié, sous le même quota que les abonnements. Session
+  incomplète hors abonnement → purge des segments déjà récupérés à
+  `close_stream`. **Éviction à deux étages** (`eviction_order`) : les
+  publications d'émetteurs non souscrits partent avant celles des émetteurs
+  souscrits, réplication puis âge à l'intérieur de chaque étage — un
+  abonnement est une intention explicite, un visionnage une opportunité.
+  Désabonnement : purge aussi les publications regardées non épinglées de
+  l'émetteur retiré. **Pas de réplication toutes-directions réintroduite**
+  (retirée à dessein au lot channels c, réouverture conditionnée à une
+  décision explicite de spec). **Contrat FFI v15** :
+  `seed_watched()`/`set_seed_watched(bool)` (sync). CLI : `seed-watched
+  [--set on|off]`. Les trois fronts : case « Conserver et resservir ce que
+  je regarde » (réglages de seed, même patron que la case mDNS) + badge
+  « conservé » sur une entrée non souscrite avec `seeded_count > 0`.
 - **Packaging Linux — Flatpak ✔ (fonctionnel, palier gratuit)** : manifeste
   [`packaging/flatpak/org.champinium.Champinium.yml`](packaging/flatpak/org.champinium.Champinium.yml)
   (app-id `org.champinium.Champinium`, runtime GNOME 48, rustc via rustup au
@@ -544,7 +583,8 @@ lien ✔ (`resolve_channel`, contrat v9 ; partie B — scheme OS — ✔) ; dura
 du record de feed ✔ (`republish_known_feeds`) ; IPNS #21 close, voir ADR 0007 ;
 lecture progressive ✔ (ADR 0009) ; provenance déclarée ✔ (ADR 0010) ;
 modération réputationnelle ✔ (ADR 0011) ; hygiène DHT ✔ (ADR 0012) ;
-découverte initiale ✔ (ADR 0013)).
+découverte initiale ✔ (ADR 0013) ; persistance de la longue traîne ✔
+(ADR 0014)).
 Voir le spec.
 
 **Dernière release : voir `.release-please-manifest.json` / CHANGELOG** —
@@ -552,4 +592,4 @@ pas de version en dur ici, elle dérive (règle intendant DG006). Release-please
 gère le versionnement (`bump-minor-pre-major` actif :
 un breaking change bumpe la mineure tant qu'on est < 1.0.0 — la 1.0 sera un
 choix délibéré de stabilisation d'API). Versionnement du contrat FFI distinct :
-`CONTRACT_VERSION = 14` (voir `AGENTS.md`).
+`CONTRACT_VERSION = 15` (voir `AGENTS.md`).

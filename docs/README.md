@@ -16,5 +16,6 @@ Documentation Champinium. À étoffer à mesure des phases.
 - Modération réputationnelle, listes signées distribuées par le réseau : décision figée par l'[ADR 0011](adr/0011-reputational-moderation.md) (remplace partiellement l'[ADR 0002](adr/0002-node-side-moderation.md)), implémentée (denylist v3, contrat FFI v13).
 - Hygiène DHT : protocole Kademlia dédié et annonce par racine (segments non annoncés individuellement) : décision figée par l'[ADR 0012](adr/0012-dedicated-dht-and-root-providing.md), implémentée (contrat FFI inchangé).
 - Découverte initiale : bootstraps compilés (liste vide au départ) + persistés, mDNS débrayable, transport DNS : décision figée par l'[ADR 0013](adr/0013-bootstrap-discovery.md), implémentée (contrat FFI v14).
+- Persistance de la longue traîne : maintenance (réannonce + republication) intégrée au nœud, démon simplifié, seed opt-in de ce que je regarde, éviction à deux étages : décision figée par l'[ADR 0014](adr/0014-long-tail-persistence.md), implémentée (contrat FFI v15).
 - Packaging & signature par OS (Phase 6).
 - Seeding en arrière-plan : launchd / Windows Service / systemd user (Phase 4).
