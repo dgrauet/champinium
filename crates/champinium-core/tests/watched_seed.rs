@@ -439,7 +439,17 @@ async fn watched_publication_is_evicted_to_make_room_for_a_subscription() {
     poll_until(
         Duration::from_secs(60),
         "la publication de l'abonnement doit être seedée à la place de la regardée",
-        || b.blockstore().has(&m_sub) && b.blockstore().has(&seg_sub[0]),
+        || {
+            // Anti-flake : `make_room_for` remesure la réplication de la
+            // victime et peut lire `1` de façon transitoire, ce qui refuse
+            // l'éviction (inégalité stricte) et inscrit le candidat dans
+            // `quota_blocked` — vidé seulement sur un évènement catalogue ou
+            // quota, tous deux déjà passés ici. Réécrire le quota à sa valeur
+            // courante réémet `seed_wake`, donc vide `quota_blocked` : le
+            // candidat est retenté au tour suivant au lieu d'être condamné.
+            let _ = b.set_seed_quota(used_by_watched);
+            b.blockstore().has(&m_sub) && b.blockstore().has(&seg_sub[0])
+        },
     )
     .await;
     assert!(
@@ -452,4 +462,76 @@ async fn watched_publication_is_evicted_to_make_room_for_a_subscription() {
     );
     let (used, quota) = b.storage_stats();
     assert!(used <= quota, "le quota ne doit jamais être dépassé");
+}
+
+/// Quota trop petit pour la publication regardée et **rien d'évinçable** :
+/// l'indexation est refusée, et AUCUN bloc ne doit rester au magasin.
+///
+/// Le cas piégeux est le refus **en cours de boucle** : `seed_publication`
+/// abandonne au segment qui franchit le quota et retire ce qu'elle avait
+/// engagé, **manifeste compris**. Les segments suivants, récupérés par la
+/// session et jamais touchés par ce rollback, ne sont retrouvables que par
+/// une liste capturée AVANT la tentative — sinon ils restent au magasin pour
+/// toujours, hors index, hors quota et jamais réannoncés.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watched_publication_refused_by_quota_leaves_no_orphans() {
+    let dir = tempfile::tempdir().unwrap();
+    let kp_a = Keypair::generate_ed25519();
+    let a = Node::with_moderation(
+        kp_a.clone(),
+        Blockstore::open(dir.path().join("a5")).unwrap(),
+        Moderation::empty(),
+    )
+    .await
+    .unwrap();
+    let addr_a = a
+        .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .await
+        .unwrap();
+    let (m, cids) = publish(&a, "refuse", 3).await;
+    let manifest_size = a.blockstore().size_of(&m).unwrap();
+
+    let b = fast_node(dir.path(), "b5").await;
+    wire(&b, &a, addr_a).await;
+    b.set_seed_watched(true).unwrap();
+    // Quota calibré pour franchir la limite AU MILIEU de la boucle : le
+    // manifeste passe, le premier segment aussi, le second non. L'index est
+    // vide, donc rien n'est évinçable pour financer la suite.
+    b.set_seed_quota(manifest_size + 1).unwrap();
+    seed_catalog(&b, &kp_a, m).await;
+
+    let info = open_until_ok(&b, m).await;
+    poll_until(
+        Duration::from_secs(60),
+        "la session doit récupérer tous ses segments",
+        || {
+            b.stream_status(info.id)
+                .map(|s| s.fetched_segments == s.total_segments)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+    // Pas d'assertion « les blocs sont d'abord là » : la boucle de seed est
+    // rapide (intervalle court) et peut avoir déjà purgé au moment où on
+    // regarde. Que la session `Seed` mette bien ses segments au magasin est
+    // établi par `watched_stream_enters_seed_index_when_enabled` ; ici ce qui
+    // compte est qu'il n'en reste RIEN, et sans la capture des segments avant
+    // la tentative, ceux d'après le refus resteraient indéfiniment (le
+    // sondage ci-dessous partirait en timeout).
+    poll_until(
+        Duration::from_secs(30),
+        "aucun bloc ne doit survivre au refus de quota",
+        || !b.blockstore().has(&m) && cids.iter().all(|c| !b.blockstore().has(c)),
+    )
+    .await;
+    assert_eq!(
+        b.storage_stats().0,
+        0,
+        "une publication refusée ne compte rien au quota"
+    );
+    b.close_stream(info.id).await;
+    assert!(
+        !b.blockstore().has(&m) && cids.iter().all(|c| !b.blockstore().has(c)),
+        "la fermeture ne doit rien ressusciter"
+    );
 }

@@ -4269,8 +4269,25 @@ async fn seed_loop(
 /// (quota infranchissable, émetteur bloqué/banni entre-temps), ses blocs
 /// resteraient au magasin hors de toute comptabilité. `seed_publication` ne
 /// nettoie que ce qu'elle a elle-même récupéré ; ici les blocs viennent de la
-/// SESSION, donc la purge se fait depuis le manifeste relu au magasin.
+/// SESSION, d'où la purge de secours ci-dessous.
 async fn seed_watched_publication(state: &SeedLoopState, issuer: PeerId, manifest_cid: Cid) {
+    // Segments capturés AVANT toute tentative, et c'est essentiel : quand
+    // `seed_publication` abandonne en cours de boucle (quota franchi au
+    // segment `i`, CID illisible, refus de modération), elle retire les blocs
+    // qu'elle avait engagés — **manifeste compris**. Relire le manifeste
+    // après coup ne rendrait donc plus rien, et les segments `i..n`, locaux
+    // depuis la session et jamais touchés par ce rollback, resteraient au
+    // magasin pour toujours : hors index, hors quota, jamais réannoncés.
+    // Le manifeste est local par construction sur ce chemin (la session l'a
+    // récupéré en `Seed`), la lecture ne coûte rien.
+    let segment_cids: Vec<String> = state
+        .blockstore
+        .get(&manifest_cid)
+        .ok()
+        .and_then(|bytes| HlsManifest::from_json(&bytes).ok())
+        .map(|m| m.segments.iter().map(|s| s.cid.clone()).collect())
+        .unwrap_or_default();
+
     if let Err(e) = seed_publication(state, issuer, manifest_cid, true).await {
         tracing::debug!("indexation de la publication regardée {manifest_cid}: {e}");
     }
@@ -4287,16 +4304,9 @@ async fn seed_watched_publication(state: &SeedLoopState, issuer: PeerId, manifes
     if settled {
         return;
     }
-    // Manifeste relu localement : le seul moyen de connaître les segments à
-    // purger. Absent/illisible (déjà retiré par `seed_publication`) → rien à
-    // faire, sauf le manifeste lui-même, couvert par la publication éphémère.
-    let segment_cids = state
-        .blockstore
-        .get(&manifest_cid)
-        .ok()
-        .and_then(|bytes| HlsManifest::from_json(&bytes).ok())
-        .map(|m| m.segments.iter().map(|s| s.cid.clone()).collect())
-        .unwrap_or_default();
+    // `remove_unshared_blocks` épargne ce qu'une publication encore indexée
+    // référence, et retire le bloc du manifeste lui-même (déjà parti, le cas
+    // échéant — la suppression est idempotente).
     remove_unshared_blocks(
         &state.blockstore,
         &state.seed_index,
@@ -6297,10 +6307,13 @@ mod tests {
     /// Sans cette préférence, un tiers qui liste le manifeste d'un créateur
     /// suivi ferait retomber sa lecture en `Stream` au hasard.
     ///
-    /// Les deux rôles sont joués dans les DEUX sens (deux nœuds aux
-    /// abonnements croisés sur les mêmes feeds) : quel que soit l'ordre que
-    /// chaque `HashMap` produit, au moins un des deux nœuds a son émetteur
-    /// souscrit ailleurs qu'en tête.
+    /// **Déterminisme** : un SEUL nœud, donc une seule `HashMap` de catalogue,
+    /// donc un seul ordre d'itération — inconnu, mais fixe pour la durée du
+    /// test. L'abonnement bascule d'un émetteur à l'autre sur ce catalogue
+    /// inchangé : quel que soit cet ordre, l'une des deux assertions porte
+    /// forcément sur un émetteur qui n'est PAS en tête, celle que l'ancien
+    /// « prendre la première entrée venue » échouerait. Le test détecte donc
+    /// la régression à coup sûr, pas trois fois sur quatre.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn catalog_entry_for_manifest_prefers_a_subscribed_issuer() {
         let dir = tempfile::tempdir().unwrap();
@@ -6312,34 +6325,39 @@ mod tests {
         // Un manifeste quelconque, revendiqué par les deux feeds.
         let manifest_cid = crate::content::cid_for(b"manifeste revendique par deux emetteurs");
 
-        for (name, subscribed_issuer, subscribed_kp) in [("cx", x, &kp_x), ("cy", y, &kp_y)] {
-            let bs = Blockstore::open(dir.path().join(name)).unwrap();
-            let node = Node::with_moderation(Keypair::generate_ed25519(), bs, Moderation::empty())
-                .await
-                .unwrap();
-            node.subscribe(subscribed_issuer).unwrap();
-            for kp in [&kp_x, &kp_y] {
-                let feed = Feed::build_signed(kp, 1, &[manifest_cid]).unwrap();
-                node.apply_feed_for_tests(feed).unwrap();
-            }
-            assert_eq!(
-                node.catalog_entries().len(),
-                2,
-                "les deux feeds doivent être au catalogue"
-            );
-            // Répété : l'ordre d'une `HashMap` est fixe dans un processus,
-            // mais le verrou porte sur le résultat, pas sur l'ordre.
-            for _ in 0..8 {
-                let entry = node
-                    .catalog_entry_for_manifest(&manifest_cid)
-                    .expect("une entrée revendique ce manifeste");
-                assert_eq!(
-                    entry.issuer,
-                    identity::peer_id(subscribed_kp),
-                    "l'émetteur SOUSCRIT doit être élu, jamais celui qui liste le CID sans être suivi"
-                );
-            }
+        let bs = Blockstore::open(dir.path().join("cat")).unwrap();
+        let node = Node::with_moderation(Keypair::generate_ed25519(), bs, Moderation::empty())
+            .await
+            .unwrap();
+        for kp in [&kp_x, &kp_y] {
+            let feed = Feed::build_signed(kp, 1, &[manifest_cid]).unwrap();
+            node.apply_feed_for_tests(feed).unwrap();
         }
+        assert_eq!(
+            node.catalog_entries().len(),
+            2,
+            "les deux feeds doivent être au catalogue"
+        );
+
+        node.subscribe(x).unwrap();
+        assert_eq!(
+            node.catalog_entry_for_manifest(&manifest_cid)
+                .expect("une entrée revendique ce manifeste")
+                .issuer,
+            x,
+            "l'émetteur SOUSCRIT doit être élu, jamais celui qui liste le CID sans être suivi"
+        );
+
+        // Même catalogue, même ordre : seul l'abonnement change de camp.
+        node.unsubscribe(x).unwrap();
+        node.subscribe(y).unwrap();
+        assert_eq!(
+            node.catalog_entry_for_manifest(&manifest_cid)
+                .expect("une entrée revendique ce manifeste")
+                .issuer,
+            y,
+            "l'élection doit suivre l'abonnement, pas l'ordre d'itération du catalogue"
+        );
     }
 
     /// Le réglage « seed de ce que je regarde » (spec persistance §3) est
