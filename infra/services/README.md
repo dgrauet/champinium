@@ -1,8 +1,11 @@
 # Seeding en arrière-plan (hors UI)
 
 Le nœud seede même sans interface ouverte, via le démon **`champinium-seed`** :
-au démarrage puis périodiquement, il réannonce dans la DHT tous les CIDs qu'il
-détient (provider records). Ce qu'il détient, c'est le noyau qui en décide —
+au démarrage puis périodiquement, il réannonce dans la DHT les racines qu'il
+détient (provider records) et republie les feeds signés qu'il détient
+légitimement. Cette maintenance appartient au **nœud** (elle démarre à son
+`listen`), pas au démon : l'app seede tant qu'elle est ouverte ; le démon,
+quand elle est fermée. Ce que le nœud détient, c'est le noyau qui en décide —
 la **boucle de seed proactif** retient et resert les publications des
 channels **souscrits** par ce nœud, sous quota, avec éviction par réplication
 et pins (voir `docs/architecture.md` §6 bis) ; le démon ne publie pas de feed
@@ -13,7 +16,7 @@ jamais un contenu matché).
 
 ```sh
 champinium-seed --data-dir <dir> [--listen <multiaddr>] \
-    [--bootstrap <multiaddr> ...] [--reprovide-interval <secondes>]
+    [--bootstrap <multiaddr> ...]
 ```
 
 Chaque OS l'enveloppe dans son gestionnaire de service natif.

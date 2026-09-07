@@ -171,6 +171,24 @@ const FOLLOW_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// ([`Node::with_moderation_and_intervals`]), jamais par un setter posé après
 /// le `tokio::spawn`.
 const SEED_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// Intervalle de la maintenance réseau du nœud lui-même : réannonce des
+/// racines détenues ([`Node::reprovide_all`]) et republication des feeds
+/// connus ([`Node::republish_known_feeds`]). Une heure — ces deux passes
+/// existent contre l'expiration des records Kademlia (store de providers
+/// volatile, TTL des records de feed), pas contre un changement local, donc
+/// un rythme lent suffit et évite d'inonder la DHT.
+///
+/// Cette maintenance vivait auparavant **uniquement** dans le démon
+/// `champinium-seed` : un nœud GUI qui redémarrait ne réannonçait donc jamais
+/// ce qu'il seedait, et la longue traîne s'éteignait en silence chez tous les
+/// utilisateurs sans démon installé. Elle appartient désormais au nœud, qui la
+/// démarre à [`Node::listen`] — jamais à la construction : un nœud qui n'écoute
+/// pas n'est joignable par personne, l'annoncer serait un mensonge.
+///
+/// Même leçon que [`FOLLOW_INTERVAL`] : surchargeable au constructeur
+/// ([`Node::with_moderation_and_intervals`]), jamais par un setter posé après
+/// le `tokio::spawn`.
+pub const REPROVIDE_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// Demande d'un bloc par CID (octets du CID).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -421,6 +439,15 @@ pub struct Node {
     /// lu directement : seul son compteur de références (via `Clone`) importe.
     #[allow(dead_code)]
     alive: Arc<()>,
+    /// Vrai dès que [`Node::listen`] a démarré la boucle de maintenance
+    /// ([`maintenance_loop`]). Partagé par toutes les poignées clonées : deux
+    /// `listen` (sur deux adresses, ou depuis deux clones) ne doivent démarrer
+    /// qu'**une** boucle — sinon chaque appel ajouterait une passe de
+    /// réannonce concurrente sur la même DHT.
+    maintenance_started: Arc<AtomicBool>,
+    /// Intervalle de la boucle de maintenance, fixé au constructeur (voir
+    /// [`REPROVIDE_INTERVAL`]).
+    reprovide_interval: Duration,
     cmd_tx: mpsc::Sender<Command>,
     /// Backend de repli de récupération froide (ADR 0008, CS-a tâche 3) —
     /// `None` par défaut : aucun câblage de production dans cette tâche, seule
@@ -566,6 +593,7 @@ impl Node {
             Moderation::new(),
             FOLLOW_INTERVAL,
             SEED_INTERVAL,
+            REPROVIDE_INTERVAL,
             Some(crate::moderation::project_issuer()?),
         )
         .await
@@ -585,6 +613,7 @@ impl Node {
             Moderation::new(),
             FOLLOW_INTERVAL,
             SEED_INTERVAL,
+            REPROVIDE_INTERVAL,
             Some(crate::moderation::project_issuer()?),
             true,
         )
@@ -607,6 +636,7 @@ impl Node {
             Moderation::new(),
             FOLLOW_INTERVAL,
             SEED_INTERVAL,
+            REPROVIDE_INTERVAL,
             Some(crate::moderation::project_issuer()?),
             false,
         )
@@ -652,20 +682,23 @@ impl Node {
             moderation,
             follow_interval,
             SEED_INTERVAL,
+            REPROVIDE_INTERVAL,
             None,
         )
         .await
     }
 
     /// Comme [`Node::with_moderation`], mais avec `follow_interval` (suivi de
-    /// channel) ET `seed_interval` (seed proactif, lot c) explicites plutôt
-    /// que les constantes de production [`FOLLOW_INTERVAL`]/[`SEED_INTERVAL`]
-    /// (5 min chacune, bien trop long pour un test). Réservé aux tests :
-    /// contrairement à un setter post-construction (qui entrerait en course
-    /// avec la toute première lecture de l'intervalle par la boucle
-    /// correspondante — voir le commentaire sur `FOLLOW_INTERVAL`), les deux
-    /// intervalles sont effectifs **avant** le `tokio::spawn` de leur boucle,
-    /// donc sans course possible.
+    /// channel), `seed_interval` (seed proactif, lot c) ET
+    /// `reprovide_interval` (maintenance réseau) explicites plutôt que les
+    /// constantes de production
+    /// [`FOLLOW_INTERVAL`]/[`SEED_INTERVAL`]/[`REPROVIDE_INTERVAL`] (bien trop
+    /// longues pour un test). Réservé aux tests : contrairement à un setter
+    /// post-construction (qui entrerait en course avec la toute première
+    /// lecture de l'intervalle par la boucle correspondante — voir le
+    /// commentaire sur `FOLLOW_INTERVAL`), les trois intervalles sont
+    /// effectifs **avant** le `tokio::spawn` de leur boucle, donc sans course
+    /// possible.
     ///
     /// `project_issuer` est l'éditeur de denylist non retirable de ce nœud :
     /// `Some(_)` pour [`Node::new`]/[`Node::open`] (clé projet compilée),
@@ -678,6 +711,7 @@ impl Node {
         moderation: Moderation,
         follow_interval: Duration,
         seed_interval: Duration,
+        reprovide_interval: Duration,
         project_issuer: Option<PeerId>,
     ) -> CoreResult<Self> {
         Self::build(
@@ -686,6 +720,7 @@ impl Node {
             moderation,
             follow_interval,
             seed_interval,
+            reprovide_interval,
             project_issuer,
             false,
         )
@@ -699,12 +734,20 @@ impl Node {
     /// les démons `champinium-seed`/`champinium-bootstrap` ainsi que toute la
     /// suite de tests) — un nœud ne démarre un socket multicast que si un
     /// dotfile explicite le demande.
+    // Corps commun privé de six constructeurs : chaque paramètre y est un
+    // réglage que l'un d'eux surcharge (les trois intervalles pour les tests,
+    // l'éditeur projet pour `new`/`open`, mDNS pour `open` vs
+    // `open_isolated`). Les regrouper dans une struct de config déplacerait le
+    // bruit d'un cran sans rien clarifier — la fonction n'est jamais appelée
+    // hors de ce bloc `impl`.
+    #[allow(clippy::too_many_arguments)]
     async fn build(
         keypair: Keypair,
         blockstore: Blockstore,
         moderation: Moderation,
         follow_interval: Duration,
         seed_interval: Duration,
+        reprovide_interval: Duration,
         project_issuer: Option<PeerId>,
         mdns_default: bool,
     ) -> CoreResult<Self> {
@@ -901,6 +944,8 @@ impl Node {
             project_issuer,
             moderation_events,
             alive,
+            maintenance_started: Arc::new(AtomicBool::new(false)),
+            reprovide_interval,
             cmd_tx,
             #[cfg(feature = "cold-storage")]
             cold: None,
@@ -1002,10 +1047,51 @@ impl Node {
     }
 
     /// Écoute sur `addr` ; renvoie l'adresse effectivement liée.
+    ///
+    /// Premier `listen` réussi = démarrage de la **maintenance réseau** du
+    /// nœud ([`maintenance_loop`] : réannonce des racines + republication des
+    /// feeds connus, toutes les [`REPROVIDE_INTERVAL`], première passe
+    /// immédiate en rattrapage de démarrage). C'est ici et pas à la
+    /// construction : annoncer des racines depuis un nœud qui n'écoute sur
+    /// rien enverrait les pairs vers une adresse injoignable. Une seule boucle
+    /// quels que soient le nombre d'appels et de poignées clonées
+    /// (`maintenance_started`).
     pub async fn listen(&self, addr: Multiaddr) -> CoreResult<Multiaddr> {
         let (tx, rx) = oneshot::channel();
         self.send(Command::Listen { addr, tx }).await?;
-        rx.await.map_err(|_| CoreError::Shutdown)?
+        let bound = rx.await.map_err(|_| CoreError::Shutdown)??;
+        if !self.maintenance_started.swap(true, Ordering::SeqCst) {
+            tokio::spawn(maintenance_loop(
+                Arc::downgrade(&self.alive),
+                self.maintenance_state(),
+                self.reprovide_interval,
+            ));
+        }
+        Ok(bound)
+    }
+
+    /// Vrai si la boucle de maintenance a été démarrée (par un [`Node::listen`]
+    /// réussi). Réservé aux tests : sert à vérifier qu'un nœud qui n'écoute pas
+    /// n'a aucun effet réseau implicite.
+    #[doc(hidden)]
+    pub fn maintenance_started_for_tests(&self) -> bool {
+        self.maintenance_started.load(Ordering::SeqCst)
+    }
+
+    /// Fabrique l'état isolé de la boucle de maintenance (des `Arc` clonés,
+    /// jamais un `Node` — voir le commentaire sur [`Node::alive`]).
+    fn maintenance_state(&self) -> MaintenanceState {
+        MaintenanceState {
+            cmd_tx: self.cmd_tx.clone(),
+            blockstore: self.blockstore.clone(),
+            moderation: self.moderation.clone(),
+            catalog: self.catalog.clone(),
+            subscriptions: self.subscriptions.clone(),
+            seed_index: self.seed_index.clone(),
+            blocked_channels: self.blocked_channels.clone(),
+            denylist_issuers: self.denylist_issuers.clone(),
+            peer_id: self.peer_id,
+        }
     }
 
     /// Adresses d'écoute actuelles.
@@ -2342,20 +2428,7 @@ impl Node {
     /// détenus ne sont plus annoncés tant qu'on ne les republie pas. Renvoie
     /// le nombre de roots réannoncés.
     pub async fn reprovide_all(&self) -> CoreResult<usize> {
-        let segments = self
-            .seed_index
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .all_segment_cids();
-        let mut count = 0usize;
-        for cid in self.blockstore.list()? {
-            if segments.contains(&cid.to_string()) {
-                continue;
-            }
-            self.provide(cid).await?;
-            count += 1;
-        }
-        Ok(count)
+        reprovide_all_inner(&self.maintenance_state()).await
     }
 
     /// Réannonce dans la DHT les feeds SIGNÉS que ce nœud détient
@@ -2383,71 +2456,7 @@ impl Node {
     /// juste envoyé à la boucle réseau) ; renvoie le nombre de feeds pour
     /// lesquels un PUT a été émis.
     pub async fn republish_known_feeds(&self) -> CoreResult<usize> {
-        let subs = self.subscriptions_snapshot();
-        let to_republish: Vec<(PeerId, Vec<u8>)> = {
-            let catalog = self
-                .catalog
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            catalog
-                .issuers()
-                .filter(|issuer| **issuer == self.peer_id || subs.contains(*issuer))
-                .filter(|issuer| {
-                    !is_key_blocked_inner(&self.moderation, &self.blocked_channels, issuer)
-                })
-                .filter_map(|issuer| {
-                    let data = catalog.feed_for(issuer)?.to_json().ok()?.into_bytes();
-                    Some((*issuer, data))
-                })
-                .collect()
-        };
-
-        let mut count = 0usize;
-        for (issuer, data) in to_republish {
-            let (tx, _rx) = oneshot::channel();
-            let _ = self
-                .cmd_tx
-                .send(Command::PutRecord {
-                    key: feed_record_key(&issuer),
-                    value: data,
-                    tx,
-                })
-                .await;
-            count += 1;
-        }
-
-        // Denylists : même problème de durabilité que les feeds (le record
-        // Kademlia d'un éditeur hors ligne s'éteint à son TTL), même remède —
-        // chaque nœud qui suit un éditeur reprovisionne sa liste. Seules les
-        // listes en cache d'un éditeur ENCORE souscrit sont republiées : un
-        // cache orphelin ne doit pas être réinjecté dans le réseau.
-        let subscribed_editors: BTreeSet<PeerId> = self
-            .denylist_issuers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        for list in crate::moderation::load_cached_lists(self.blockstore.root()) {
-            let Ok(issuer) = list.issuer_peer_id() else {
-                continue;
-            };
-            if !subscribed_editors.contains(&issuer) {
-                continue;
-            }
-            let Ok(value) = serde_json::to_vec(&list) else {
-                continue;
-            };
-            let (tx, _rx) = oneshot::channel();
-            let _ = self
-                .cmd_tx
-                .send(Command::PutRecord {
-                    key: denylist_record_key(&issuer),
-                    value,
-                    tx,
-                })
-                .await;
-            count += 1;
-        }
-        Ok(count)
+        republish_known_feeds_inner(&self.maintenance_state()).await
     }
 
     /// Annonce que ce nœud fournit `cid`. **Ne fait rien** si le CID est bloqué :
@@ -4012,6 +4021,147 @@ async fn seed_loop(
     }
 }
 
+/// Tout ce qu'il faut pour réannoncer les racines et republier les feeds
+/// **sans** détenir une poignée `Node`. Même raison d'être que
+/// [`SeedLoopState`] et [`ModerationState`] : une tâche de fond qui clonerait
+/// un `Node` retiendrait son `cmd_tx` fort et la boucle d'évènements ne
+/// s'arrêterait jamais (voir le commentaire sur `Node::alive`). `Node` en
+/// fabrique un à la demande (`Node::maintenance_state`) et les méthodes
+/// publiques [`Node::reprovide_all`]/[`Node::republish_known_feeds`] délèguent
+/// ici : la boucle de fond et l'appel manuel exécutent le même code.
+struct MaintenanceState {
+    cmd_tx: mpsc::Sender<Command>,
+    blockstore: Blockstore,
+    moderation: Arc<RwLock<Moderation>>,
+    catalog: Arc<Mutex<Catalog>>,
+    subscriptions: Arc<Mutex<BTreeSet<PeerId>>>,
+    seed_index: Arc<Mutex<SeedIndex>>,
+    blocked_channels: Arc<Mutex<BTreeSet<PeerId>>>,
+    denylist_issuers: Arc<Mutex<BTreeSet<PeerId>>>,
+    peer_id: PeerId,
+}
+
+/// Corps de [`Node::reprovide_all`] — voir sa doc pour le comportement.
+async fn reprovide_all_inner(state: &MaintenanceState) -> CoreResult<usize> {
+    let segments = state
+        .seed_index
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .all_segment_cids();
+    let mut count = 0usize;
+    for cid in state.blockstore.list()? {
+        if segments.contains(&cid.to_string()) {
+            continue;
+        }
+        provide_inner(&state.cmd_tx, &state.moderation, cid).await?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Corps de [`Node::republish_known_feeds`] — voir sa doc pour le comportement.
+async fn republish_known_feeds_inner(state: &MaintenanceState) -> CoreResult<usize> {
+    let subs: BTreeSet<PeerId> = state
+        .subscriptions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let to_republish: Vec<(PeerId, Vec<u8>)> = {
+        let catalog = state
+            .catalog
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        catalog
+            .issuers()
+            .filter(|issuer| **issuer == state.peer_id || subs.contains(*issuer))
+            .filter(|issuer| {
+                !is_key_blocked_inner(&state.moderation, &state.blocked_channels, issuer)
+            })
+            .filter_map(|issuer| {
+                let data = catalog.feed_for(issuer)?.to_json().ok()?.into_bytes();
+                Some((*issuer, data))
+            })
+            .collect()
+    };
+
+    let mut count = 0usize;
+    for (issuer, data) in to_republish {
+        let (tx, _rx) = oneshot::channel();
+        let _ = state
+            .cmd_tx
+            .send(Command::PutRecord {
+                key: feed_record_key(&issuer),
+                value: data,
+                tx,
+            })
+            .await;
+        count += 1;
+    }
+
+    // Denylists : même problème de durabilité que les feeds (le record
+    // Kademlia d'un éditeur hors ligne s'éteint à son TTL), même remède —
+    // chaque nœud qui suit un éditeur reprovisionne sa liste. Seules les
+    // listes en cache d'un éditeur ENCORE souscrit sont republiées : un
+    // cache orphelin ne doit pas être réinjecté dans le réseau.
+    let subscribed_editors: BTreeSet<PeerId> = state
+        .denylist_issuers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    for list in crate::moderation::load_cached_lists(state.blockstore.root()) {
+        let Ok(issuer) = list.issuer_peer_id() else {
+            continue;
+        };
+        if !subscribed_editors.contains(&issuer) {
+            continue;
+        }
+        let Ok(value) = serde_json::to_vec(&list) else {
+            continue;
+        };
+        let (tx, _rx) = oneshot::channel();
+        let _ = state
+            .cmd_tx
+            .send(Command::PutRecord {
+                key: denylist_record_key(&issuer),
+                value,
+                tx,
+            })
+            .await;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Boucle de maintenance réseau du nœud : réannonce des racines détenues
+/// ([`reprovide_all_inner`]) puis republication des feeds et denylists connus
+/// ([`republish_known_feeds_inner`]), toutes les `reprovide_interval`.
+///
+/// Démarrée par le premier [`Node::listen`] réussi, jamais à la construction.
+/// Comme `follow_loop` et `seed_loop` : la toute première passe a lieu AVANT
+/// toute attente (rattrapage au démarrage — le store de providers Kademlia est
+/// volatile, donc au redémarrage plus rien n'est annoncé tant qu'on n'a pas
+/// republié), et la boucle ne tient qu'un [`Weak`] marqueur de vivacité,
+/// jamais un `Node` fort qui empêcherait la boucle d'évènements de s'arrêter.
+///
+/// Best-effort : l'échec d'une passe (réseau indisponible, aucun pair connu)
+/// est seulement tracé — la passe suivante réessaiera.
+async fn maintenance_loop(alive: Weak<()>, state: MaintenanceState, reprovide_interval: Duration) {
+    loop {
+        if alive.upgrade().is_none() {
+            return;
+        }
+        match reprovide_all_inner(&state).await {
+            Ok(n) => tracing::debug!("maintenance : {n} racines réannoncées"),
+            Err(e) => tracing::debug!("maintenance : réannonce des racines échouée: {e}"),
+        }
+        match republish_known_feeds_inner(&state).await {
+            Ok(n) => tracing::debug!("maintenance : {n} records republiés"),
+            Err(e) => tracing::debug!("maintenance : republication échouée: {e}"),
+        }
+        tokio::time::sleep(reprovide_interval).await;
+    }
+}
+
 /// Préfixe des clés DHT de feeds.
 const FEED_KEY_PREFIX: &[u8] = b"/champinium/feed/";
 
@@ -4807,6 +4957,104 @@ mod tests {
         })
         .await
         .expect("A doit joindre B par bootstrap");
+    }
+
+    /// Sans démon `champinium-seed` : un nœud qui redémarre et écoute
+    /// réannonce tout seul les racines qu'il détient. C'est la maintenance
+    /// intégrée au nœud (`maintenance_loop`, démarrée par `listen`) — avant
+    /// elle, un utilisateur sans démon voyait son contenu disparaître de la
+    /// DHT à chaque redémarrage.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn maintenance_reprovides_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Node::open_isolated(&dir.path().join("a")).await.unwrap();
+        let a_addr = a
+            .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        let cid = a.add(b"maintenance-block").await.unwrap();
+
+        // B récupère le bloc en politique Seed (il en devient détenteur), puis
+        // s'éteint en même temps que A : seul le blockstore de B subsiste.
+        let b_dir = dir.path().join("b");
+        let b = Node::open_isolated(&b_dir).await.unwrap();
+        b.listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        let a_full: Multiaddr = format!("{a_addr}/p2p/{}", a.peer_id()).parse().unwrap();
+        b.connect(a_full).await.unwrap();
+        // Attente de convergence (jamais un sleep fixe seul) : la table de
+        // routage de B doit connaître A avant que la requête de fournisseurs
+        // puisse aboutir.
+        let seeded = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Ok(bytes) = b.get_with(cid, StorePolicy::Seed).await {
+                    return bytes;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .expect("B doit récupérer le bloc depuis A");
+        assert_eq!(seeded, b"maintenance-block");
+        drop(b);
+        drop(a);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Redémarrage de B, avec un intervalle de maintenance court. Aucun
+        // appel manuel à `reprovide_all` : seul `listen` doit suffire.
+        let keypair = crate::identity::load_or_generate(b_dir.join("node.key")).unwrap();
+        let blockstore = Blockstore::open(b_dir.join("blocks")).unwrap();
+        let b = Node::with_moderation_and_intervals(
+            keypair,
+            blockstore,
+            Moderation::empty(),
+            FOLLOW_INTERVAL,
+            SEED_INTERVAL,
+            Duration::from_millis(200),
+            None,
+        )
+        .await
+        .unwrap();
+        let b_addr = b
+            .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+
+        let c = Node::open_isolated(&dir.path().join("c")).await.unwrap();
+        c.listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        let b_full: Multiaddr = format!("{b_addr}/p2p/{}", b.peer_id()).parse().unwrap();
+        c.connect(b_full).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if c.get_providers(cid)
+                    .await
+                    .map(|p| p.contains(&b.peer_id()))
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .expect("B doit réannoncer sans démon");
+        assert_eq!(c.get(cid).await.unwrap(), b"maintenance-block");
+    }
+
+    /// Un nœud ouvert mais qui n'écoute pas n'annonce rien : la maintenance
+    /// n'est pas un effet de bord de la construction. Annoncer des racines
+    /// depuis un nœud injoignable enverrait les pairs dans le vide.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn maintenance_not_started_without_listen() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = Node::open_isolated(dir.path()).await.unwrap();
+        n.add(b"x").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!n.maintenance_started_for_tests());
     }
 
     /// Le point de commit du seed ne retient une publication que si l'émetteur
