@@ -94,6 +94,10 @@ public sealed class ChannelGroup
             ? "· à jour"
             : $"· seed en cours ({SeededCount}/{TotalCount})";
 
+    /// <summary>Badge « conservé » (vue Explorer uniquement) : contenu retenu
+    /// localement (seed de ce que je regarde) sans abonnement au channel.</summary>
+    public string WatchedBadgeText => !IsSubscribed && SeededCount > 0 ? "· conservé" : "";
+
     /// <summary>Libellé du bouton — calculé depuis l'état d'abonnement réel
     /// (dans l'onglet Abonnements, toujours vrai par construction).</summary>
     public string SubscribeLabel => IsSubscribed ? "Se désabonner" : "S'abonner";
@@ -466,6 +470,46 @@ public sealed class NodeViewModel : INotifyPropertyChanged
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(MdnsEnabled)));
     }
 
+    /// <summary>Conserver et resservir ce que je regarde (hors abonnement) — effet
+    /// immédiat, contrairement à <see cref="MdnsEnabled"/>. Même patron sinon :
+    /// <c>SeedWatched</c>/<c>SetSeedWatched</c> sont SYNC, le setter public sert
+    /// exclusivement l'écriture utilisateur (liaison <c>ToggleSwitch</c>), le peuplement
+    /// initial passe par <see cref="SetSeedWatchedState"/>.</summary>
+    private bool _seedWatched;
+    public bool SeedWatched
+    {
+        get => _seedWatched;
+        set
+        {
+            if (_node is null || _seedWatched == value)
+            {
+                return;
+            }
+            try
+            {
+                _node.SetSeedWatched(value);
+                SetSeedWatchedState(value);
+            }
+            catch (Exception)
+            {
+                SubscriptionStatus = "seed de ce que je regarde: erreur";
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(SeedWatched)));
+            }
+        }
+    }
+
+    /// <summary>Peuple <see cref="SeedWatched"/> sans écrire vers la FFI —
+    /// utilisé au démarrage pour refléter l'état du core.</summary>
+    private void SetSeedWatchedState(bool value)
+    {
+        if (_seedWatched == value)
+        {
+            return;
+        }
+        _seedWatched = value;
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(SeedWatched)));
+    }
+
     /// <summary>Affichage humain de l'usage courant (liaison TextBlock du popover de réglages).</summary>
     public string StorageStatsText =>
         $"Utilisé : {GigabytesText(_storageStats.usedBytes)} Go / {GigabytesText(_storageStats.quotaBytes)} Go";
@@ -561,6 +605,7 @@ public sealed class NodeViewModel : INotifyPropertyChanged
             RefreshModeration();
             QuotaField = GigabytesText(_storageStats.quotaBytes);
             SetMdnsState(node.MdnsEnabled());
+            SetSeedWatchedState(node.SeedWatched());
 
             // Amorçage best-effort : ne bloque jamais le démarrage de l'UI ni
             // n'échoue de façon visible — le champ « Connecter » manuel reste
