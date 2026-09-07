@@ -19,6 +19,25 @@ async fn node(dir: &std::path::Path, name: &str) -> Node {
         .unwrap()
 }
 
+/// Comme [`node`], mais avec des boucles de fond rapides (suivi et seed) —
+/// même patron que `tests/proactive_seed.rs`. La maintenance reste à sa
+/// valeur de production : ces tests ne la mesurent pas.
+async fn fast_node(dir: &std::path::Path, name: &str) -> Node {
+    let kp = load_or_generate(dir.join(format!("{name}.key"))).unwrap();
+    let bs = Blockstore::open(dir.join(name)).unwrap();
+    Node::with_moderation_and_intervals(
+        kp,
+        bs,
+        Moderation::empty(),
+        Duration::from_millis(100),
+        Duration::from_millis(100),
+        champinium_core::p2p::REPROVIDE_INTERVAL,
+        None,
+    )
+    .await
+    .unwrap()
+}
+
 async fn poll_until<F: Fn() -> bool>(deadline: Duration, message: &str, cond: F) {
     tokio::time::timeout(deadline, async {
         loop {
@@ -47,17 +66,25 @@ async fn open_until_ok(node: &Node, m: champinium_core::Cid) -> champinium_core:
     .expect("open_stream doit finir par réussir")
 }
 
-/// Publie chez `creator` un manifeste de `n` segments réels et rend
-/// `(cid du manifeste, cids des segments)`.
-async fn publish(
+/// Publie chez `creator` un manifeste de `n` segments et rend
+/// `(cid du manifeste, cids des segments)`. `present` dit, par index, si le
+/// bloc existe réellement chez `creator` : un segment absent est listé au
+/// manifeste avec un CID que **personne** ne détient, donc jamais récupérable
+/// (`get` échoue et retente toutes les `RETRY_DELAY`) — c'est ce qui permet
+/// de garantir qu'une session ne se complètera JAMAIS.
+async fn publish_with(
     creator: &Node,
     tag: &str,
-    n: usize,
+    present: &[bool],
 ) -> (champinium_core::Cid, Vec<champinium_core::Cid>) {
     let mut cids = vec![];
-    for i in 0..n {
+    for (i, p) in present.iter().enumerate() {
         let payload = format!("segment {i} de {tag} (test seed regarde)");
-        cids.push(creator.add(payload.as_bytes()).await.unwrap());
+        cids.push(if *p {
+            creator.add(payload.as_bytes()).await.unwrap()
+        } else {
+            champinium_core::content::cid_for(format!("absent {i} de {tag}").as_bytes())
+        });
     }
     let manifest = HlsManifest::new(
         1.0,
@@ -73,6 +100,15 @@ async fn publish(
         .await
         .unwrap();
     (m, cids)
+}
+
+/// [`publish_with`] où tous les segments existent.
+async fn publish(
+    creator: &Node,
+    tag: &str,
+    n: usize,
+) -> (champinium_core::Cid, Vec<champinium_core::Cid>) {
+    publish_with(creator, tag, &vec![true; n]).await
 }
 
 async fn wire(consumer: &Node, creator: &Node, addr: libp2p::Multiaddr) {
@@ -173,7 +209,12 @@ async fn watched_stream_enters_seed_index_when_enabled() {
     );
     b.close_stream(info.id).await;
 
-    // Un tiers voit deux fournisseurs pour la racine (A + B).
+    // Un tiers voit deux fournisseurs pour la racine (A + B). Vérification
+    // complémentaire, pas la preuve du lot : sous `StorePolicy::Seed` le
+    // manifeste est mis en cache ET annoncé dès `open_stream`, donc cette
+    // assertion tient dès le choix de politique. Ce que le seed de ce qui est
+    // regardé ajoute — la publication RETENUE et comptabilisée — est prouvé
+    // par `storage_stats` et `seed_coverage` ci-dessus.
     let c = node(dir.path(), "c1").await;
     c.listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
         .await
@@ -240,6 +281,12 @@ async fn watched_stream_ignored_when_disabled() {
 /// Session regardée fermée AVANT sa complétion : elle n'entre jamais à
 /// l'index, donc ses blocs déjà récupérés doivent être purgés — pas
 /// d'accumulation hors comptabilité de quota (spec persistance §4).
+///
+/// **Déterminisme** : le dernier segment n'existe chez PERSONNE (le manifeste
+/// le liste, sa récupération échoue puis retente toutes les `RETRY_DELAY`),
+/// donc la session ne peut structurellement pas se compléter. Sans ça, douze
+/// blocs minuscules sur une boucle TCP locale peuvent tous arriver entre deux
+/// sondages et faire échouer le test par intermittence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn incomplete_watched_stream_leaves_no_orphans() {
     let dir = tempfile::tempdir().unwrap();
@@ -255,8 +302,9 @@ async fn incomplete_watched_stream_leaves_no_orphans() {
         .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
         .await
         .unwrap();
-    // Assez de segments pour pouvoir fermer entre le premier et le dernier.
-    let (m, cids) = publish(&a, "partiel", 12).await;
+    // Trois segments réels, un quatrième introuvable partout : la session se
+    // stabilise à 3/4 et ne se complète jamais.
+    let (m, cids) = publish_with(&a, "partiel", &[true, true, true, false]).await;
 
     let b = node(dir.path(), "b3").await;
     wire(&b, &a, addr_a).await;
@@ -264,26 +312,20 @@ async fn incomplete_watched_stream_leaves_no_orphans() {
     seed_catalog(&b, &kp_a, m).await;
 
     let info = open_until_ok(&b, m).await;
-    // Attend au moins un segment récupéré, mais ferme avant la complétion :
-    // si la session finit d'elle-même avant qu'on la ferme, le test n'a plus
-    // de sens — on l'annonce plutôt que de conclure à tort.
-    let mut closed_incomplete = false;
-    for _ in 0..600 {
-        let st = b.stream_status(info.id).unwrap();
-        if st.fetched_segments >= 1 && st.fetched_segments < st.total_segments {
-            b.close_stream(info.id).await;
-            closed_incomplete = true;
-            break;
-        }
-        if st.fetched_segments == st.total_segments {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(
-        closed_incomplete,
-        "la session s'est complétée avant d'avoir pu être fermée en cours de route"
-    );
+    // Attend que les trois segments récupérables soient là — c'est le pire
+    // cas pour la purge (le maximum de blocs à retirer), et la session reste
+    // structurellement incomplète.
+    poll_until(
+        Duration::from_secs(60),
+        "les trois segments récupérables doivent arriver",
+        || {
+            b.stream_status(info.id)
+                .map(|s| s.fetched_segments == 3 && s.total_segments == 4)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+    b.close_stream(info.id).await;
 
     assert_eq!(
         b.storage_stats().0,
@@ -298,4 +340,116 @@ async fn incomplete_watched_stream_leaves_no_orphans() {
         cids.iter().all(|c| !b.blockstore().has(c)),
         "aucun segment orphelin ne doit rester au magasin de B"
     );
+}
+
+/// Éviction à deux étages, câblage de bout en bout (spec persistance §5) : le
+/// quota est saturé par une publication **regardée** (hors abonnement) ;
+/// l'arrivée d'une publication d'un channel **souscrit** doit la faire partir
+/// pour lui faire de la place. C'est ce qui vérifie que `make_room_for` passe
+/// bien l'ensemble des émetteurs souscrits à `eviction_order` — l'unitaire
+/// `eviction_prefers_unsubscribed_publications` ne teste que la fonction pure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watched_publication_is_evicted_to_make_room_for_a_subscription() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Y : créateur JAMAIS souscrit, dont B regarde une publication.
+    let kp_y = Keypair::generate_ed25519();
+    let y = Node::with_moderation(
+        kp_y.clone(),
+        Blockstore::open(dir.path().join("y4")).unwrap(),
+        Moderation::empty(),
+    )
+    .await
+    .unwrap();
+    let addr_y = y
+        .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .await
+        .unwrap();
+    let (m_watched, segs_watched) = publish(&y, "regarde", 4).await;
+
+    // A : créateur auquel B s'abonnera ensuite. Publication plus petite (un
+    // seul segment) : une fois la place faite, elle doit tenir sous le quota.
+    let kp_a = Keypair::generate_ed25519();
+    let a = Node::with_moderation(
+        kp_a.clone(),
+        Blockstore::open(dir.path().join("a4")).unwrap(),
+        Moderation::empty(),
+    )
+    .await
+    .unwrap();
+    let addr_a = a
+        .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .await
+        .unwrap();
+    let (m_sub, seg_sub) = publish(&a, "abonnement", 1).await;
+
+    let b = fast_node(dir.path(), "b4").await;
+    b.listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .await
+        .unwrap();
+    wire(&b, &y, addr_y).await;
+    wire(&b, &a, addr_a).await;
+
+    // 1. B regarde la publication de Y jusqu'au bout → elle entre à l'index.
+    b.set_seed_watched(true).unwrap();
+    seed_catalog(&b, &kp_y, m_watched).await;
+    let info = open_until_ok(&b, m_watched).await;
+    poll_until(
+        Duration::from_secs(60),
+        "la session regardée doit se compléter",
+        || {
+            b.stream_status(info.id)
+                .map(|s| s.fetched_segments == s.total_segments)
+                .unwrap_or(false)
+        },
+    )
+    .await;
+    poll_until(
+        Duration::from_secs(30),
+        "la publication regardée doit être indexée",
+        || b.storage_stats().0 > 0,
+    )
+    .await;
+    b.close_stream(info.id).await;
+    let used_by_watched = b.storage_stats().0;
+
+    // 2. Le quota est saturé pile par elle : plus rien ne rentre sans éviction.
+    b.set_seed_quota(used_by_watched).unwrap();
+
+    // La victime doit être STRICTEMENT mieux répliquée que le candidat
+    // (dampening anti-oscillation de `make_room_for`) : Y + B = 2 pour la
+    // regardée, A seul = 1 pour celle de l'abonnement. On attend la
+    // convergence Kademlia avant de déclencher, sinon l'éviction serait
+    // refusée sur une mesure prématurée.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if b.replication_factor(m_watched).await.unwrap_or(0) >= 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("B doit être vu comme second fournisseur de la publication regardée");
+
+    // 3. B s'abonne à A : le seed proactif doit évincer la regardée.
+    b.subscribe(a.peer_id()).unwrap();
+    seed_catalog(&b, &kp_a, m_sub).await;
+
+    poll_until(
+        Duration::from_secs(60),
+        "la publication de l'abonnement doit être seedée à la place de la regardée",
+        || b.blockstore().has(&m_sub) && b.blockstore().has(&seg_sub[0]),
+    )
+    .await;
+    assert!(
+        !b.blockstore().has(&m_watched),
+        "la publication regardée (non souscrite) doit être évincée la première"
+    );
+    assert!(
+        segs_watched.iter().all(|c| !b.blockstore().has(c)),
+        "ses segments doivent partir avec elle"
+    );
+    let (used, quota) = b.storage_stats();
+    assert!(used <= quota, "le quota ne doit jamais être dépassé");
 }

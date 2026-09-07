@@ -1801,10 +1801,14 @@ impl Node {
     ///
     /// **Sans émetteur, pas de seed** (spec persistance §3) : un manifeste
     /// ouvert par CID nu qui n'apparaît dans aucune entrée du catalogue reste
-    /// en `Stream` même le réglage actif — l'index de seed est indexé par
-    /// émetteur, une publication sans émetteur n'aurait ni ligne dans l'index,
-    /// ni purge au désabonnement, ni étage d'éviction.
+    /// en `Stream` même si le réglage est actif — l'index de seed est indexé
+    /// par émetteur, une publication sans émetteur n'aurait ni ligne dans
+    /// l'index, ni purge au désabonnement, ni étage d'éviction.
     pub async fn open_stream(&self, manifest_cid: Cid) -> CoreResult<StreamSessionInfo> {
+        // Émetteur retenu pour ce manifeste : un émetteur SOUSCRIT prime
+        // (voir [`Node::catalog_entry_for_manifest`]) — lister un CID ne
+        // prouve rien, et un tiers ne doit pas pouvoir faire retomber la
+        // lecture d'un abonnement en `Stream` en listant son manifeste.
         let entry = self.catalog_entry_for_manifest(&manifest_cid);
         let subscribed = entry
             .as_ref()
@@ -1868,26 +1872,58 @@ impl Node {
             .remove(&id);
         if let Some(session) = session {
             let dir = session.dir().to_path_buf();
-            let orphans = session.unindexed_watched_publication();
+            let action = session.take_close_action();
             drop(session);
-            if let Some(publication) = orphans {
-                // Course bénigne avec `seed_loop` : si la publication vient
-                // d'être indexée entre-temps, `contains_manifest` le voit et
-                // rien n'est supprimé.
-                let indexed = self
-                    .seed_index
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .contains_manifest(&publication.manifest_cid);
-                if !indexed {
-                    remove_unshared_blocks(&self.blockstore, &self.seed_index, &[publication]);
-                }
+            if let Some(action) = action {
+                self.settle_watched_session(action);
             }
             if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
                 tracing::debug!("purge du répertoire de session {id}: {e}");
             }
             let _ = self.stream_events.send(id);
         }
+    }
+
+    /// Tranche le sort des blocs d'une session **regardée** qu'on ferme
+    /// (spec persistance §4). L'appelant détient le jeton de la session
+    /// (voir [`StreamSession::take_close_action`]), donc personne d'autre
+    /// n'agira sur ces blocs.
+    ///
+    /// Trois issues, dans cet ordre :
+    /// 1. **Rien** si la publication est déjà indexée (course gagnée par
+    ///    `seed_loop`) ou si son manifeste est **épinglé** — un pin n'a pas
+    ///    besoin d'une ligne d'index pour valoir ([`Node::pin_content`]
+    ///    épingle un manifeste qu'il soit retenu ou non), et « un manifeste
+    ///    épinglé n'est jamais évincé » vaut aussi ici.
+    /// 2. **Réémission** de la demande d'indexation si la session est
+    ///    complète : c'est le cas « je ferme l'app juste après la fin de la
+    ///    vidéo », où la session disparaît avant que `seed_loop` ait traité
+    ///    (ou même reçu) sa demande. Le `Node`, lui, détient l'émetteur du
+    ///    canal et survit à la session.
+    /// 3. **Purge** sinon : session incomplète, ou demande impossible à
+    ///    (ré)émettre — des blocs hors index, hors quota et jamais
+    ///    réannoncés ne doivent pas rester.
+    fn settle_watched_session(&self, action: stream::WatchedSessionClose) {
+        let settled = {
+            let idx = self
+                .seed_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let manifest = &action.publication.manifest_cid;
+            idx.contains_manifest(manifest) || idx.is_pinned(manifest)
+        };
+        if settled {
+            return;
+        }
+        if action.complete
+            && self
+                .seed_now
+                .try_send((action.issuer, action.manifest_cid))
+                .is_ok()
+        {
+            return;
+        }
+        remove_unshared_blocks(&self.blockstore, &self.seed_index, &[action.publication]);
     }
 
     /// État d'une session ; inconnue → `BlockNotFound` (mappé `NotFound`).
@@ -2028,10 +2064,28 @@ impl Node {
     /// Entrée de catalogue qui revendique ce manifeste, s'il en existe une —
     /// c'est ce qui donne un ÉMETTEUR à une publication lue, donc une ligne
     /// possible dans l'index de seed (spec persistance §3).
+    ///
+    /// **Un émetteur SOUSCRIT prime sur tous les autres.** Lister un CID ne
+    /// prouve pas qu'on le possède (invariant anti-censure du lot d) :
+    /// n'importe quel pair peut publier un feed listant le manifeste d'un
+    /// tiers. Or `Catalog::entries()` dérive d'une `HashMap`, donc son ordre
+    /// n'est pas déterministe : élire « la première entrée trouvée » ferait
+    /// dépendre d'un aléa la politique de stockage d'une lecture
+    /// d'abonnement — un tiers qui liste le manifeste d'un créateur suivi
+    /// suffirait à faire retomber sa lecture en `Stream` une fois sur deux
+    /// (plus rien en cache, plus d'annonce). D'où le tri explicite ci-dessous.
     fn catalog_entry_for_manifest(&self, manifest_cid: &Cid) -> Option<CatalogEntry> {
-        self.catalog_entries()
+        let candidates: Vec<CatalogEntry> = self
+            .catalog_entries()
             .into_iter()
-            .find(|e| e.cids.contains(manifest_cid))
+            .filter(|e| e.cids.contains(manifest_cid))
+            .collect();
+        let subs = self.subscriptions_snapshot();
+        candidates
+            .iter()
+            .find(|e| subs.contains(&e.issuer))
+            .cloned()
+            .or_else(|| candidates.into_iter().next())
     }
 
     /// Instantané (non trié) des abonnements — usage interne (exemption de
@@ -3902,7 +3956,7 @@ async fn seed_publication(
         // Même le manifeste ne rentre pas et rien n'est évictable (ou rien
         // d'assez répliqué pour justifier une éviction) : on ne tente même
         // pas la récupération réseau.
-        mark_quota_blocked(state, manifest_cid);
+        skip_for_quota(state, manifest_cid, watched);
         return Ok(());
     }
     let manifest_bytes = get_with_inner(
@@ -3934,13 +3988,21 @@ async fn seed_publication(
                 return Err(CoreError::Cid(e));
             }
         };
-        if !state.blockstore.has(&cid)
-            && !make_room_for(state, fetched_bytes, candidate_replication).await
-        {
+        // Quota vérifié pour CHAQUE segment, qu'il soit déjà local ou non :
+        // une publication **regardée** a tous ses blocs en place (la session
+        // les a récupérés en `Seed`), donc une garde `!has(&cid)` ici
+        // court-circuiterait tout contrôle et laisserait le quota dépassé de
+        // la taille d'une publication entière. Ce n'est pas un contrôle
+        // gratuit sur le chemin proactif non plus : un segment déjà présent
+        // pèse le même poids une fois la publication indexée. Seule la
+        // récupération RÉSEAU reste conditionnée à l'absence du bloc, et
+        // `get_with_inner` s'en charge lui-même (il rend les octets locaux
+        // sans toucher au réseau quand le bloc est déjà là).
+        if !make_room_for(state, fetched_bytes, candidate_replication).await {
             // Plus de place et rien à évincer : publication sautée, on
             // nettoie ce qui a été récupéré pour elle jusqu'ici.
             remove_unindexed_fetch(state, &fetched_cids);
-            mark_quota_blocked(state, manifest_cid);
+            skip_for_quota(state, manifest_cid, watched);
             return Ok(());
         }
         match get_with_inner(
@@ -3990,15 +4052,13 @@ async fn seed_publication(
         .is_blocked_key(&issuer);
     let committed = {
         // Origine `watched` : l'émetteur n'est PAS souscrit par définition —
-        // ce qui invaliderait la publication ici est un blocage local décidé
-        // pendant la récupération (le ban par denylist, lui, reste couvert
-        // par `key_banned` dans les deux cas).
+        // ce qui invaliderait la publication ici est un blocage décidé
+        // pendant la récupération. `is_key_blocked_inner` est le helper
+        // unique de cette règle (blocage local ET ban de clé fusionnés), le
+        // même qu'aux autres checkpoints : le dupliquer ici ferait un
+        // troisième endroit à maintenir si la règle évolue.
         let wanted_by_intent = if watched {
-            !state
-                .blocked_channels
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(&issuer)
+            !is_key_blocked_inner(&state.moderation, &state.blocked_channels, &issuer)
         } else {
             state
                 .subscriptions
@@ -4042,6 +4102,20 @@ async fn seed_publication(
     }
     let _ = state.seed_events.send(());
     Ok(())
+}
+
+/// Publication sautée faute de place évictable. Seul le chemin PROACTIF
+/// mémorise le manifeste dans `quota_blocked` : c'est `seed_channel` qui
+/// consulte cet ensemble, à chaque passe de round-robin, pour ne pas
+/// re-fetcher-puis-annuler la même publication condamnée. Une publication
+/// **regardée** n'est jamais retentée d'elle-même (elle n'arrive que par une
+/// demande nommée de session) — l'y inscrire ne servirait à rien et ferait
+/// grossir un ensemble non borné pour rien ; c'est
+/// [`seed_watched_publication`] qui purge ses blocs.
+fn skip_for_quota(state: &SeedLoopState, manifest_cid: Cid, watched: bool) {
+    if !watched {
+        mark_quota_blocked(state, manifest_cid);
+    }
 }
 
 /// Mémorise qu'une publication a été sautée faute de place évictable, pour
@@ -4200,12 +4274,17 @@ async fn seed_watched_publication(state: &SeedLoopState, issuer: PeerId, manifes
     if let Err(e) = seed_publication(state, issuer, manifest_cid, true).await {
         tracing::debug!("indexation de la publication regardée {manifest_cid}: {e}");
     }
-    let indexed = state
-        .seed_index
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains_manifest(&manifest_cid.to_string());
-    if indexed {
+    // Épinglé = jamais évincé (invariant du lot c), même sans ligne d'index :
+    // `pin_content` épingle un manifeste qu'il soit retenu ou non.
+    let settled = {
+        let idx = state
+            .seed_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let manifest = manifest_cid.to_string();
+        idx.contains_manifest(&manifest) || idx.is_pinned(&manifest)
+    };
+    if settled {
         return;
     }
     // Manifeste relu localement : le seul moyen de connaître les segments à
@@ -6210,6 +6289,57 @@ mod tests {
         drop(node);
         let node = Node::open(dir.path()).await.unwrap();
         assert!(!node.mdns_enabled());
+    }
+
+    /// Deux feeds listent le MÊME manifeste, un seul émetteur est souscrit :
+    /// `catalog_entry_for_manifest` doit élire le souscrit, quel que soit
+    /// l'ordre d'itération (non déterministe) de la `HashMap` du catalogue.
+    /// Sans cette préférence, un tiers qui liste le manifeste d'un créateur
+    /// suivi ferait retomber sa lecture en `Stream` au hasard.
+    ///
+    /// Les deux rôles sont joués dans les DEUX sens (deux nœuds aux
+    /// abonnements croisés sur les mêmes feeds) : quel que soit l'ordre que
+    /// chaque `HashMap` produit, au moins un des deux nœuds a son émetteur
+    /// souscrit ailleurs qu'en tête.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_entry_for_manifest_prefers_a_subscribed_issuer() {
+        let dir = tempfile::tempdir().unwrap();
+        let kp_x = Keypair::generate_ed25519();
+        let kp_y = Keypair::generate_ed25519();
+        let x = identity::peer_id(&kp_x);
+        let y = identity::peer_id(&kp_y);
+
+        // Un manifeste quelconque, revendiqué par les deux feeds.
+        let manifest_cid = crate::content::cid_for(b"manifeste revendique par deux emetteurs");
+
+        for (name, subscribed_issuer, subscribed_kp) in [("cx", x, &kp_x), ("cy", y, &kp_y)] {
+            let bs = Blockstore::open(dir.path().join(name)).unwrap();
+            let node = Node::with_moderation(Keypair::generate_ed25519(), bs, Moderation::empty())
+                .await
+                .unwrap();
+            node.subscribe(subscribed_issuer).unwrap();
+            for kp in [&kp_x, &kp_y] {
+                let feed = Feed::build_signed(kp, 1, &[manifest_cid]).unwrap();
+                node.apply_feed_for_tests(feed).unwrap();
+            }
+            assert_eq!(
+                node.catalog_entries().len(),
+                2,
+                "les deux feeds doivent être au catalogue"
+            );
+            // Répété : l'ordre d'une `HashMap` est fixe dans un processus,
+            // mais le verrou porte sur le résultat, pas sur l'ordre.
+            for _ in 0..8 {
+                let entry = node
+                    .catalog_entry_for_manifest(&manifest_cid)
+                    .expect("une entrée revendique ce manifeste");
+                assert_eq!(
+                    entry.issuer,
+                    identity::peer_id(subscribed_kp),
+                    "l'émetteur SOUSCRIT doit être élu, jamais celui qui liste le CID sans être suivi"
+                );
+            }
+        }
     }
 
     /// Le réglage « seed de ce que je regarde » (spec persistance §3) est
