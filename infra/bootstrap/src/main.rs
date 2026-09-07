@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
     // ce nœud (compilés ∪ persistés), best-effort — un bootstrap peut lui-même
     // s'appuyer sur d'autres bootstraps pour peupler sa table de routage.
     match node.bootstrap().await {
-        Ok(n) => tracing::info!("bootstrap: {n} pair(s) joint(s)"),
+        Ok(n) => tracing::info!("bootstrap : {n} dial(s) lancé(s)"),
         Err(e) => tracing::warn!("bootstrap échoué: {e}"),
     }
 

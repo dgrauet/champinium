@@ -282,11 +282,8 @@ async fn main() -> Result<()> {
                 .listen(listen.parse().context("multiaddr d'écoute invalide")?)
                 .await?;
             connect_bootstraps(&node, &bootstrap).await?;
-            let joined = node.bootstrap().await?;
-            println!(
-                "bootstrap: {joined} pair(s) joint(s), {} connecté(s)",
-                node.connected_peers().await?
-            );
+            let dialed = node.bootstrap().await?;
+            println!("bootstrap : {dialed} dial(s) lancé(s)");
             // Annonce un feed du contenu déjà détenu, rediffusé périodiquement,
             // en réutilisant les métadonnées déjà déclarées pour chaque CID
             // connu (jamais d'écrasement d'une déclaration existante).
@@ -745,7 +742,7 @@ async fn main() -> Result<()> {
             let node = build_node(&cli.data_dir).await?;
             if let Some(addr) = add {
                 let addr = addr.parse().context("multiaddr invalide")?;
-                node.add_bootstrap(addr)?;
+                node.add_bootstrap(addr).await?;
             }
             let bootstraps = node.bootstraps();
             if bootstraps.is_empty() {

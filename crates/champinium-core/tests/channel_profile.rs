@@ -17,7 +17,7 @@ async fn profile_survives_restart_and_signs_published_feeds() {
     let dir = tempfile::tempdir().unwrap();
 
     {
-        let node = Node::open(dir.path()).await.unwrap();
+        let node = Node::open_isolated(dir.path()).await.unwrap();
         node.set_channel_profile(profile("Aurores")).await.unwrap();
         let cid = champinium_core::content::cid_for(b"contenu");
         node.publish_feed(&[cid]).await.unwrap();
@@ -27,14 +27,14 @@ async fn profile_survives_restart_and_signs_published_feeds() {
     }
 
     // Redémarrage : le profil est rechargé depuis .channel_profile.
-    let node = Node::open(dir.path()).await.unwrap();
+    let node = Node::open_isolated(dir.path()).await.unwrap();
     assert_eq!(node.channel_profile().name, "Aurores");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn changing_profile_republishes_current_feed() {
     let dir = tempfile::tempdir().unwrap();
-    let node = Node::open(dir.path()).await.unwrap();
+    let node = Node::open_isolated(dir.path()).await.unwrap();
     let cid = champinium_core::content::cid_for(b"contenu");
     node.publish_feed(&[cid]).await.unwrap();
     let seq_before = node.catalog_entries()[0].seq;

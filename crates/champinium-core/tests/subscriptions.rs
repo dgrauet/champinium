@@ -35,11 +35,11 @@ async fn subscriptions_persist_across_restart() {
     let dir = tempfile::tempdir().unwrap();
     let issuer = Keypair::generate_ed25519().public().to_peer_id();
     {
-        let node = Node::open(dir.path()).await.unwrap();
+        let node = Node::open_isolated(dir.path()).await.unwrap();
         node.subscribe(issuer).unwrap();
         assert_eq!(node.subscriptions(), vec![issuer]);
     }
-    let node = Node::open(dir.path()).await.unwrap();
+    let node = Node::open_isolated(dir.path()).await.unwrap();
     assert_eq!(node.subscriptions(), vec![issuer]);
 
     node.unsubscribe(issuer).unwrap();
@@ -51,7 +51,7 @@ async fn catalog_subscribed_filters_to_followed_issuers() {
     // Deux feeds dans le catalogue (via gossip local publish + apply direct) ;
     // seul l'émetteur souscrit apparaît dans catalog_subscribed().
     let dir = tempfile::tempdir().unwrap();
-    let node = Node::open(dir.path()).await.unwrap();
+    let node = Node::open_isolated(dir.path()).await.unwrap();
 
     // Mon propre feed (non souscrit) + un feed tiers appliqué à la main.
     let cid = champinium_core::content::cid_for(b"x");

@@ -33,6 +33,7 @@ use libp2p::kad::{
 };
 use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport};
 use libp2p::swarm::behaviour::toggle::Toggle;
+use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{dcutr, gossipsub, identify, identity::Keypair, mdns, noise, ping, relay, tcp, yamux};
 use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm};
@@ -111,18 +112,36 @@ fn bootstraps_path(blockstore: &Blockstore) -> PathBuf {
 
 /// Charge les bootstraps persistés (vide si absent/illisible — un fichier
 /// corrompu ne doit pas empêcher le démarrage). Les entrées individuellement
-/// invalides sont ignorées plutôt que de faire échouer tout le chargement.
+/// invalides (multiaddr mal formée, ou sans composant `/p2p/<peerid>`) sont
+/// journalisées et ignorées plutôt que de faire échouer tout le chargement —
+/// même exigence que [`parse_bootstrap_lines`]. Tronqué à [`MAX_BOOTSTRAPS`]
+/// (journalisé) : un `.bootstraps` hors-borne (édité à la main, ou par une
+/// version antérieure sans la vérification) ne doit pas faire dialer un
+/// nombre non borné d'adresses à chaque démarrage.
 fn load_bootstraps(blockstore: &Blockstore) -> BTreeSet<Multiaddr> {
-    std::fs::read_to_string(bootstraps_path(blockstore))
+    let addrs: Vec<Multiaddr> = std::fs::read_to_string(bootstraps_path(blockstore))
         .ok()
         .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
         .map(|addrs| {
             addrs
                 .into_iter()
-                .filter_map(|a| a.parse::<Multiaddr>().ok())
+                .filter_map(|a| match a.parse::<Multiaddr>() {
+                    Ok(addr) if split_peer_id(addr.clone()).is_ok() => Some(addr),
+                    _ => {
+                        tracing::warn!("bootstrap persisté ignoré (invalide ou sans /p2p/): {a}");
+                        None
+                    }
+                })
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if addrs.len() > MAX_BOOTSTRAPS {
+        tracing::warn!(
+            "{} bootstraps persistés, tronqué à {MAX_BOOTSTRAPS}",
+            addrs.len()
+        );
+    }
+    addrs.into_iter().take(MAX_BOOTSTRAPS).collect()
 }
 
 /// Persiste les bootstraps ajoutés par l'utilisateur (JSON `Vec<String>` trié
@@ -172,7 +191,9 @@ struct Behaviour {
     relay_client: relay::client::Behaviour,
     dcutr: dcutr::Behaviour,
     /// Découverte locale (réseau physique) — débrayable (tâche 2), défaut
-    /// actif. `Toggle::from(None)` n'ouvre aucun socket multicast.
+    /// actif pour [`Node::open`] (fronts, CLI) seulement ; inactif sauf
+    /// dotfile explicite pour [`Node::new`]/`with_moderation*` (démons,
+    /// tests). `Toggle::from(None)` n'ouvre aucun socket multicast.
     mdns: Toggle<mdns::tokio::Behaviour>,
 }
 
@@ -558,7 +579,38 @@ impl Node {
     pub async fn open(data_dir: &Path) -> CoreResult<Self> {
         let keypair = identity::load_or_generate(data_dir.join("node.key"))?;
         let blockstore = Blockstore::open(data_dir.join("blocks"))?;
-        Self::new(keypair, blockstore).await
+        Self::build(
+            keypair,
+            blockstore,
+            Moderation::new(),
+            FOLLOW_INTERVAL,
+            SEED_INTERVAL,
+            Some(crate::moderation::project_issuer()?),
+            true,
+        )
+        .await
+    }
+
+    /// Comme [`Node::open`], mais mDNS ne démarre que si `.mdns_enabled` dit
+    /// explicitement `true` — pour les tests et les outils qui ne doivent ni
+    /// révéler leur présence sur le LAN ni composer vers des nœuds étrangers
+    /// (voir la revue finale du lot « découverte initiale » : mDNS actif par
+    /// défaut dans toute la suite de tests couplait des nœuds sans rapport et
+    /// cassait des assertions de comptage exact de fournisseurs).
+    #[doc(hidden)]
+    pub async fn open_isolated(data_dir: &Path) -> CoreResult<Self> {
+        let keypair = identity::load_or_generate(data_dir.join("node.key"))?;
+        let blockstore = Blockstore::open(data_dir.join("blocks"))?;
+        Self::build(
+            keypair,
+            blockstore,
+            Moderation::new(),
+            FOLLOW_INTERVAL,
+            SEED_INTERVAL,
+            Some(crate::moderation::project_issuer()?),
+            false,
+        )
+        .await
     }
 
     /// Se connecte à un pair désigné par une multiaddr terminée par
@@ -628,13 +680,41 @@ impl Node {
         seed_interval: Duration,
         project_issuer: Option<PeerId>,
     ) -> CoreResult<Self> {
+        Self::build(
+            keypair,
+            blockstore,
+            moderation,
+            follow_interval,
+            seed_interval,
+            project_issuer,
+            false,
+        )
+        .await
+    }
+
+    /// Corps commun de tous les constructeurs. `mdns_default` est la valeur
+    /// utilisée quand `.mdns_enabled` est absent/illisible : `true` pour
+    /// [`Node::open`] (fronts, CLI — le confort de la découverte locale prime),
+    /// `false` pour tout le reste ([`Node::new`], `with_moderation*`, et donc
+    /// les démons `champinium-seed`/`champinium-bootstrap` ainsi que toute la
+    /// suite de tests) — un nœud ne démarre un socket multicast que si un
+    /// dotfile explicite le demande.
+    async fn build(
+        keypair: Keypair,
+        blockstore: Blockstore,
+        moderation: Moderation,
+        follow_interval: Duration,
+        seed_interval: Duration,
+        project_issuer: Option<PeerId>,
+        mdns_default: bool,
+    ) -> CoreResult<Self> {
         let peer_id = identity::peer_id(&keypair);
         // Débrayage mDNS (tâche 2) : lu AVANT `build_swarm` — contrairement au
         // débrayage de repli froid (simple lecture d'un `bool`), celui-ci
         // conditionne la construction du comportement réseau lui-même, donc
         // aucun setter post-construction ne peut l'appliquer avant le prochain
         // démarrage (même remarque que `FOLLOW_INTERVAL`).
-        let mdns_enabled_initial = load_mdns_enabled(&blockstore);
+        let mdns_enabled_initial = load_mdns_enabled(&blockstore).unwrap_or(mdns_default);
         let mut swarm = build_swarm(keypair.clone(), mdns_enabled_initial)?;
         // Mode serveur : stocke et sert les provider records (pas seulement client).
         swarm
@@ -964,27 +1044,27 @@ impl Node {
     /// Ajoute un bootstrap connu de l'utilisateur (persisté `.bootstraps`) :
     /// `addr` doit porter un composant `/p2p/<peerid>`, sinon
     /// `CoreError::Network`. Borné à [`MAX_BOOTSTRAPS`] (compilés + persistés
-    /// confondus) — anti-DoS, même patron que les autres ensembles persistés
-    /// (abonnements, éditeurs de denylist).
-    pub fn add_bootstrap(&self, addr: Multiaddr) -> CoreResult<()> {
+    /// confondus, sur l'union **dédupliquée** que renvoie [`Node::bootstraps`]
+    /// — une adresse déjà compilée ou déjà persistée est acceptée de façon
+    /// idempotente sans consommer de marge) — anti-DoS, même patron que les
+    /// autres ensembles persistés (abonnements, éditeurs de denylist).
+    pub async fn add_bootstrap(&self, addr: Multiaddr) -> CoreResult<()> {
         let (peer, base) = split_peer_id(addr.clone())?;
-        let mut set = self
-            .bootstraps
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !set.contains(&addr) && set.len() + compiled_bootstraps().len() >= MAX_BOOTSTRAPS {
+        let already_known = self.bootstraps().contains(&addr);
+        if !already_known && self.bootstraps().len() >= MAX_BOOTSTRAPS {
             return Err(CoreError::Network(format!(
                 "au plus {MAX_BOOTSTRAPS} bootstraps"
             )));
         }
-        set.insert(addr);
-        save_bootstraps(&self.blockstore, &set)?;
-        drop(set);
-        let cmd_tx = self.cmd_tx.clone();
-        tokio::spawn(async move {
-            let _ = cmd_tx.send(Command::AddAddress { peer, addr: base }).await;
-        });
-        Ok(())
+        {
+            let mut set = self
+                .bootstraps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            set.insert(addr);
+            save_bootstraps(&self.blockstore, &set)?;
+        }
+        self.add_address(peer, base).await
     }
 
     /// Compose vers tous les bootstraps connus (best-effort) puis peuple la
@@ -995,6 +1075,12 @@ impl Node {
     pub async fn bootstrap(&self) -> CoreResult<usize> {
         let mut joined = 0usize;
         for addr in self.bootstraps() {
+            if let Ok((peer, _)) = split_peer_id(addr.clone()) {
+                if peer == self.peer_id {
+                    tracing::debug!("bootstrap {addr} ignoré : c'est ce nœud lui-même");
+                    continue;
+                }
+            }
             match self.connect(addr.clone()).await {
                 Ok(()) => joined += 1,
                 Err(e) => tracing::warn!("bootstrap {addr} injoignable: {e}"),
@@ -2495,7 +2581,11 @@ impl Node {
         self.cold_retrieval_enabled.load(Ordering::Relaxed)
     }
 
-    /// État courant du débrayage mDNS (vrai par défaut).
+    /// État courant du débrayage mDNS. Défaut si `.mdns_enabled` est absent :
+    /// actif pour un nœud ouvert via [`Node::open`] (fronts, CLI) ; inactif
+    /// pour tout nœud construit via [`Node::new`]/`with_moderation*`, donc
+    /// pour les démons `champinium-seed`/`champinium-bootstrap` — voir
+    /// [`Node::build`].
     pub fn mdns_enabled(&self) -> bool {
         self.mdns_enabled.load(Ordering::Relaxed)
     }
@@ -2680,13 +2770,13 @@ fn mdns_enabled_path(blockstore: &Blockstore) -> PathBuf {
     blockstore.root().join(".mdns_enabled")
 }
 
-/// Charge le débrayage mDNS persisté (activé par défaut si absent/illisible
-/// — même logique que `load_cold_enabled`).
-fn load_mdns_enabled(blockstore: &Blockstore) -> bool {
+/// Charge le débrayage mDNS persisté — `None` si absent/illisible (le
+/// défaut, dans ce cas, dépend de l'appelant : `true` pour [`Node::open`],
+/// `false` pour tous les autres constructeurs, voir [`Node::build`]).
+fn load_mdns_enabled(blockstore: &Blockstore) -> Option<bool> {
     std::fs::read_to_string(mdns_enabled_path(blockstore))
         .ok()
         .and_then(|s| s.trim().parse::<bool>().ok())
-        .unwrap_or(true)
 }
 
 /// Persiste le débrayage mDNS.
@@ -4304,7 +4394,11 @@ impl EventLoop {
                         .behaviour_mut()
                         .kademlia
                         .add_address(&peer, addr.clone());
-                    let _ = self.swarm.dial(addr);
+                    let opts = DialOpts::peer_id(peer)
+                        .addresses(vec![addr])
+                        .condition(PeerCondition::DisconnectedAndNotDialing)
+                        .build();
+                    let _ = self.swarm.dial(opts);
                 }
             }
             // `Expired` : rien à faire — libp2p-mdns retire déjà l'entrée de
@@ -4624,21 +4718,57 @@ mod tests {
         assert_eq!(parse_bootstrap_lines("# c\n\n/ip4/1.2.3.4/tcp/4101/p2p/12D3KooWJtMRdnYaZgSyi3KTLaa5DN6mCAcpfwaTXgD1PHo997ej\nnimporte quoi\n").len(), 1);
     }
 
+    /// `.bootstraps` sur disque n'est pas plus digne de confiance que le
+    /// fichier compilé : une entrée sans `/p2p/`, ou tout simplement
+    /// inanalysable, est ignorée (journalisée), et un fichier hors-borne est
+    /// tronqué à `MAX_BOOTSTRAPS` plutôt que dialer un nombre non borné
+    /// d'adresses à chaque démarrage.
+    #[test]
+    fn load_bootstraps_filters_invalid_and_truncates() {
+        let dir = tempfile::tempdir().unwrap();
+        let blockstore = Blockstore::open(dir.path().join("blocks")).unwrap();
+
+        let valid =
+            "/ip4/1.2.3.4/tcp/4101/p2p/12D3KooWJtMRdnYaZgSyi3KTLaa5DN6mCAcpfwaTXgD1PHo997ej";
+        let without_peer_id = "/ip4/5.6.7.8/tcp/4101";
+        let unparsable = "nimporte quoi";
+        let json = serde_json::to_string(&vec![valid, without_peer_id, unparsable]).unwrap();
+        std::fs::write(bootstraps_path(&blockstore), json).unwrap();
+        let loaded = load_bootstraps(&blockstore);
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.contains(&valid.parse::<Multiaddr>().unwrap()));
+
+        // 70 entrées valides mais distinctes (port différent par entrée pour
+        // que le `BTreeSet` ne les déduplique pas) → tronqué à MAX_BOOTSTRAPS.
+        let many: Vec<String> = (0..70)
+            .map(|i| {
+                format!(
+                    "/ip4/1.2.3.4/tcp/{}/p2p/12D3KooWJtMRdnYaZgSyi3KTLaa5DN6mCAcpfwaTXgD1PHo997ej",
+                    5000 + i
+                )
+            })
+            .collect();
+        let json = serde_json::to_string(&many).unwrap();
+        std::fs::write(bootstraps_path(&blockstore), json).unwrap();
+        assert_eq!(load_bootstraps(&blockstore).len(), MAX_BOOTSTRAPS);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn add_bootstrap_requires_peer_id_and_persists() {
         let dir = tempfile::tempdir().unwrap();
-        let node = Node::open(dir.path()).await.unwrap();
+        let node = Node::open_isolated(dir.path()).await.unwrap();
         assert!(node
             .add_bootstrap("/ip4/127.0.0.1/tcp/4101".parse().unwrap())
+            .await
             .is_err());
         let addr: Multiaddr =
             "/ip4/127.0.0.1/tcp/4101/p2p/12D3KooWJtMRdnYaZgSyi3KTLaa5DN6mCAcpfwaTXgD1PHo997ej"
                 .parse()
                 .unwrap();
-        node.add_bootstrap(addr.clone()).unwrap();
+        node.add_bootstrap(addr.clone()).await.unwrap();
         assert!(node.bootstraps().contains(&addr));
         drop(node);
-        let node = Node::open(dir.path()).await.unwrap();
+        let node = Node::open_isolated(dir.path()).await.unwrap();
         assert!(
             node.bootstraps().contains(&addr),
             "persisté dans .bootstraps"
@@ -4648,18 +4778,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bootstrap_joins_peer_and_populates_routing_table() {
         let dir = tempfile::tempdir().unwrap();
-        let b = Node::open(&dir.path().join("b")).await.unwrap();
+        let b = Node::open_isolated(&dir.path().join("b")).await.unwrap();
         let addr_b = b
             .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
             .await
             .unwrap();
         let cid = b.add(b"bloc de b").await.unwrap();
-        let a = Node::open(&dir.path().join("a")).await.unwrap();
+        let a = Node::open_isolated(&dir.path().join("a")).await.unwrap();
         a.listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
             .await
             .unwrap();
         let full: Multiaddr = format!("{addr_b}/p2p/{}", b.peer_id()).parse().unwrap();
-        a.add_bootstrap(full).unwrap();
+        a.add_bootstrap(full).await.unwrap();
         assert_eq!(a.bootstrap().await.unwrap(), 1);
         // Sans aucun `connect` manuel : la table de routage connaît B.
         tokio::time::timeout(Duration::from_secs(30), async {
@@ -4787,7 +4917,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn denylist_issuers_persist_and_project_is_locked() {
         let dir = tempfile::tempdir().unwrap();
-        let node = Node::open(dir.path()).await.unwrap();
+        let node = Node::open_isolated(dir.path()).await.unwrap();
         let project = node
             .project_issuer()
             .expect("Node::open injecte l'éditeur projet");
@@ -4801,7 +4931,7 @@ mod tests {
         );
         drop(node);
 
-        let node = Node::open(dir.path()).await.unwrap();
+        let node = Node::open_isolated(dir.path()).await.unwrap();
         let issuers = node.denylist_issuers();
         assert_eq!(issuers.first(), Some(&project), "projet en tête");
         assert!(issuers.contains(&other), "souscription persistée");
@@ -5474,13 +5604,13 @@ mod tests {
     async fn cold_retrieval_toggle_persists_without_feature() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let node = Node::open(dir.path()).await.unwrap();
+            let node = Node::open_isolated(dir.path()).await.unwrap();
             assert!(node.cold_retrieval_enabled(), "défaut = actif");
             node.set_cold_retrieval(false).unwrap();
             assert!(!node.cold_retrieval_enabled());
         }
         // Réouverture : le dotfile .cold_enabled doit relire false.
-        let node = Node::open(dir.path()).await.unwrap();
+        let node = Node::open_isolated(dir.path()).await.unwrap();
         assert!(!node.cold_retrieval_enabled(), "persisté à la réouverture");
     }
 

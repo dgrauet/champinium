@@ -737,8 +737,8 @@ impl ChampiniumNode {
 
     /// Compose vers tous les bootstraps connus (best-effort, un dial refusé
     /// n'est pas propagé) puis peuple la table de routage Kademlia. Renvoie
-    /// le nombre de bootstraps joints ; `0` si la liste est vide ou si aucun
-    /// n'a répondu (contrat v14, ADR 0013).
+    /// le nombre de bootstraps dont le dial a été **accepté** (la connexion
+    /// n'est pas garantie) ; `0` si la liste est vide (contrat v14, ADR 0013).
     pub async fn bootstrap(&self) -> Result<u32, FfiError> {
         Ok(self.inner.bootstrap().await? as u32)
     }
@@ -759,7 +759,7 @@ impl ChampiniumNode {
         let addr = multiaddr.parse().map_err(|e| FfiError::InvalidInput {
             msg: format!("multiaddr invalide: {e}"),
         })?;
-        self.inner.add_bootstrap(addr).map_err(|e| match e {
+        self.inner.add_bootstrap(addr).await.map_err(|e| match e {
             crate::CoreError::Network(msg) => FfiError::InvalidInput { msg },
             other => other.into(),
         })

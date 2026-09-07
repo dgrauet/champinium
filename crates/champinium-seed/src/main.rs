@@ -80,7 +80,7 @@ async fn main() -> Result<()> {
     // nœud (compilés ∪ persistés `.bootstraps`), best-effort — n'empêche pas
     // le démarrage du démon si aucun n'est joignable.
     match node.bootstrap().await {
-        Ok(n) => tracing::info!("bootstrap: {n} pair(s) joint(s)"),
+        Ok(n) => tracing::info!("bootstrap : {n} dial(s) lancé(s)"),
         Err(e) => tracing::warn!("bootstrap échoué: {e}"),
     }
 
