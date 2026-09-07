@@ -4700,7 +4700,7 @@ mod tests {
     #[test]
     fn kademlia_uses_champinium_protocol() {
         let key = Keypair::generate_ed25519();
-        let swarm = build_swarm(key, true).expect("build_swarm");
+        let swarm = build_swarm(key, false).expect("build_swarm");
         let names: Vec<String> = swarm
             .behaviour()
             .kademlia
