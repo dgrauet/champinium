@@ -411,6 +411,18 @@ pub struct Node {
     /// de `catalog_events` : un changement de quota n'est pas un changement de
     /// catalogue.
     seed_wake: tokio::sync::broadcast::Sender<()>,
+    /// Demande d'indexation IMMÉDIATE d'une publication précise
+    /// `(émetteur, manifeste)`, adressée à `seed_loop` — distincte de
+    /// `seed_wake` (« repasse en revue les abonnements ») : ici l'émetteur
+    /// n'est justement PAS souscrit, le round-robin ne le visiterait jamais.
+    /// Émise par une session de lecture `Seed` hors abonnement à sa
+    /// complétion (spec persistance §3, « seed de ce que je regarde »).
+    seed_now: mpsc::Sender<(PeerId, Cid)>,
+    /// Réglage « conserver et resservir ce que je regarde » (spec persistance
+    /// §3), persisté (dotfile `.seed_watched`), **défaut inactif**.
+    /// Contrairement à `mdns_enabled`, l'effet est **immédiat** : il n'est lu
+    /// qu'à l'ouverture d'une session (`open_stream`).
+    seed_watched: Arc<AtomicBool>,
     /// Channels bloqués LOCALEMENT (tâche 3) : préférence strictement privée
     /// de ce nœud, jamais publiée ni signalée sur le réseau (même patron que
     /// `subscriptions`, dotfile `.blocked_channels`). Fusionné avec les clés
@@ -854,6 +866,13 @@ impl Node {
         let seed_quota = Arc::new(Mutex::new(seeding::load_seed_quota(&blockstore)));
         let (seed_events, _) = tokio::sync::broadcast::channel(64);
         let (seed_wake, _) = tokio::sync::broadcast::channel(16);
+        // Demandes d'indexation immédiate (sessions `Seed` hors abonnement).
+        // Canal borné et jamais attendu (`try_send` côté session) : saturer
+        // ne bloque jamais une lecture, au pire une publication regardée
+        // n'entre pas à l'index — dégradation acceptable pour un opt-in.
+        let (seed_now, seed_now_rx) = mpsc::channel(64);
+        // Défaut `false` : retenir hors abonnement consomme le quota.
+        let seed_watched = Arc::new(AtomicBool::new(load_seed_watched(&blockstore)));
 
         let alive = Arc::new(());
 
@@ -895,6 +914,7 @@ impl Node {
                 moderation: moderation.clone(),
                 catalog: catalog.clone(),
                 subscriptions: subscriptions.clone(),
+                blocked_channels: blocked_channels.clone(),
                 seed_index: seed_index.clone(),
                 seed_quota: seed_quota.clone(),
                 seed_events: seed_events.clone(),
@@ -905,6 +925,7 @@ impl Node {
             },
             catalog_events.subscribe(),
             seed_wake.subscribe(),
+            seed_now_rx,
             seed_interval,
         ));
 
@@ -939,6 +960,8 @@ impl Node {
             seed_quota,
             seed_events,
             seed_wake,
+            seed_now,
+            seed_watched,
             blocked_channels,
             denylist_issuers,
             project_issuer,
@@ -1771,17 +1794,34 @@ impl Node {
     /// Ouvre une session de lecture progressive : récupère et parse le
     /// manifeste (→ `Moderated`/`NotFound` sortent ici), démarre serveur et
     /// ordonnanceur, rend l'URL de la playlist VOD. Politique `Seed` si le
-    /// manifeste appartient à un channel souscrit (comme `fetch_hls`),
-    /// `Stream` sinon (cache de session éphémère, rien au blockstore).
+    /// manifeste appartient à un channel souscrit (comme `fetch_hls`) **ou**
+    /// si « seed de ce que je regarde » est actif et que l'émetteur est
+    /// identifiable au catalogue ; `Stream` sinon (cache de session éphémère,
+    /// rien au blockstore).
+    ///
+    /// **Sans émetteur, pas de seed** (spec persistance §3) : un manifeste
+    /// ouvert par CID nu qui n'apparaît dans aucune entrée du catalogue reste
+    /// en `Stream` même le réglage actif — l'index de seed est indexé par
+    /// émetteur, une publication sans émetteur n'aurait ni ligne dans l'index,
+    /// ni purge au désabonnement, ni étage d'éviction.
     pub async fn open_stream(&self, manifest_cid: Cid) -> CoreResult<StreamSessionInfo> {
-        let subscribed = self
-            .catalog_subscribed()
-            .into_iter()
-            .any(|e| e.cids.contains(&manifest_cid));
-        let policy = if subscribed {
+        let entry = self.catalog_entry_for_manifest(&manifest_cid);
+        let subscribed = entry
+            .as_ref()
+            .is_some_and(|e| self.subscriptions_snapshot().contains(&e.issuer));
+        // Regardé (hors abonnement) : retenu sous le MÊME quota, mais indexé
+        // par la session elle-même à sa complétion — le round-robin du seed
+        // proactif ne visite que les abonnements.
+        let watched = self.seed_watched() && !subscribed && entry.is_some();
+        let policy = if subscribed || watched {
             StorePolicy::Seed
         } else {
             StorePolicy::Stream
+        };
+        let issuer_to_index = if watched {
+            entry.as_ref().map(|e| e.issuer)
+        } else {
+            None
         };
         let bytes = self.get_with(manifest_cid, policy).await?;
         let manifest = HlsManifest::from_json(&bytes)?;
@@ -1797,6 +1837,8 @@ impl Node {
             self.fetcher(),
             self.stream_events.clone(),
             self.seed_wake.clone(),
+            issuer_to_index,
+            self.seed_now.clone(),
         )
         .await?;
         self.streams
@@ -1809,6 +1851,15 @@ impl Node {
 
     /// Ferme une session (idempotent) : serveur arrêté, boucle annulée,
     /// répertoire de session supprimé.
+    ///
+    /// **Purge des orphelins** (spec persistance §4) : une session `Seed`
+    /// **hors abonnement** (« ce que je regarde ») fermée AVANT sa complétion
+    /// n'entre jamais à l'index de seed — ses blocs déjà récupérés
+    /// grossiraient le magasin hors de toute comptabilité de quota. Ils sont
+    /// donc retirés ici, manifeste compris, sauf ceux qu'une publication
+    /// encore indexée référence (garde de `remove_unshared_blocks`). Une
+    /// session d'un channel **souscrit** garde son comportement : le seed
+    /// proactif complètera la publication plus tard.
     pub async fn close_stream(&self, id: u64) {
         let session = self
             .streams
@@ -1817,7 +1868,21 @@ impl Node {
             .remove(&id);
         if let Some(session) = session {
             let dir = session.dir().to_path_buf();
+            let orphans = session.unindexed_watched_publication();
             drop(session);
+            if let Some(publication) = orphans {
+                // Course bénigne avec `seed_loop` : si la publication vient
+                // d'être indexée entre-temps, `contains_manifest` le voit et
+                // rien n'est supprimé.
+                let indexed = self
+                    .seed_index
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_manifest(&publication.manifest_cid);
+                if !indexed {
+                    remove_unshared_blocks(&self.blockstore, &self.seed_index, &[publication]);
+                }
+            }
             if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
                 tracing::debug!("purge du répertoire de session {id}: {e}");
             }
@@ -1958,6 +2023,15 @@ impl Node {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entries()
+    }
+
+    /// Entrée de catalogue qui revendique ce manifeste, s'il en existe une —
+    /// c'est ce qui donne un ÉMETTEUR à une publication lue, donc une ligne
+    /// possible dans l'index de seed (spec persistance §3).
+    fn catalog_entry_for_manifest(&self, manifest_cid: &Cid) -> Option<CatalogEntry> {
+        self.catalog_entries()
+            .into_iter()
+            .find(|e| e.cids.contains(manifest_cid))
     }
 
     /// Instantané (non trié) des abonnements — usage interne (exemption de
@@ -2611,6 +2685,26 @@ impl Node {
         save_mdns_enabled(&self.blockstore, enabled)
     }
 
+    /// État courant du réglage « conserver et resservir ce que je regarde »
+    /// (spec persistance §3). **Défaut inactif** : hors abonnement, une
+    /// lecture ne laisse rien au magasin tant que l'utilisateur ne l'a pas
+    /// demandé.
+    pub fn seed_watched(&self) -> bool {
+        self.seed_watched.load(Ordering::Relaxed)
+    }
+
+    /// Active/désactive le seed de ce qui est regardé et persiste le choix
+    /// (dotfile `.seed_watched`). Contrairement à [`Node::set_mdns`], l'effet
+    /// est **immédiat** : le réglage n'est lu qu'à l'ouverture d'une session
+    /// ([`Node::open_stream`]), donc la prochaine lecture l'applique déjà.
+    /// Désactiver n'efface rien de ce qui a déjà été retenu — le quota et
+    /// l'éviction s'en chargent (une publication regardée, non épinglée, part
+    /// avant celles des abonnements).
+    pub fn set_seed_watched(&self, enabled: bool) -> CoreResult<()> {
+        self.seed_watched.store(enabled, Ordering::Relaxed);
+        save_seed_watched(&self.blockstore, enabled)
+    }
+
     /// Configure le backend [`ColdStore`] de **repli de récupération** — point
     /// d'entrée public pour câbler un `ArweaveColdStore` (ou tout autre backend
     /// de récupération). Le choix du backend concret et de ses gateways reste à
@@ -2791,6 +2885,28 @@ fn load_mdns_enabled(blockstore: &Blockstore) -> Option<bool> {
 /// Persiste le débrayage mDNS.
 fn save_mdns_enabled(blockstore: &Blockstore, enabled: bool) -> CoreResult<()> {
     std::fs::write(mdns_enabled_path(blockstore), enabled.to_string())?;
+    Ok(())
+}
+
+/// Chemin du réglage « seed de ce que je regarde » persisté (spec
+/// persistance §3), à côté des blocs — même patron que `.mdns_enabled`.
+fn seed_watched_path(blockstore: &Blockstore) -> PathBuf {
+    blockstore.root().join(".seed_watched")
+}
+
+/// Charge le réglage « seed de ce que je regarde » — **défaut `false`** :
+/// retenir hors abonnement consomme le quota de l'utilisateur, ça ne
+/// s'active que sur un choix explicite (absent/illisible → désactivé).
+fn load_seed_watched(blockstore: &Blockstore) -> bool {
+    std::fs::read_to_string(seed_watched_path(blockstore))
+        .ok()
+        .and_then(|s| s.trim().parse::<bool>().ok())
+        .unwrap_or(false)
+}
+
+/// Persiste le réglage « seed de ce que je regarde ».
+fn save_seed_watched(blockstore: &Blockstore, enabled: bool) -> CoreResult<()> {
+    std::fs::write(seed_watched_path(blockstore), enabled.to_string())?;
     Ok(())
 }
 
@@ -3595,6 +3711,10 @@ struct SeedLoopState {
     moderation: Arc<RwLock<Moderation>>,
     catalog: Arc<Mutex<Catalog>>,
     subscriptions: Arc<Mutex<BTreeSet<PeerId>>>,
+    /// Channels bloqués localement : seule invalidation possible d'une
+    /// publication **regardée** hors abonnement au point de commit (un
+    /// abonnement, lui, se lit dans `subscriptions`).
+    blocked_channels: Arc<Mutex<BTreeSet<PeerId>>>,
     seed_index: Arc<Mutex<SeedIndex>>,
     seed_quota: Arc<Mutex<u64>>,
     seed_events: tokio::sync::broadcast::Sender<()>,
@@ -3635,6 +3755,16 @@ struct SeedLoopState {
 /// `quota_blocked` par l'appelant, ce qui fixe le résultat de la passe
 /// (premier arrivé, premier servi) jusqu'au prochain évènement catalogue/quota.
 async fn make_room_for(state: &SeedLoopState, extra: u64, candidate_replication: usize) -> bool {
+    // Étage d'éviction (spec persistance §5) : les publications d'émetteurs
+    // non souscrits partent avant celles des abonnements. Relu à chaque appel
+    // — un désabonnement en cours de passe doit compter tout de suite.
+    let subscribed: HashSet<String> = state
+        .subscriptions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .map(PeerId::to_string)
+        .collect();
     let quota = *state
         .seed_quota
         .lock()
@@ -3658,7 +3788,7 @@ async fn make_room_for(state: &SeedLoopState, extra: u64, candidate_replication:
                 .seed_index
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            eviction_order(&idx, &HashMap::new())
+            eviction_order(&idx, &HashMap::new(), &subscribed)
                 .into_iter()
                 .map(|p| p.manifest_cid.clone())
                 .collect()
@@ -3684,7 +3814,7 @@ async fn make_room_for(state: &SeedLoopState, extra: u64, candidate_replication:
                 .seed_index
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            eviction_order(&idx, &replication)
+            eviction_order(&idx, &replication, &subscribed)
                 .first()
                 .map(|p| p.manifest_cid.clone())
         };
@@ -3732,19 +3862,33 @@ fn evict_publication(state: &SeedLoopState, manifest_cid: &str) {
 /// magasin — pas d'accumulation silencieuse hors comptabilité.
 /// Décision du point de commit du seed proactif, isolée en fonction PURE pour
 /// être testable sans simuler la course TOCTOU (finding revue finale lot d) :
-/// une publication fraîchement seedée n'est committée à l'index QUE si son
-/// émetteur est toujours abonné ET n'est pas banni par denylist. Le ban prime
-/// sur l'abonnement (`subscribe_denylist` ne désabonne pas — sans ce «&& !banni»
-/// une publication d'une clé bannie en cours de seed survivrait à la purge) ;
-/// le blocage local est déjà couvert par l'abonnement (`block_channel` désabonne).
-fn seed_still_wanted(subscribed: bool, key_banned: bool) -> bool {
-    subscribed && !key_banned
+/// une publication fraîchement seedée n'est committée à l'index QUE si
+/// l'intention qui la justifiait tient toujours (`wanted_by_intent`) ET que
+/// son émetteur n'est pas banni par denylist. Le ban prime sur l'intention
+/// (`subscribe_denylist` ne désabonne pas — sans ce «&& !banni» une
+/// publication d'une clé bannie en cours de seed survivrait à la purge).
+///
+/// `wanted_by_intent` dépend de l'origine, calculé par l'appelant : pour le
+/// seed proactif c'est « toujours abonné » (le blocage local est couvert,
+/// `block_channel` désabonne) ; pour une publication **regardée** hors
+/// abonnement (spec persistance §3) c'est « pas bloqué localement », l'unique
+/// signal d'invalidation dont dispose ce chemin.
+fn seed_still_wanted(wanted_by_intent: bool, key_banned: bool) -> bool {
+    wanted_by_intent && !key_banned
 }
 
+/// Corps du seed d'une publication (voir la doc de [`seed_still_wanted`]).
+///
+/// `watched` distingue les deux origines : `false` = passe du seed proactif
+/// sur un channel **souscrit** ; `true` = publication **regardée** hors
+/// abonnement (spec persistance §3), dont la légitimité ne vient pas d'un
+/// abonnement mais de la lecture elle-même — le point de commit ci-dessous en
+/// tient compte.
 async fn seed_publication(
     state: &SeedLoopState,
     issuer: PeerId,
     manifest_cid: Cid,
+    watched: bool,
 ) -> CoreResult<()> {
     // Réplication du candidat lui-même, mesurée UNE fois et réutilisée pour
     // tout le reste de cette tentative (manifeste + chaque segment) — le
@@ -3845,11 +3989,24 @@ async fn seed_publication(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .is_blocked_key(&issuer);
     let committed = {
-        let subs = state
-            .subscriptions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !seed_still_wanted(subs.contains(&issuer), key_banned) {
+        // Origine `watched` : l'émetteur n'est PAS souscrit par définition —
+        // ce qui invaliderait la publication ici est un blocage local décidé
+        // pendant la récupération (le ban par denylist, lui, reste couvert
+        // par `key_banned` dans les deux cas).
+        let wanted_by_intent = if watched {
+            !state
+                .blocked_channels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&issuer)
+        } else {
+            state
+                .subscriptions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&issuer)
+        };
+        if !seed_still_wanted(wanted_by_intent, key_banned) {
             false
         } else {
             let mut idx = state
@@ -3876,7 +4033,8 @@ async fn seed_publication(
         }
     };
     if !committed {
-        // L'émetteur n'est plus suivi : la tentative est abandonnée et ses
+        // L'émetteur n'est plus voulu (désabonné, bloqué ou banni) : la
+        // tentative est abandonnée et ses
         // blocs non indexés sont retirés (ceux partagés avec une publication
         // indexée survivent via la garde `all_cids` de `remove_unindexed_fetch`).
         remove_unindexed_fetch(state, &fetched_cids);
@@ -3954,7 +4112,7 @@ async fn seed_channel(state: &SeedLoopState, issuer: PeerId) {
         if known_blocked {
             continue;
         }
-        if let Err(e) = seed_publication(state, issuer, manifest_cid).await {
+        if let Err(e) = seed_publication(state, issuer, manifest_cid, false).await {
             tracing::debug!("seed proactif: échec pour {manifest_cid} ({issuer}): {e}");
         }
     }
@@ -3990,11 +4148,15 @@ async fn seed_pass(state: &SeedLoopState, round_robin: usize) -> usize {
 /// `Node::set_seed_quota`). Comme `follow_loop` : la toute première passe a
 /// lieu AVANT toute attente (rattrapage au démarrage), et la boucle ne tient
 /// qu'un [`Weak`] marqueur de vivacité — jamais un `Node` fort.
+/// La branche `seed_now` sert le « seed de ce que je regarde » (spec
+/// persistance §3) : une publication NOMMÉE, d'un émetteur non souscrit, que
+/// le round-robin ne visiterait jamais.
 async fn seed_loop(
     alive: Weak<()>,
     state: SeedLoopState,
     mut catalog_events: tokio::sync::broadcast::Receiver<()>,
     mut seed_wake: tokio::sync::broadcast::Receiver<()>,
+    mut seed_now: mpsc::Receiver<(PeerId, Cid)>,
     seed_interval: Duration,
 ) {
     let mut round_robin: usize = 0;
@@ -4017,8 +4179,55 @@ async fn seed_loop(
             _ = seed_wake.recv() => {
                 state.quota_blocked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
             }
+            Some((issuer, manifest_cid)) = seed_now.recv() => {
+                seed_watched_publication(&state, issuer, manifest_cid).await;
+            }
         }
     }
+}
+
+/// Indexe une publication **regardée** hors abonnement, à la complétion de sa
+/// session de lecture (spec persistance §3). Les blocs sont déjà locaux (la
+/// session les a récupérés en `Seed`) : `seed_publication` n'y ajoute que la
+/// comptabilité de quota — et l'éviction si le quota est déjà plein.
+///
+/// **Purge des orphelins** : si la publication n'est PAS entrée à l'index
+/// (quota infranchissable, émetteur bloqué/banni entre-temps), ses blocs
+/// resteraient au magasin hors de toute comptabilité. `seed_publication` ne
+/// nettoie que ce qu'elle a elle-même récupéré ; ici les blocs viennent de la
+/// SESSION, donc la purge se fait depuis le manifeste relu au magasin.
+async fn seed_watched_publication(state: &SeedLoopState, issuer: PeerId, manifest_cid: Cid) {
+    if let Err(e) = seed_publication(state, issuer, manifest_cid, true).await {
+        tracing::debug!("indexation de la publication regardée {manifest_cid}: {e}");
+    }
+    let indexed = state
+        .seed_index
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains_manifest(&manifest_cid.to_string());
+    if indexed {
+        return;
+    }
+    // Manifeste relu localement : le seul moyen de connaître les segments à
+    // purger. Absent/illisible (déjà retiré par `seed_publication`) → rien à
+    // faire, sauf le manifeste lui-même, couvert par la publication éphémère.
+    let segment_cids = state
+        .blockstore
+        .get(&manifest_cid)
+        .ok()
+        .and_then(|bytes| HlsManifest::from_json(&bytes).ok())
+        .map(|m| m.segments.iter().map(|s| s.cid.clone()).collect())
+        .unwrap_or_default();
+    remove_unshared_blocks(
+        &state.blockstore,
+        &state.seed_index,
+        &[SeededPublication {
+            manifest_cid: manifest_cid.to_string(),
+            segment_cids,
+            total_bytes: 0,
+            order: 0,
+        }],
+    );
 }
 
 /// Tout ce qu'il faut pour réannoncer les racines et republier les feeds
@@ -6001,6 +6210,21 @@ mod tests {
         drop(node);
         let node = Node::open(dir.path()).await.unwrap();
         assert!(!node.mdns_enabled());
+    }
+
+    /// Le réglage « seed de ce que je regarde » (spec persistance §3) est
+    /// lisible/modifiable et **persisté** (dotfile `.seed_watched`), **défaut
+    /// inactif** — retenir hors abonnement consomme le quota, ça se demande.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn seed_watched_setting_persists_and_defaults_to_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).await.unwrap();
+        assert!(!node.seed_watched());
+        node.set_seed_watched(true).unwrap();
+        assert!(node.seed_watched(), "effet immédiat, pas au redémarrage");
+        drop(node);
+        let node = Node::open(dir.path()).await.unwrap();
+        assert!(node.seed_watched());
     }
 
     /// Deux nœuds sur la même machine, AUCUN dial : mDNS les met en relation.

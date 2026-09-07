@@ -9,7 +9,7 @@
 use crate::blockstore::Blockstore;
 use crate::error::{CoreError, Result as CoreResult};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 /// Quota de seed par défaut (20 Gio) si aucun `.seed_quota` n'est persisté.
@@ -161,27 +161,40 @@ impl SeedIndex {
     }
 }
 
-/// Ordre d'éviction des publications NON épinglées : réplication décroissante
-/// (celles déjà bien répliquées ailleurs sur le réseau partent en premier),
-/// puis `order` croissant (la plus ancienne d'abord) en cas d'égalité. Fonction
-/// pure : la réplication est mesurée par l'appelant (ex. `replication_factor`
-/// DHT), jamais ici.
+/// Ordre d'éviction des publications NON épinglées, **à deux étages**
+/// (spec persistance §5) : les publications d'émetteurs NON souscrits partent
+/// en premier — un abonnement est une intention explicite, un visionnage
+/// n'est qu'une opportunité. À l'intérieur de chaque étage, l'ordre historique
+/// est conservé : réplication décroissante (ce qui est déjà bien répliqué
+/// ailleurs part d'abord), puis `order` croissant (la plus ancienne d'abord)
+/// en cas d'égalité. Fonction pure : la réplication est mesurée par l'appelant
+/// (ex. `replication_factor` DHT), jamais ici ; `subscribed` contient les
+/// émetteurs souscrits sous leur forme chaîne (`PeerId::to_string`), la même
+/// clé que celle de l'index.
 pub fn eviction_order<'a>(
     index: &'a SeedIndex,
     replication: &HashMap<String, usize>,
+    subscribed: &HashSet<String>,
 ) -> Vec<&'a SeededPublication> {
-    let mut candidates: Vec<&SeededPublication> = index
+    let mut candidates: Vec<(bool, &SeededPublication)> = index
         .publications
-        .values()
-        .flatten()
-        .filter(|p| !index.is_pinned(&p.manifest_cid))
+        .iter()
+        .flat_map(|(issuer, pubs)| {
+            let is_subscribed = subscribed.contains(issuer);
+            pubs.iter().map(move |p| (is_subscribed, p))
+        })
+        .filter(|(_, p)| !index.is_pinned(&p.manifest_cid))
         .collect();
-    candidates.sort_by(|a, b| {
+    candidates.sort_by(|(sub_a, a), (sub_b, b)| {
         let ra = replication.get(&a.manifest_cid).copied().unwrap_or(0);
         let rb = replication.get(&b.manifest_cid).copied().unwrap_or(0);
-        rb.cmp(&ra).then_with(|| a.order.cmp(&b.order))
+        // `false` (non souscrit) trie avant `true` : premier évincé.
+        sub_a
+            .cmp(sub_b)
+            .then_with(|| rb.cmp(&ra))
+            .then_with(|| a.order.cmp(&b.order))
     });
-    candidates
+    candidates.into_iter().map(|(_, p)| p).collect()
 }
 
 /// Chemin de l'index de seed persisté (à côté des blocs).
@@ -342,7 +355,7 @@ mod tests {
         let mut replication = HashMap::new();
         replication.insert("well-replicated".to_string(), 5);
         replication.insert("rare".to_string(), 1);
-        let order = eviction_order(&idx, &replication);
+        let order = eviction_order(&idx, &replication, &HashSet::new());
         assert_eq!(order[0].manifest_cid, "well-replicated");
         assert_eq!(order[1].manifest_cid, "rare");
     }
@@ -355,9 +368,29 @@ mod tests {
         let mut replication = HashMap::new();
         replication.insert("older".to_string(), 2);
         replication.insert("newer".to_string(), 2);
-        let order = eviction_order(&idx, &replication);
+        let order = eviction_order(&idx, &replication, &HashSet::new());
         assert_eq!(order[0].manifest_cid, "older");
         assert_eq!(order[1].manifest_cid, "newer");
+    }
+
+    /// Éviction à deux étages (spec persistance §5) : une publication d'un
+    /// émetteur NON souscrit part avant celle d'un souscrit, même quand la
+    /// souscrite est BIEN mieux répliquée (donc « meilleure candidate » au
+    /// seul critère historique). L'abonnement est une intention explicite, le
+    /// visionnage une simple opportunité.
+    #[test]
+    fn eviction_prefers_unsubscribed_publications() {
+        let mut idx = SeedIndex::default();
+        idx.insert("sub", publication("m-sub", 10));
+        idx.insert("nosub", publication("m-nosub", 10));
+        let mut replication = HashMap::new();
+        replication.insert("m-sub".to_string(), 5); // mieux répliquée…
+        replication.insert("m-nosub".to_string(), 1);
+        let subscribed: HashSet<String> = ["sub".to_string()].into();
+        let order = eviction_order(&idx, &replication, &subscribed);
+        // …mais non souscrite : elle part quand même d'abord.
+        assert_eq!(order[0].manifest_cid, "m-nosub");
+        assert_eq!(order[1].manifest_cid, "m-sub");
     }
 
     #[test]
@@ -369,7 +402,7 @@ mod tests {
         let mut replication = HashMap::new();
         replication.insert("pinned".to_string(), 10);
         replication.insert("unpinned".to_string(), 0);
-        let order = eviction_order(&idx, &replication);
+        let order = eviction_order(&idx, &replication, &HashSet::new());
         assert_eq!(order.len(), 1);
         assert_eq!(order[0].manifest_cid, "unpinned");
     }

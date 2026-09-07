@@ -9,15 +9,17 @@ use crate::blockstore::Blockstore;
 use crate::error::CoreError;
 use crate::ingest::HlsManifest;
 use crate::p2p::{Fetcher, StorePolicy};
+use crate::seeding::SeededPublication;
 use cid::Cid;
 use futures::future::BoxFuture;
+use libp2p::PeerId;
 use scheduler::{FailureCause, SegmentScheduler, SegmentState, RETRY_DELAY};
 use server::{LocalHttpServer, SegmentError, SegmentSource};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::{broadcast, watch, Notify};
+use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 
 /// Résultat d'`open_stream` : l'URL à donner telle quelle au lecteur natif.
@@ -66,6 +68,15 @@ pub(crate) struct SessionState {
     /// boucle de seed enregistre alors la publication au `SeedIndex` sous
     /// quota (blocs déjà en cache → passe peu coûteuse).
     seed_wake: broadcast::Sender<()>,
+    /// Émetteur à indexer à la complétion pour une session `Seed` **hors
+    /// abonnement** (« seed de ce que je regarde », spec persistance §3).
+    /// `None` pour un channel souscrit : le round-robin du seed proactif le
+    /// visite déjà, un simple `seed_wake` suffit. `None` aussi quand aucun
+    /// émetteur n'est identifiable (manifeste hors catalogue).
+    issuer_to_index: Option<PeerId>,
+    /// Demande d'indexation immédiate d'une publication précise, adressée à
+    /// `seed_loop` — voir `Node::seed_now`.
+    seed_now: mpsc::Sender<(PeerId, Cid)>,
     /// Poignée faible sur soi-même : `SegmentSource::segment` prend `&self`
     /// mais doit rendre un futur `'static`. Posée juste après la construction
     /// de l'`Arc` (voir [`StreamSession::open`]).
@@ -225,6 +236,8 @@ impl StreamSession {
         fetcher: Fetcher,
         events: broadcast::Sender<u64>,
         seed_wake: broadcast::Sender<()>,
+        issuer_to_index: Option<PeerId>,
+        seed_now: mpsc::Sender<(PeerId, Cid)>,
     ) -> Result<(Self, StreamSessionInfo), CoreError> {
         let segments = manifest
             .segments
@@ -247,6 +260,8 @@ impl StreamSession {
             changed,
             events,
             seed_wake,
+            issuer_to_index,
+            seed_now,
             me: Mutex::new(std::sync::Weak::new()),
         });
         *state
@@ -276,6 +291,37 @@ impl StreamSession {
 
     pub(crate) fn dir(&self) -> &Path {
         &self.state.dir
+    }
+
+    /// Publication dont les blocs sont à purger si cette session se ferme
+    /// maintenant (spec persistance §4) — `Some` seulement pour une session
+    /// `Seed` **hors abonnement** (`issuer_to_index`) qui n'est **pas
+    /// complète** : elle n'a donc rien demandé à `seed_loop` et n'entrera
+    /// jamais à l'index toute seule. Complète, elle a émis sa demande
+    /// d'indexation : c'est `seed_loop` qui décide (et purge lui-même si le
+    /// quota la refuse). Souscrite, rien à purger : le seed proactif
+    /// complètera la publication plus tard.
+    ///
+    /// `total_bytes`/`order` sont nuls : la valeur ne sert qu'à énumérer des
+    /// CIDs pour `remove_unshared_blocks`, jamais à entrer dans un index.
+    pub(crate) fn unindexed_watched_publication(&self) -> Option<SeededPublication> {
+        let issuer_watched = self.state.issuer_to_index.is_some();
+        if self.state.policy != StorePolicy::Seed || !issuer_watched {
+            return None;
+        }
+        let complete = {
+            let s = self.state.lock();
+            s.fetched() == s.total()
+        };
+        if complete {
+            return None;
+        }
+        Some(SeededPublication {
+            manifest_cid: self.state.manifest_cid.to_string(),
+            segment_cids: self.state.segments.iter().map(Cid::to_string).collect(),
+            total_bytes: 0,
+            order: 0,
+        })
     }
 }
 
@@ -355,7 +401,23 @@ async fn fetch_loop(fetcher: Fetcher, state: Arc<SessionState>) {
                 let done = { let s = state.lock(); s.fetched() == s.total() };
                 if done && !completed_notified && state.policy == StorePolicy::Seed {
                     completed_notified = true;
-                    let _ = state.seed_wake.send(());
+                    match state.issuer_to_index {
+                        // Hors abonnement (« ce que je regarde ») : le
+                        // round-robin du seed proactif ne visiterait jamais
+                        // cet émetteur — on nomme la publication à indexer.
+                        Some(issuer) => {
+                            if state.seed_now.try_send((issuer, state.manifest_cid)).is_err() {
+                                tracing::debug!(
+                                    "session {}: demande d'indexation non transmise (canal saturé ou fermé)",
+                                    state.id
+                                );
+                            }
+                        }
+                        // Channel souscrit : le seed proactif s'en charge.
+                        None => {
+                            let _ = state.seed_wake.send(());
+                        }
+                    }
                 }
             }
             _ = state.wake.notified() => {}
