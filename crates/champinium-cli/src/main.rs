@@ -771,8 +771,12 @@ async fn main() -> Result<()> {
                 };
                 node.set_seed_watched(enabled)?;
             }
-            let state = if node.seed_watched() { "on" } else { "off" };
-            println!("seed-watched : {state}");
+            let state = if node.seed_watched() {
+                "activé"
+            } else {
+                "désactivé"
+            };
+            println!("seed de ce que je regarde : {state}");
         }
     }
     Ok(())
