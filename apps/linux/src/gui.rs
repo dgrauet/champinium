@@ -117,6 +117,9 @@ struct Ui {
     /// pas encore quand `Ui` est créé). Sert de `transient_for` aux dialogues
     /// ouverts depuis un en-tête de channel (confirmation de blocage).
     window: RefCell<Option<ApplicationWindow>>,
+    /// Label « réseau : N pair(s) » — rafraîchi après l'amorçage et toutes les
+    /// 10 s (voir `start_peer_count_timer`).
+    peer_count: RefCell<Option<Label>>,
 }
 
 fn build_ui(app: &Application) {
@@ -140,6 +143,7 @@ fn build_ui(app: &Application) {
         stream_progress: RefCell::new(None),
         explorer_warned: Cell::new(false),
         window: RefCell::new(None),
+        peer_count: RefCell::new(None),
     });
 
     let status = Label::new(Some("démarrage…"));
@@ -150,6 +154,11 @@ fn build_ui(app: &Application) {
     // streaming (`subscribe_stream`).
     let stream_progress = Label::new(None);
     stream_progress.set_xalign(0.0);
+    // Compteur de pairs connectés — rafraîchi après l'amorçage puis toutes
+    // les 10 s (voir `start_peer_count_timer`).
+    let peer_count_label = Label::new(Some("réseau : 0 pair(s)"));
+    peer_count_label.set_xalign(0.0);
+    *ui.peer_count.borrow_mut() = Some(peer_count_label.clone());
     // Réglages de seed (lot c) : quota (Go) + usage courant — popup dédiée
     // pour rester cohérente avec la vue unique existante (pas de fenêtre de
     // préférences séparée).
@@ -162,6 +171,7 @@ fn build_ui(app: &Application) {
     let moderation_lists_btn = Button::with_label("Listes de modération");
     let header_bar = GtkBox::new(Orientation::Horizontal, 8);
     header_bar.append(&status);
+    header_bar.append(&peer_count_label);
     header_bar.append(&stream_progress);
     header_bar.append(&seed_settings_btn);
     header_bar.append(&blocked_channels_btn);
@@ -295,6 +305,21 @@ fn build_ui(app: &Application) {
                     let mut stream_events = node.subscribe_stream();
                     let mut moderation_events = node.subscribe_moderation();
                     *ui.node.borrow_mut() = Some(node);
+                    // Amorçage best-effort après listen : ne bloque jamais le
+                    // démarrage de l'UI ni n'échoue de façon visible — le
+                    // champ « Connecter » manuel reste le chemin de secours.
+                    {
+                        let ui = ui.clone();
+                        glib::spawn_future_local(async move {
+                            let node = ui.node.borrow().clone();
+                            if let Some(node) = node {
+                                let rt = ui.rt.clone();
+                                let _ = rt.spawn(async move { node.bootstrap().await }).await;
+                            }
+                            refresh_peer_count(&ui).await;
+                        });
+                    }
+                    start_peer_count_timer(&ui);
                     // Le nœud est prêt : router les liens champinium:// vers
                     // le chemin du bouton « Aperçu » (rejoue spinner +
                     // résolution + feuille + erreurs, aucune duplication) —
@@ -413,6 +438,7 @@ fn build_ui(app: &Application) {
 
                     while let Ok(()) | Err(RecvError::Lagged(_)) = events.recv().await {
                         refresh_lists(&ui, &status, &subs_list, &explorer_list, &search_entry);
+                        refresh_peer_count(&ui).await;
                     }
                 }
                 Err(e) => {
@@ -1154,6 +1180,21 @@ fn open_seed_settings(ui: &Rc<Ui>, parent: &ApplicationWindow) {
     cold_row.append(&cold_label);
     cold_row.append(&cold_switch);
 
+    // Découverte mDNS (LAN) — même patron sync que le réglage de récupération
+    // froide ci-dessus (`mdns_enabled`/`set_mdns` sont sync).
+    const MDNS_HELP: &str =
+        "Effet au prochain démarrage. Révèle la présence de ce nœud sur le réseau local.";
+    let mdns_row = GtkBox::new(Orientation::Horizontal, 8);
+    let mdns_label = Label::new(Some("Découverte sur le réseau local (mDNS)"));
+    mdns_label.set_xalign(0.0);
+    mdns_label.set_hexpand(true);
+    mdns_label.set_tooltip_text(Some(MDNS_HELP));
+    let mdns_switch = Switch::new();
+    mdns_switch.set_active(node.mdns_enabled());
+    mdns_switch.set_tooltip_text(Some(MDNS_HELP));
+    mdns_row.append(&mdns_label);
+    mdns_row.append(&mdns_switch);
+
     let msg_label = Label::new(None);
     msg_label.set_xalign(0.0);
 
@@ -1161,8 +1202,24 @@ fn open_seed_settings(ui: &Rc<Ui>, parent: &ApplicationWindow) {
     content.append(&quota_row);
     content.append(&stats_label);
     content.append(&cold_row);
+    content.append(&mdns_row);
     content.append(&msg_label);
     win.set_child(Some(&content));
+
+    let mdns_ui = ui.clone();
+    let mdns_msg_label = msg_label.clone();
+    mdns_switch.connect_state_set(move |_, is_active| {
+        let Some(node) = mdns_ui.node.borrow().clone() else {
+            return glib::Propagation::Stop;
+        };
+        match node.set_mdns(is_active) {
+            Ok(()) => glib::Propagation::Proceed,
+            Err(e) => {
+                mdns_msg_label.set_text(&describe_core_error(&e, "mDNS"));
+                glib::Propagation::Stop
+            }
+        }
+    });
 
     let cold_ui = ui.clone();
     let cold_msg_label = msg_label.clone();
@@ -1703,6 +1760,33 @@ fn start_playback(url: &str) -> Result<gstreamer::Element, String> {
         .set_state(gstreamer::State::Playing)
         .map_err(|e| format!("démarrage : {e}"))?;
     Ok(playbin)
+}
+
+/// Relit le nombre de pairs connectés et met à jour le label du header.
+/// Best-effort : une erreur réseau laisse l'affichage précédent inchangé.
+async fn refresh_peer_count(ui: &Rc<Ui>) {
+    let Some(node) = ui.node.borrow().clone() else {
+        return;
+    };
+    let rt = ui.rt.clone();
+    let Ok(Ok(n)) = rt.spawn(async move { node.connected_peers().await }).await else {
+        return;
+    };
+    if let Some(label) = ui.peer_count.borrow().as_ref() {
+        label.set_text(&format!("réseau : {n} pair(s)"));
+    }
+}
+
+/// Démarre le rafraîchissement périodique (10 s) du compteur de pairs — en
+/// plus du rafraîchissement immédiat après l'amorçage et à chaque tic du
+/// catalogue (voir les appels `refresh_peer_count` ci-dessus).
+fn start_peer_count_timer(ui: &Rc<Ui>) {
+    let ui = ui.clone();
+    glib::timeout_add_seconds_local(10, move || {
+        let ui = ui.clone();
+        glib::spawn_future_local(async move { refresh_peer_count(&ui).await });
+        glib::ControlFlow::Continue
+    });
 }
 
 // --- Ponts vers le noyau (exécutés sur le runtime tokio) ---

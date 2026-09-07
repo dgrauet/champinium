@@ -136,7 +136,7 @@ async fn subscribed_seeder_republication_keeps_creator_feed_discoverable_offline
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn republish_known_feeds_skips_non_subscribed_catalog_issuer() {
     let dir = tempfile::tempdir().unwrap();
-    let node = Node::open(dir.path()).await.unwrap();
+    let node = Node::open_isolated(dir.path()).await.unwrap();
 
     let other = Keypair::generate_ed25519();
     let feed = Feed::build_signed(&other, 1, &[cid_for(b"unsubscribed")]).unwrap();
@@ -156,7 +156,7 @@ async fn republish_known_feeds_skips_non_subscribed_catalog_issuer() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn republish_known_feeds_skips_blocked_issuer() {
     let dir = tempfile::tempdir().unwrap();
-    let node = Node::open(dir.path()).await.unwrap();
+    let node = Node::open_isolated(dir.path()).await.unwrap();
 
     let victim = Keypair::generate_ed25519();
     let victim_peer = victim.public().to_peer_id();

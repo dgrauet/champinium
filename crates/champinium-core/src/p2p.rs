@@ -32,8 +32,10 @@ use libp2p::kad::{
     GetProvidersOk, GetRecordOk, QueryId, QueryResult, RecordKey,
 };
 use libp2p::request_response::{self, OutboundRequestId, ProtocolSupport};
+use libp2p::swarm::behaviour::toggle::Toggle;
+use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{dcutr, gossipsub, identify, identity::Keypair, noise, ping, relay, tcp, yamux};
+use libp2p::{dcutr, gossipsub, identify, identity::Keypair, mdns, noise, ping, relay, tcp, yamux};
 use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -70,6 +72,87 @@ const MAX_FEED_SIZE: usize = 4 * 1024 * 1024;
 const MAX_PROVIDED_KEYS: usize = 1_000_000;
 /// Nombre max de records DHT stockés localement (feeds d'autres créateurs).
 const MAX_DHT_RECORDS: usize = 100_000;
+
+/// Bootstraps compilés (ADR 0013). Le binaire est la confiance : liste non
+/// signée, vide tant qu'aucun bootstrap public n'existe.
+const DEFAULT_BOOTSTRAPS: &str = include_str!("../../../bootstrap/default.peers");
+/// Borne sur le nombre total de bootstraps (compilés + persistés) qu'un nœud
+/// retient — anti-DoS sur `add_bootstrap`, même patron que `MAX_DHT_RECORDS`.
+pub const MAX_BOOTSTRAPS: usize = 64;
+
+/// Parse une liste de multiaddrs bootstrap (une par ligne, `#` = commentaire,
+/// lignes vides ignorées). Une ligne invalide (multiaddr mal formée, ou sans
+/// composant `/p2p/<peerid>`) est journalée et ignorée plutôt que de faire
+/// échouer tout le chargement.
+fn parse_bootstrap_lines(raw: &str) -> Vec<Multiaddr> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| match l.parse::<Multiaddr>() {
+            Ok(a) if split_peer_id(a.clone()).is_ok() => Some(a),
+            _ => {
+                tracing::warn!("bootstrap ignoré (multiaddr invalide ou sans /p2p/): {l}");
+                None
+            }
+        })
+        .collect()
+}
+
+/// Bootstraps compilés dans le binaire — voir [`bootstrap/README.md`]
+/// (hors crate) pour proposer un bootstrap public.
+pub fn compiled_bootstraps() -> Vec<Multiaddr> {
+    parse_bootstrap_lines(DEFAULT_BOOTSTRAPS)
+}
+
+/// Chemin des bootstraps ajoutés par l'utilisateur, à côté des blocs — même
+/// patron que `.subscriptions`.
+fn bootstraps_path(blockstore: &Blockstore) -> PathBuf {
+    blockstore.root().join(".bootstraps")
+}
+
+/// Charge les bootstraps persistés (vide si absent/illisible — un fichier
+/// corrompu ne doit pas empêcher le démarrage). Les entrées individuellement
+/// invalides (multiaddr mal formée, ou sans composant `/p2p/<peerid>`) sont
+/// journalisées et ignorées plutôt que de faire échouer tout le chargement —
+/// même exigence que [`parse_bootstrap_lines`]. Tronqué à [`MAX_BOOTSTRAPS`]
+/// (journalisé) : un `.bootstraps` hors-borne (édité à la main, ou par une
+/// version antérieure sans la vérification) ne doit pas faire dialer un
+/// nombre non borné d'adresses à chaque démarrage.
+fn load_bootstraps(blockstore: &Blockstore) -> BTreeSet<Multiaddr> {
+    let addrs: Vec<Multiaddr> = std::fs::read_to_string(bootstraps_path(blockstore))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .map(|addrs| {
+            addrs
+                .into_iter()
+                .filter_map(|a| match a.parse::<Multiaddr>() {
+                    Ok(addr) if split_peer_id(addr.clone()).is_ok() => Some(addr),
+                    _ => {
+                        tracing::warn!("bootstrap persisté ignoré (invalide ou sans /p2p/): {a}");
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if addrs.len() > MAX_BOOTSTRAPS {
+        tracing::warn!(
+            "{} bootstraps persistés, tronqué à {MAX_BOOTSTRAPS}",
+            addrs.len()
+        );
+    }
+    addrs.into_iter().take(MAX_BOOTSTRAPS).collect()
+}
+
+/// Persiste les bootstraps ajoutés par l'utilisateur (JSON `Vec<String>` trié
+/// — `BTreeSet` le garantit).
+fn save_bootstraps(blockstore: &Blockstore, set: &BTreeSet<Multiaddr>) -> CoreResult<()> {
+    let addrs: Vec<String> = set.iter().map(Multiaddr::to_string).collect();
+    let json = serde_json::to_string(&addrs)
+        .map_err(|e| CoreError::Network(format!("json bootstraps: {e}")))?;
+    std::fs::write(bootstraps_path(blockstore), json)?;
+    Ok(())
+}
 /// Intervalle du suivi actif périodique des channels souscrits (spec channels
 /// §2). Surchargeable en test via
 /// [`Node::with_moderation_and_follow_interval`] — **pas** via un setter
@@ -107,10 +190,15 @@ struct Behaviour {
     // NAT traversal : client de circuit relay v2 + hole punching DCUtR.
     relay_client: relay::client::Behaviour,
     dcutr: dcutr::Behaviour,
+    /// Découverte locale (réseau physique) — débrayable (tâche 2), défaut
+    /// actif pour [`Node::open`] (fronts, CLI) seulement ; inactif sauf
+    /// dotfile explicite pour [`Node::new`]/`with_moderation*` (démons,
+    /// tests). `Toggle::from(None)` n'ouvre aucun socket multicast.
+    mdns: Toggle<mdns::tokio::Behaviour>,
 }
 
 impl Behaviour {
-    fn new(key: &Keypair, relay_client: relay::client::Behaviour) -> Self {
+    fn new(key: &Keypair, relay_client: relay::client::Behaviour, mdns_enabled: bool) -> Self {
         let peer_id = key.public().to_peer_id();
         // Filtrage des stores entrants : sans lui, n'importe quel pair peut
         // écraser le record de feed d'autrui chez les nœuds stockeurs (déni de
@@ -167,6 +255,11 @@ impl Behaviour {
         gossipsub
             .with_peer_score(score_params, gossipsub::PeerScoreThresholds::default())
             .expect("paramètres de scoring valides");
+        let mdns = Toggle::from(if mdns_enabled {
+            mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id).ok()
+        } else {
+            None
+        });
         Self {
             kademlia,
             identify,
@@ -175,6 +268,7 @@ impl Behaviour {
             gossipsub,
             relay_client,
             dcutr: dcutr::Behaviour::new(peer_id),
+            mdns,
         }
     }
 }
@@ -237,6 +331,17 @@ enum Command {
     StopProviding {
         key: RecordKey,
     },
+    /// Peuple la table de routage Kademlia depuis les pairs déjà connus
+    /// (`kademlia.bootstrap()`). `NoKnownPeers` (aucun pair ajouté au
+    /// préalable, ex. liste de bootstraps vide) est renvoyé comme `Err` ici
+    /// mais n'est pas propagé par [`Node::bootstrap`] (journalisé seulement).
+    Bootstrap {
+        tx: oneshot::Sender<Result<(), String>>,
+    },
+    /// Nombre de pairs actuellement connectés (`Swarm::connected_peers`).
+    ConnectedPeers {
+        tx: oneshot::Sender<usize>,
+    },
 }
 
 /// Politique de stockage appliquée par [`Node::get_with`] lors d'une
@@ -272,6 +377,10 @@ pub struct Node {
     /// Abonnements locaux (channels suivis) — état **privé** du nœud, jamais
     /// publié sur le réseau (spec channels §2).
     subscriptions: Arc<Mutex<BTreeSet<PeerId>>>,
+    /// Bootstraps ajoutés par l'utilisateur, persistés `.bootstraps` — les
+    /// compilés ([`compiled_bootstraps`]) ne sont PAS stockés ici, seulement
+    /// ajoutés à la lecture par [`Node::bootstraps`].
+    bootstraps: Arc<Mutex<BTreeSet<Multiaddr>>>,
     /// Index de seed proactif (spec channels lot c) : publications retenues
     /// par émetteur, pins, quota — voir [`crate::seeding`].
     seed_index: Arc<Mutex<SeedIndex>>,
@@ -327,6 +436,12 @@ pub struct Node {
     /// soit la feature de build, seul le repli réseau lui-même reste gaté
     /// (`cold`, ci-dessus).
     cold_retrieval_enabled: Arc<AtomicBool>,
+    /// Débrayage mDNS (tâche 2), persisté (dotfile `.mdns_enabled`), défaut
+    /// actif. Contrairement à `cold_retrieval_enabled`, ce réglage ne prend
+    /// effet qu'au **prochain démarrage** (`build_swarm` construit le
+    /// comportement `mdns` une fois pour toutes) — voir la doc de
+    /// [`Node::set_mdns`].
+    mdns_enabled: Arc<AtomicBool>,
     /// Sessions de lecture progressive ouvertes (spec 2026-09-05). Aucune
     /// session ne détient de `Node` (voir `Fetcher`) : lâcher la dernière
     /// poignée lâche la table, donc arrête serveurs et boucles.
@@ -464,7 +579,38 @@ impl Node {
     pub async fn open(data_dir: &Path) -> CoreResult<Self> {
         let keypair = identity::load_or_generate(data_dir.join("node.key"))?;
         let blockstore = Blockstore::open(data_dir.join("blocks"))?;
-        Self::new(keypair, blockstore).await
+        Self::build(
+            keypair,
+            blockstore,
+            Moderation::new(),
+            FOLLOW_INTERVAL,
+            SEED_INTERVAL,
+            Some(crate::moderation::project_issuer()?),
+            true,
+        )
+        .await
+    }
+
+    /// Comme [`Node::open`], mais mDNS ne démarre que si `.mdns_enabled` dit
+    /// explicitement `true` — pour les tests et les outils qui ne doivent ni
+    /// révéler leur présence sur le LAN ni composer vers des nœuds étrangers
+    /// (voir la revue finale du lot « découverte initiale » : mDNS actif par
+    /// défaut dans toute la suite de tests couplait des nœuds sans rapport et
+    /// cassait des assertions de comptage exact de fournisseurs).
+    #[doc(hidden)]
+    pub async fn open_isolated(data_dir: &Path) -> CoreResult<Self> {
+        let keypair = identity::load_or_generate(data_dir.join("node.key"))?;
+        let blockstore = Blockstore::open(data_dir.join("blocks"))?;
+        Self::build(
+            keypair,
+            blockstore,
+            Moderation::new(),
+            FOLLOW_INTERVAL,
+            SEED_INTERVAL,
+            Some(crate::moderation::project_issuer()?),
+            false,
+        )
+        .await
     }
 
     /// Se connecte à un pair désigné par une multiaddr terminée par
@@ -534,8 +680,42 @@ impl Node {
         seed_interval: Duration,
         project_issuer: Option<PeerId>,
     ) -> CoreResult<Self> {
+        Self::build(
+            keypair,
+            blockstore,
+            moderation,
+            follow_interval,
+            seed_interval,
+            project_issuer,
+            false,
+        )
+        .await
+    }
+
+    /// Corps commun de tous les constructeurs. `mdns_default` est la valeur
+    /// utilisée quand `.mdns_enabled` est absent/illisible : `true` pour
+    /// [`Node::open`] (fronts, CLI — le confort de la découverte locale prime),
+    /// `false` pour tout le reste ([`Node::new`], `with_moderation*`, et donc
+    /// les démons `champinium-seed`/`champinium-bootstrap` ainsi que toute la
+    /// suite de tests) — un nœud ne démarre un socket multicast que si un
+    /// dotfile explicite le demande.
+    async fn build(
+        keypair: Keypair,
+        blockstore: Blockstore,
+        moderation: Moderation,
+        follow_interval: Duration,
+        seed_interval: Duration,
+        project_issuer: Option<PeerId>,
+        mdns_default: bool,
+    ) -> CoreResult<Self> {
         let peer_id = identity::peer_id(&keypair);
-        let mut swarm = build_swarm(keypair.clone())?;
+        // Débrayage mDNS (tâche 2) : lu AVANT `build_swarm` — contrairement au
+        // débrayage de repli froid (simple lecture d'un `bool`), celui-ci
+        // conditionne la construction du comportement réseau lui-même, donc
+        // aucun setter post-construction ne peut l'appliquer avant le prochain
+        // démarrage (même remarque que `FOLLOW_INTERVAL`).
+        let mdns_enabled_initial = load_mdns_enabled(&blockstore).unwrap_or(mdns_default);
+        let mut swarm = build_swarm(keypair.clone(), mdns_enabled_initial)?;
         // Mode serveur : stocke et sert les provider records (pas seulement client).
         swarm
             .behaviour_mut()
@@ -558,6 +738,9 @@ impl Node {
         // Abonnements locaux persistés (spec channels §2) : rechargés avant le
         // démarrage de la boucle de suivi pour que le passage initial les couvre.
         let subscriptions = Arc::new(Mutex::new(load_subscriptions(&blockstore)));
+        // Bootstraps persistés par l'utilisateur (les compilés ne sont pas
+        // stockés ici, voir la doc du champ `Node::bootstraps`).
+        let bootstraps = Arc::new(Mutex::new(load_bootstraps(&blockstore)));
         // Channels bloqués localement (tâche 3) : rechargés avant le démarrage
         // de la boucle de gossip (le check d'ingestion catalogue doit en tenir
         // compte dès le premier feed reçu).
@@ -691,6 +874,7 @@ impl Node {
         // s'écrit même dans un build par défaut, sans effet réseau sans la
         // feature.
         let cold_retrieval_enabled = Arc::new(AtomicBool::new(load_cold_enabled(&blockstore)));
+        let mdns_enabled = Arc::new(AtomicBool::new(mdns_enabled_initial));
 
         // Purge des sessions de lecture orphelines (un front qui n'a pas fermé).
         let _ = std::fs::remove_dir_all(stream::streams_root(&blockstore));
@@ -707,6 +891,7 @@ impl Node {
             feed_seq,
             channel_profile,
             subscriptions,
+            bootstraps,
             seed_index,
             seed_quota,
             seed_events,
@@ -720,6 +905,7 @@ impl Node {
             #[cfg(feature = "cold-storage")]
             cold: None,
             cold_retrieval_enabled,
+            mdns_enabled,
             streams: Arc::new(Mutex::new(HashMap::new())),
             stream_next_id: Arc::new(AtomicU64::new(0)),
             stream_events,
@@ -839,6 +1025,81 @@ impl Node {
     /// Enregistre une adresse connue pour un pair (table de routage Kademlia).
     pub async fn add_address(&self, peer: PeerId, addr: Multiaddr) -> CoreResult<()> {
         self.send(Command::AddAddress { peer, addr }).await
+    }
+
+    /// Bootstraps connus : compilés ([`compiled_bootstraps`]) ∪ persistés par
+    /// l'utilisateur, dédupliqués et triés par chaîne (`BTreeSet<Multiaddr>`).
+    pub fn bootstraps(&self) -> Vec<Multiaddr> {
+        let mut all: BTreeSet<Multiaddr> = compiled_bootstraps().into_iter().collect();
+        all.extend(
+            self.bootstraps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .cloned(),
+        );
+        all.into_iter().collect()
+    }
+
+    /// Ajoute un bootstrap connu de l'utilisateur (persisté `.bootstraps`) :
+    /// `addr` doit porter un composant `/p2p/<peerid>`, sinon
+    /// `CoreError::Network`. Borné à [`MAX_BOOTSTRAPS`] (compilés + persistés
+    /// confondus, sur l'union **dédupliquée** que renvoie [`Node::bootstraps`]
+    /// — une adresse déjà compilée ou déjà persistée est acceptée de façon
+    /// idempotente sans consommer de marge) — anti-DoS, même patron que les
+    /// autres ensembles persistés (abonnements, éditeurs de denylist).
+    pub async fn add_bootstrap(&self, addr: Multiaddr) -> CoreResult<()> {
+        let (peer, base) = split_peer_id(addr.clone())?;
+        let already_known = self.bootstraps().contains(&addr);
+        if !already_known && self.bootstraps().len() >= MAX_BOOTSTRAPS {
+            return Err(CoreError::Network(format!(
+                "au plus {MAX_BOOTSTRAPS} bootstraps"
+            )));
+        }
+        {
+            let mut set = self
+                .bootstraps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            set.insert(addr);
+            save_bootstraps(&self.blockstore, &set)?;
+        }
+        self.add_address(peer, base).await
+    }
+
+    /// Compose vers tous les bootstraps connus (best-effort) puis peuple la
+    /// table de routage (`kademlia.bootstrap()`). Renvoie le nombre de
+    /// bootstraps dont le dial a été accepté. Aucun effet si la liste est
+    /// vide (`kademlia.bootstrap()` renvoie alors `NoKnownPeers`, journalisé
+    /// mais pas propagé).
+    pub async fn bootstrap(&self) -> CoreResult<usize> {
+        let mut joined = 0usize;
+        for addr in self.bootstraps() {
+            if let Ok((peer, _)) = split_peer_id(addr.clone()) {
+                if peer == self.peer_id {
+                    tracing::debug!("bootstrap {addr} ignoré : c'est ce nœud lui-même");
+                    continue;
+                }
+            }
+            match self.connect(addr.clone()).await {
+                Ok(()) => joined += 1,
+                Err(e) => tracing::warn!("bootstrap {addr} injoignable: {e}"),
+            }
+        }
+        let (tx, rx) = oneshot::channel();
+        self.send(Command::Bootstrap { tx }).await?;
+        if let Err(e) = rx.await.map_err(|_| CoreError::Shutdown)? {
+            // NoKnownPeers quand la liste est vide : pas une erreur applicative.
+            tracing::debug!("kademlia.bootstrap: {e}");
+        }
+        Ok(joined)
+    }
+
+    /// Nombre de pairs actuellement connectés.
+    pub async fn connected_peers(&self) -> CoreResult<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Command::ConnectedPeers { tx }).await?;
+        rx.await.map_err(|_| CoreError::Shutdown)
     }
 
     /// Indique si un CID est actuellement bloqué par la modération.
@@ -2320,6 +2581,27 @@ impl Node {
         self.cold_retrieval_enabled.load(Ordering::Relaxed)
     }
 
+    /// État courant du débrayage mDNS. Défaut si `.mdns_enabled` est absent :
+    /// actif pour un nœud ouvert via [`Node::open`] (fronts, CLI) ; inactif
+    /// pour tout nœud construit via [`Node::new`]/`with_moderation*`, donc
+    /// pour les démons `champinium-seed`/`champinium-bootstrap` — voir
+    /// [`Node::build`].
+    pub fn mdns_enabled(&self) -> bool {
+        self.mdns_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Active/désactive la découverte mDNS et persiste le choix (dotfile
+    /// `.mdns_enabled`, à côté des blocs). Contrairement à
+    /// [`Node::set_cold_retrieval`], **l'effet n'est visible qu'au prochain
+    /// démarrage** : le comportement `mdns` est construit une fois pour
+    /// toutes par `build_swarm`, avant que ce nœud existe — il n'existe pas
+    /// de setter qui rouvrirait/fermerait le socket multicast à chaud sans
+    /// reconstruire tout le swarm.
+    pub fn set_mdns(&self, enabled: bool) -> CoreResult<()> {
+        self.mdns_enabled.store(enabled, Ordering::Relaxed);
+        save_mdns_enabled(&self.blockstore, enabled)
+    }
+
     /// Configure le backend [`ColdStore`] de **repli de récupération** — point
     /// d'entrée public pour câbler un `ArweaveColdStore` (ou tout autre backend
     /// de récupération). Le choix du backend concret et de ses gateways reste à
@@ -2479,6 +2761,27 @@ fn load_cold_enabled(blockstore: &Blockstore) -> bool {
 /// Persiste le débrayage de repli froid.
 fn save_cold_enabled(blockstore: &Blockstore, enabled: bool) -> CoreResult<()> {
     std::fs::write(cold_enabled_path(blockstore), enabled.to_string())?;
+    Ok(())
+}
+
+/// Chemin du débrayage mDNS persisté (tâche 2), à côté des blocs — même
+/// patron que `.cold_enabled`.
+fn mdns_enabled_path(blockstore: &Blockstore) -> PathBuf {
+    blockstore.root().join(".mdns_enabled")
+}
+
+/// Charge le débrayage mDNS persisté — `None` si absent/illisible (le
+/// défaut, dans ce cas, dépend de l'appelant : `true` pour [`Node::open`],
+/// `false` pour tous les autres constructeurs, voir [`Node::build`]).
+fn load_mdns_enabled(blockstore: &Blockstore) -> Option<bool> {
+    std::fs::read_to_string(mdns_enabled_path(blockstore))
+        .ok()
+        .and_then(|s| s.trim().parse::<bool>().ok())
+}
+
+/// Persiste le débrayage mDNS.
+fn save_mdns_enabled(blockstore: &Blockstore, enabled: bool) -> CoreResult<()> {
+    std::fs::write(mdns_enabled_path(blockstore), enabled.to_string())?;
     Ok(())
 }
 
@@ -3808,7 +4111,7 @@ pub fn split_peer_id(mut addr: Multiaddr) -> CoreResult<(PeerId, Multiaddr)> {
     }
 }
 
-fn build_swarm(keypair: Keypair) -> CoreResult<Swarm<Behaviour>> {
+fn build_swarm(keypair: Keypair, mdns_enabled: bool) -> CoreResult<Swarm<Behaviour>> {
     let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
@@ -3817,10 +4120,16 @@ fn build_swarm(keypair: Keypair) -> CoreResult<Swarm<Behaviour>> {
             yamux::Config::default,
         )
         .map_err(|e| CoreError::Network(e.to_string()))?
+        .with_dns()
+        .map_err(|e| CoreError::Network(e.to_string()))?
         .with_relay_client(noise::Config::new, yamux::Config::default)
         .map_err(|e| CoreError::Network(e.to_string()))?
         .with_behaviour(|key, relay_client| {
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Behaviour::new(key, relay_client))
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Behaviour::new(
+                key,
+                relay_client,
+                mdns_enabled,
+            ))
         })
         .map_err(|e| CoreError::Network(e.to_string()))?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
@@ -3923,6 +4232,16 @@ impl EventLoop {
             }
             Command::AddAddress { peer, addr } => {
                 self.swarm.behaviour_mut().kademlia.add_address(&peer, addr);
+            }
+            Command::Bootstrap { tx } => {
+                let res = match self.swarm.behaviour_mut().kademlia.bootstrap() {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(e.to_string()),
+                };
+                let _ = tx.send(res);
+            }
+            Command::ConnectedPeers { tx } => {
+                let _ = tx.send(self.swarm.connected_peers().count());
             }
             Command::Provide { key, tx } => {
                 match self.swarm.behaviour_mut().kademlia.start_providing(key) {
@@ -4065,6 +4384,27 @@ impl EventLoop {
                     self.handle_feed_message(&message_id, &propagation_source, &message.data);
                 }
             }
+            SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
+                // Découverte locale (réseau physique) : peuple la table de
+                // routage Kademlia ET tente un dial best-effort — sans lui,
+                // un pair mDNS resterait connu mais jamais connecté tant
+                // qu'aucune requête Kademlia ne le sollicite.
+                for (peer, addr) in peers {
+                    self.swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .add_address(&peer, addr.clone());
+                    let opts = DialOpts::peer_id(peer)
+                        .addresses(vec![addr])
+                        .condition(PeerCondition::DisconnectedAndNotDialing)
+                        .build();
+                    let _ = self.swarm.dial(opts);
+                }
+            }
+            // `Expired` : rien à faire — libp2p-mdns retire déjà l'entrée de
+            // sa propre table interne, et une adresse Kademlia expirée sera
+            // simplement ignorée si elle redevient injoignable.
+            SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Expired(_))) => {}
             _ => {}
         }
     }
@@ -4360,7 +4700,7 @@ mod tests {
     #[test]
     fn kademlia_uses_champinium_protocol() {
         let key = Keypair::generate_ed25519();
-        let swarm = build_swarm(key).expect("build_swarm");
+        let swarm = build_swarm(key, false).expect("build_swarm");
         let names: Vec<String> = swarm
             .behaviour()
             .kademlia
@@ -4369,6 +4709,104 @@ mod tests {
             .map(|p| p.to_string())
             .collect();
         assert_eq!(names, vec![KAD_PROTOCOL.to_string()]);
+    }
+
+    #[test]
+    fn compiled_bootstraps_parse_and_ignore_invalid_lines() {
+        // Le fichier livré est vide (aucun bootstrap public) : aucune entrée.
+        assert!(compiled_bootstraps().is_empty());
+        assert_eq!(parse_bootstrap_lines("# c\n\n/ip4/1.2.3.4/tcp/4101/p2p/12D3KooWJtMRdnYaZgSyi3KTLaa5DN6mCAcpfwaTXgD1PHo997ej\nnimporte quoi\n").len(), 1);
+    }
+
+    /// `.bootstraps` sur disque n'est pas plus digne de confiance que le
+    /// fichier compilé : une entrée sans `/p2p/`, ou tout simplement
+    /// inanalysable, est ignorée (journalisée), et un fichier hors-borne est
+    /// tronqué à `MAX_BOOTSTRAPS` plutôt que dialer un nombre non borné
+    /// d'adresses à chaque démarrage.
+    #[test]
+    fn load_bootstraps_filters_invalid_and_truncates() {
+        let dir = tempfile::tempdir().unwrap();
+        let blockstore = Blockstore::open(dir.path().join("blocks")).unwrap();
+
+        let valid =
+            "/ip4/1.2.3.4/tcp/4101/p2p/12D3KooWJtMRdnYaZgSyi3KTLaa5DN6mCAcpfwaTXgD1PHo997ej";
+        let without_peer_id = "/ip4/5.6.7.8/tcp/4101";
+        let unparsable = "nimporte quoi";
+        let json = serde_json::to_string(&vec![valid, without_peer_id, unparsable]).unwrap();
+        std::fs::write(bootstraps_path(&blockstore), json).unwrap();
+        let loaded = load_bootstraps(&blockstore);
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.contains(&valid.parse::<Multiaddr>().unwrap()));
+
+        // 70 entrées valides mais distinctes (port différent par entrée pour
+        // que le `BTreeSet` ne les déduplique pas) → tronqué à MAX_BOOTSTRAPS.
+        let many: Vec<String> = (0..70)
+            .map(|i| {
+                format!(
+                    "/ip4/1.2.3.4/tcp/{}/p2p/12D3KooWJtMRdnYaZgSyi3KTLaa5DN6mCAcpfwaTXgD1PHo997ej",
+                    5000 + i
+                )
+            })
+            .collect();
+        let json = serde_json::to_string(&many).unwrap();
+        std::fs::write(bootstraps_path(&blockstore), json).unwrap();
+        assert_eq!(load_bootstraps(&blockstore).len(), MAX_BOOTSTRAPS);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn add_bootstrap_requires_peer_id_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open_isolated(dir.path()).await.unwrap();
+        assert!(node
+            .add_bootstrap("/ip4/127.0.0.1/tcp/4101".parse().unwrap())
+            .await
+            .is_err());
+        let addr: Multiaddr =
+            "/ip4/127.0.0.1/tcp/4101/p2p/12D3KooWJtMRdnYaZgSyi3KTLaa5DN6mCAcpfwaTXgD1PHo997ej"
+                .parse()
+                .unwrap();
+        node.add_bootstrap(addr.clone()).await.unwrap();
+        assert!(node.bootstraps().contains(&addr));
+        drop(node);
+        let node = Node::open_isolated(dir.path()).await.unwrap();
+        assert!(
+            node.bootstraps().contains(&addr),
+            "persisté dans .bootstraps"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bootstrap_joins_peer_and_populates_routing_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = Node::open_isolated(&dir.path().join("b")).await.unwrap();
+        let addr_b = b
+            .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        let cid = b.add(b"bloc de b").await.unwrap();
+        let a = Node::open_isolated(&dir.path().join("a")).await.unwrap();
+        a.listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        let full: Multiaddr = format!("{addr_b}/p2p/{}", b.peer_id()).parse().unwrap();
+        a.add_bootstrap(full).await.unwrap();
+        assert_eq!(a.bootstrap().await.unwrap(), 1);
+        // Sans aucun `connect` manuel : la table de routage connaît B.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if a.connected_peers().await.unwrap() >= 1
+                    && a.get_providers(cid)
+                        .await
+                        .map(|p| p.contains(&b.peer_id()))
+                        .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .expect("A doit joindre B par bootstrap");
     }
 
     /// Le point de commit du seed ne retient une publication que si l'émetteur
@@ -4479,7 +4917,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn denylist_issuers_persist_and_project_is_locked() {
         let dir = tempfile::tempdir().unwrap();
-        let node = Node::open(dir.path()).await.unwrap();
+        let node = Node::open_isolated(dir.path()).await.unwrap();
         let project = node
             .project_issuer()
             .expect("Node::open injecte l'éditeur projet");
@@ -4493,7 +4931,7 @@ mod tests {
         );
         drop(node);
 
-        let node = Node::open(dir.path()).await.unwrap();
+        let node = Node::open_isolated(dir.path()).await.unwrap();
         let issuers = node.denylist_issuers();
         assert_eq!(issuers.first(), Some(&project), "projet en tête");
         assert!(issuers.contains(&other), "souscription persistée");
@@ -5166,13 +5604,13 @@ mod tests {
     async fn cold_retrieval_toggle_persists_without_feature() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let node = Node::open(dir.path()).await.unwrap();
+            let node = Node::open_isolated(dir.path()).await.unwrap();
             assert!(node.cold_retrieval_enabled(), "défaut = actif");
             node.set_cold_retrieval(false).unwrap();
             assert!(!node.cold_retrieval_enabled());
         }
         // Réouverture : le dotfile .cold_enabled doit relire false.
-        let node = Node::open(dir.path()).await.unwrap();
+        let node = Node::open_isolated(dir.path()).await.unwrap();
         assert!(!node.cold_retrieval_enabled(), "persisté à la réouverture");
     }
 
@@ -5225,5 +5663,72 @@ mod tests {
         assert!(!session_dir.exists());
         assert!(node.stream_status(info.id).is_err());
         node.close_stream(info.id).await; // idempotent
+    }
+
+    /// Le débrayage mDNS (tâche 2) est lisible/modifiable et **persisté**
+    /// (dotfile `.mdns_enabled`, défaut actif) — même patron que
+    /// `cold_retrieval_toggle_persists_without_feature`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mdns_setting_persists_and_defaults_to_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(dir.path()).await.unwrap();
+        assert!(node.mdns_enabled());
+        node.set_mdns(false).unwrap();
+        drop(node);
+        let node = Node::open(dir.path()).await.unwrap();
+        assert!(!node.mdns_enabled());
+    }
+
+    /// Deux nœuds sur la même machine, AUCUN dial : mDNS les met en relation.
+    /// Peut être bloqué par un runner CI sans multicast → échéance généreuse
+    /// et message explicite (voir ledger si passage en #[ignore]).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "mDNS multicast indisponible sur certains runners — validé par le test manuel deux machines"]
+    async fn mdns_discovers_local_peer_without_dial() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Node::open(&dir.path().join("a")).await.unwrap();
+        let b = Node::open(&dir.path().join("b")).await.unwrap();
+        a.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        b.listen("/ip4/0.0.0.0/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(40), async {
+            loop {
+                if a.connected_peers().await.unwrap() >= 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+        .await
+        .expect("mDNS doit découvrir le pair local (multicast bloqué sur ce runner ?)");
+    }
+
+    /// mDNS désactivé : `Toggle::from(None)` ne doit ouvrir aucun socket
+    /// multicast — vérifié indirectement en s'assurant que `build_swarm`
+    /// avec `mdns_enabled = false` construit sans erreur et que le
+    /// comportement `mdns` est bien désactivé (`Toggle::is_enabled`).
+    #[test]
+    fn mdns_disabled_toggle_is_off() {
+        let key = Keypair::generate_ed25519();
+        let swarm = build_swarm(key, false).expect("build_swarm");
+        assert!(!swarm.behaviour().mdns.is_enabled());
+    }
+
+    /// Une multiadresse `/dns4/...` doit être acceptée par `dial` sans erreur
+    /// synchrone — la feature `dns` doit être branchée dans le transport
+    /// (`.with_dns()`), sinon `Swarm::dial` échouerait immédiatement faute de
+    /// transport capable de résoudre `/dns4/`.
+    #[tokio::test]
+    async fn dns_multiaddr_dials_without_sync_error() {
+        let key = Keypair::generate_ed25519();
+        let peer = PeerId::random();
+        let mut swarm = build_swarm(key, false).expect("build_swarm");
+        let addr: Multiaddr = format!("/dns4/localhost/tcp/1/p2p/{peer}").parse().unwrap();
+        swarm
+            .dial(addr)
+            .expect("dial /dns4/ ne doit pas échouer synchroniquement");
     }
 }

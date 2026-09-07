@@ -20,7 +20,7 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
   capacité absente, ils **ouvrent une demande de changement de contrat** (voir
   protocole plus bas) — ils ne contournent pas via du code natif ad hoc.
 
-### Contrat actuel — v13 (`CONTRACT_VERSION = 13`)
+### Contrat actuel — v14 (`CONTRACT_VERSION = 14`)
 
 > v1 → v2 : ajout de `subscribe_denylist(json) -> u64` sur `ChampiniumNode`
 > (modération fédérée activable depuis les fronts). Purement additif.
@@ -142,6 +142,27 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
 > (peer_id)` (async — `InvalidInput` sur l'éditeur projet), `denylist_link
 > (peer_id)` (sync), callback interface **`ModerationListener`**
 > (`on_moderation_updated()`) via `set_moderation_listener(listener)` (async).
+>
+> v13 → v14 : **découverte initiale** (ADR 0013). `bootstrap() -> u32`
+> (async — compose vers tous les bootstraps connus, best-effort, un dial
+> refusé n'est pas propagé, puis peuple la table de routage Kademlia ;
+> renvoie le nombre de bootstraps **dont le dial a été accepté** — la
+> connexion n'est pas garantie —, `0` si la liste est vide),
+> `connected_peers() -> u32` (async — nombre de pairs actuellement
+> connectés), `bootstraps() -> Vec<String>` (sync — bootstraps connus,
+> compilés ∪ persistés par l'utilisateur), `add_bootstrap(multiaddr)`
+> (async — ajoute un bootstrap persisté ; `multiaddr` sans composant
+> `/p2p/<peerid>`, ou borne de `MAX_BOOTSTRAPS` atteinte (sur l'union
+> dédupliquée — une adresse déjà connue est acceptée sans consommer de
+> marge) → `InvalidInput`, pas `Network` : le noyau le reporte en
+> `CoreError::Network`, remappé explicitement côté FFI), `mdns_enabled() ->
+> bool` (sync — la découverte mDNS locale est-elle active ? défaut vrai pour
+> un nœud ouvert via `Node::open`/`open_node`, c'est-à-dire les fronts et le
+> CLI ; défaut faux pour `champinium-seed`/`champinium-bootstrap`, qui
+> passent par `Node::new` et n'activent mDNS que si `.mdns_enabled` dit
+> explicitement `true`) et `set_mdns(enabled)` (sync — persiste le choix ;
+> **n'a d'effet qu'au prochain démarrage**, le socket multicast n'étant
+> ouvert/fermé qu'à la construction du swarm). Purement additif.
 
 Fonctions libres (smoke test async, conservées de v0) :
 
@@ -193,6 +214,12 @@ Objet **`ChampiniumNode`** (méthodes) :
 | `subscribe_denylist_issuer(link_or_peer_id) -> ()` | **async** | s'abonne à un éditeur de denylist (lien ou PeerId nu) : persiste + fetch immédiat en tâche de fond |
 | `unsubscribe_denylist_issuer(peer_id) -> ()` | **async** | se désabonne d'un éditeur de denylist ; `InvalidInput` sur l'éditeur projet |
 | `set_moderation_listener(listener) -> ()` | **async** | enregistre un `ModerationListener` (rafraîchissement réactif de la modération) |
+| `bootstrap() -> u32` | **async** | compose vers tous les bootstraps connus (best-effort), peuple la table de routage ; renvoie le nombre de dials **acceptés** (pas de connexions établies), `0` si liste vide |
+| `connected_peers() -> u32` | **async** | nombre de pairs actuellement connectés |
+| `bootstraps() -> Vec<String>` | sync | bootstraps connus (compilés ∪ persistés) |
+| `add_bootstrap(multiaddr) -> ()` | **async** | ajoute un bootstrap persisté ; sans `/p2p/<peerid>` ou borne atteinte (union dédupliquée) → `InvalidInput` |
+| `mdns_enabled() -> bool` | sync | la découverte mDNS locale est-elle active ? (défaut vrai pour `Node::open` — fronts, CLI — seulement ; faux sinon sauf `.mdns_enabled` explicite) |
+| `set_mdns(enabled) -> ()` | sync | active/désactive mDNS, persisté ; effet au **prochain démarrage** seulement |
 
 Records `FfiCatalogEntry { issuer, seq, cids, items, channel, seeded_count,
 total_count, pinned }`, `FfiContentItem { cid, title, tags }`,

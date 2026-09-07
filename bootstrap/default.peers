@@ -1,0 +1,4 @@
+# Bootstraps embarqués (une multiaddr /…/p2p/<peerid> par ligne, # = commentaire).
+# Compilée dans le binaire (include_str!). VIDE tant qu'aucun bootstrap public
+# n'est déployé — voir bootstrap/README.md pour en proposer un.
+# Exemple : /dns4/bootstrap.champinium.org/tcp/4101/p2p/12D3KooW…

@@ -621,11 +621,11 @@ async fn blocked_channels_persist_across_restart() {
     let dir = tempfile::tempdir().unwrap();
     let target = Keypair::generate_ed25519().public().to_peer_id();
     {
-        let node = Node::open(dir.path()).await.unwrap();
+        let node = Node::open_isolated(dir.path()).await.unwrap();
         node.block_channel(target).await.unwrap();
         assert_eq!(node.blocked_channels(), vec![target]);
     }
-    let node = Node::open(dir.path()).await.unwrap();
+    let node = Node::open_isolated(dir.path()).await.unwrap();
     assert_eq!(node.blocked_channels(), vec![target]);
 
     node.unblock_channel(target).unwrap();

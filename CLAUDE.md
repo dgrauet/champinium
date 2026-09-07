@@ -443,6 +443,36 @@ sur deux machines physiques.
   indice de racine (fournisseurs du manifeste, repli sur les fournisseurs du
   CID) ; `reprovide_all` exclut les segments indexés par le `SeedIndex`. CLI :
   `get <cid> --root <manifeste>`. **Contrat FFI inchangé.**
+- **Découverte initiale ✔ (ADR 0013)** : liste de bootstraps compilée
+  `bootstrap/default.peers` (`include_str!`, **vide** tant qu'aucun bootstrap
+  public n'est publié, **non signée** — le binaire est la confiance) ∪
+  bootstraps persistés par l'utilisateur (dotfile `.bootstraps`, borne
+  cumulée `MAX_BOOTSTRAPS = 64`). `Node::bootstrap()` compose vers la liste
+  effective puis déclenche `kademlia.bootstrap()` (`NoKnownPeers` journalisé,
+  pas fatal) ; appelé par les fronts et démons après `listen`, jamais par
+  `Node::open`/`new` (pas d'effet réseau implicite à la construction).
+  **mDNS** (`Toggle<mdns::tokio::Behaviour>`) découvre les pairs du même
+  réseau local sans rien coller, **actif par défaut pour `Node::open`**
+  (fronts, CLI) seulement — `champinium-seed` et `champinium-bootstrap` (via
+  `Node::new`) ne l'activent que si `.mdns_enabled` dit explicitement `true`,
+  débrayable par dotfile `.mdns_enabled` (effet au prochain démarrage) —
+  révèle la présence de ce nœud sur le LAN, documenté avec la même franchise
+  que le suivi actif ou le repli froid. **Transport DNS** (`with_dns()`) accepte désormais `/dns4/`,
+  `/dns6/`, `/dnsaddr/`. Observabilité : `Node::connected_peers()`,
+  `Node::bootstraps()`. **Contrat FFI v14** (`bootstrap()`/`connected_peers()`
+  async, `add_bootstrap(multiaddr)` async — `InvalidInput` sans `/p2p/` —,
+  `bootstraps()`/`mdns_enabled()`/`set_mdns(bool)` sync). CLI : `serve`
+  appelle `bootstrap()` après les dials `--bootstrap` et affiche les
+  compteurs ; nouvelle commande `bootstraps [--add <multiaddr>]` ;
+  `champinium-seed` et `champinium-bootstrap` appellent `bootstrap()` après
+  `listen`. Les trois fronts composent au démarrage après `listen`, affichent
+  « réseau : n pair(s) » et un interrupteur « Découverte sur le réseau local
+  (mDNS) » dans le volet réglages de seed. **Déviation assumée** :
+  `deny.toml` gagne deux ignores (`RUSTSEC-2026-0118`/`0119`, `hickory-proto`
+  transitif via `libp2p-dns`/`libp2p-mdns` — DoS côté client uniquement, à
+  lever quand libp2p bump vers hickory 0.26+) ; le test mDNS deux-nœuds est
+  `#[ignore]` (multicast bloqué sur les runners CI) → validation manuelle
+  deux-machines, voir [`docs/gui-demo.md`](docs/gui-demo.md).
 - **Packaging Linux — Flatpak ✔ (fonctionnel, palier gratuit)** : manifeste
   [`packaging/flatpak/org.champinium.Champinium.yml`](packaging/flatpak/org.champinium.Champinium.yml)
   (app-id `org.champinium.Champinium`, runtime GNOME 48, rustc via rustup au
@@ -468,8 +498,9 @@ entièrement **derrière une feature cargo opt-in `cold-storage`** (absente des
 builds par défaut). Sous la feature, **seul `reqwest` (HTTP pur) est ajouté —
 PAS de `rsa`** : `cargo deny` reste **propre sans aucun ignore ajouté**
 (l'advisory RUSTSEC-2023-0071 Marvin ne peut plus s'appliquer, `rsa` n'étant
-tirée par aucune configuration ; `deny.toml` ne porte que ses deux ignores
-préexistants bincode/paste). Livré :
+tirée par aucune configuration ; `deny.toml` ne portait alors que ses deux
+ignores préexistants bincode/paste — deux entrées hickory-proto s'y sont
+ajoutées depuis, ADR 0013, sans lien avec cette feature). Livré :
 - **Trait `ColdStore`** (`retrieve` seul), backend Arweave `ArweaveColdStore`
   (module `coldstore/`) : découverte GraphQL par tag CID + GET + **vérification
   CID** + bornage de taille. HTTP pur, aucune signature.
@@ -512,7 +543,8 @@ par clé + blocage local + signalements par channel ✔ ; aperçu de channel par
 lien ✔ (`resolve_channel`, contrat v9 ; partie B — scheme OS — ✔) ; durabilité
 du record de feed ✔ (`republish_known_feeds`) ; IPNS #21 close, voir ADR 0007 ;
 lecture progressive ✔ (ADR 0009) ; provenance déclarée ✔ (ADR 0010) ;
-modération réputationnelle ✔ (ADR 0011) ; hygiène DHT ✔ (ADR 0012)).
+modération réputationnelle ✔ (ADR 0011) ; hygiène DHT ✔ (ADR 0012) ;
+découverte initiale ✔ (ADR 0013)).
 Voir le spec.
 
 **Dernière release : voir `.release-please-manifest.json` / CHANGELOG** —
@@ -520,4 +552,4 @@ pas de version en dur ici, elle dérive (règle intendant DG006). Release-please
 gère le versionnement (`bump-minor-pre-major` actif :
 un breaking change bumpe la mineure tant qu'on est < 1.0.0 — la 1.0 sera un
 choix délibéré de stabilisation d'API). Versionnement du contrat FFI distinct :
-`CONTRACT_VERSION = 13` (voir `AGENTS.md`).
+`CONTRACT_VERSION = 14` (voir `AGENTS.md`).

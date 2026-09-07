@@ -215,6 +215,13 @@ enum Cmd {
         #[command(subcommand)]
         action: DenylistCmd,
     },
+    /// Affiche les bootstraps connus (compilés ∪ persistés) ; `--add` en
+    /// ajoute un nouveau, persisté (ADR 0013).
+    Bootstraps {
+        /// Adresse `/ip4/.../tcp/.../p2p/<peerid>` à ajouter.
+        #[arg(long)]
+        add: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -275,6 +282,8 @@ async fn main() -> Result<()> {
                 .listen(listen.parse().context("multiaddr d'écoute invalide")?)
                 .await?;
             connect_bootstraps(&node, &bootstrap).await?;
+            let dialed = node.bootstrap().await?;
+            println!("bootstrap : {dialed} dial(s) lancé(s)");
             // Annonce un feed du contenu déjà détenu, rediffusé périodiquement,
             // en réutilisant les métadonnées déjà déclarées pour chaque CID
             // connu (jamais d'écrasement d'une déclaration existante).
@@ -729,6 +738,21 @@ async fn main() -> Result<()> {
                 );
             }
         },
+        Cmd::Bootstraps { add } => {
+            let node = build_node(&cli.data_dir).await?;
+            if let Some(addr) = add {
+                let addr = addr.parse().context("multiaddr invalide")?;
+                node.add_bootstrap(addr).await?;
+            }
+            let bootstraps = node.bootstraps();
+            if bootstraps.is_empty() {
+                println!("(aucun bootstrap connu — voir bootstrap/README.md)");
+            } else {
+                for b in bootstraps {
+                    println!("{b}");
+                }
+            }
+        }
     }
     Ok(())
 }

@@ -151,6 +151,11 @@
                            Style="{StaticResource CaptionTextBlockStyle}"
                            Foreground="{ThemeResource TextFillColorTertiaryBrush}"
                            TextWrapping="NoWrap" />
+                <!-- Compteur de pairs connectés (amorçage + rafraîchissement
+                     périodique, voir NodeViewModel.RefreshPeerCountAsync). -->
+                <TextBlock Text="{Binding PeerCountText, Mode=OneWay}"
+                           Style="{StaticResource CaptionTextBlockStyle}"
+                           Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
             </StackPanel>
             <!-- Réglages de seed (lot c) : quota en Go + usage courant, en Flyout
                  pour rester cohérent avec la vue unique existante (pas de fenêtre
@@ -181,6 +186,15 @@
                             <ToggleSwitch Header="Récupération d'archive froide"
                                           IsOn="{Binding ColdRetrievalEnabled, Mode=TwoWay}" />
                             <TextBlock Text="Interroge une gateway d'archive par CID en dernier recours quand aucun pair ne fournit le contenu — révèle à la gateway l'intérêt de votre IP pour ce CID."
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                       TextWrapping="Wrap" />
+                            <!-- Découverte mDNS (LAN) : même patron que le Toggle de
+                                 récupération froide ci-dessus (MdnsEnabled/SetMdns sont
+                                 SYNC côté VM). -->
+                            <ToggleSwitch Header="Découverte sur le réseau local (mDNS)"
+                                          IsOn="{Binding MdnsEnabled, Mode=TwoWay}" />
+                            <TextBlock Text="Effet au prochain démarrage. Révèle la présence de ce nœud sur le réseau local."
                                        Style="{StaticResource CaptionTextBlockStyle}"
                                        Foreground="{ThemeResource TextFillColorTertiaryBrush}"
                                        TextWrapping="Wrap" />

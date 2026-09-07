@@ -224,6 +224,7 @@ public sealed class NodeViewModel : INotifyPropertyChanged
 
     private ChampiniumNode? _node;
     private Microsoft.UI.Dispatching.DispatcherQueue? _dispatcher;
+    private Microsoft.UI.Dispatching.DispatcherQueueTimer? _peerCountTimer;
     private CatalogRefresher? _listener;
     private SeedRefresher? _seedListener;
     private ModerationRefresher? _moderationListener;
@@ -263,6 +264,24 @@ public sealed class NodeViewModel : INotifyPropertyChanged
     {
         get => _listenAddr;
         private set => Set(ref _listenAddr, value);
+    }
+
+    /// <summary>Nombre de pairs connectés — rafraîchi après l'amorçage, à chaque
+    /// tic du catalogue et toutes les 10 s par <see cref="_peerCountTimer"/>.</summary>
+    private uint _peerCount;
+    public uint PeerCount => _peerCount;
+
+    public string PeerCountText => $"réseau : {PeerCount} pair(s)";
+
+    private void SetPeerCount(uint value)
+    {
+        if (_peerCount == value)
+        {
+            return;
+        }
+        _peerCount = value;
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(PeerCount)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(PeerCountText)));
     }
 
     /// <summary>Multiaddr du pair saisi par l'utilisateur (liaison TextBox).</summary>
@@ -408,6 +427,45 @@ public sealed class NodeViewModel : INotifyPropertyChanged
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ColdRetrievalEnabled)));
     }
 
+    /// <summary>Découverte mDNS sur le réseau local — effet au prochain démarrage.
+    /// Même patron que <see cref="ColdRetrievalEnabled"/> : <c>MdnsEnabled</c>/<c>SetMdns</c>
+    /// sont SYNC, le setter public sert exclusivement l'écriture utilisateur (liaison
+    /// <c>ToggleSwitch</c>), le peuplement initial passe par <see cref="SetMdnsState"/>.</summary>
+    private bool _mdnsEnabled;
+    public bool MdnsEnabled
+    {
+        get => _mdnsEnabled;
+        set
+        {
+            if (_node is null || _mdnsEnabled == value)
+            {
+                return;
+            }
+            try
+            {
+                _node.SetMdns(value);
+                SetMdnsState(value);
+            }
+            catch (Exception)
+            {
+                SubscriptionStatus = "mDNS: erreur";
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(MdnsEnabled)));
+            }
+        }
+    }
+
+    /// <summary>Peuple <see cref="MdnsEnabled"/> sans écrire vers la FFI —
+    /// utilisé au démarrage pour refléter l'état du core.</summary>
+    private void SetMdnsState(bool value)
+    {
+        if (_mdnsEnabled == value)
+        {
+            return;
+        }
+        _mdnsEnabled = value;
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(MdnsEnabled)));
+    }
+
     /// <summary>Affichage humain de l'usage courant (liaison TextBlock du popover de réglages).</summary>
     public string StorageStatsText =>
         $"Utilisé : {GigabytesText(_storageStats.usedBytes)} Go / {GigabytesText(_storageStats.quotaBytes)} Go";
@@ -502,6 +560,20 @@ public sealed class NodeViewModel : INotifyPropertyChanged
             RefreshCatalog();
             RefreshModeration();
             QuotaField = GigabytesText(_storageStats.quotaBytes);
+            SetMdnsState(node.MdnsEnabled());
+
+            // Amorçage best-effort : ne bloque jamais le démarrage de l'UI ni
+            // n'échoue de façon visible — le champ « Connecter » manuel reste
+            // le chemin de secours.
+            _ = BootstrapAsync(node);
+
+            _peerCountTimer = _dispatcher?.CreateTimer();
+            if (_peerCountTimer is not null)
+            {
+                _peerCountTimer.Interval = TimeSpan.FromSeconds(10);
+                _peerCountTimer.Tick += (_, _) => _ = RefreshPeerCountAsync();
+                _peerCountTimer.Start();
+            }
         }
         catch (Exception ex)
         {
@@ -512,6 +584,41 @@ public sealed class NodeViewModel : INotifyPropertyChanged
             // Débloque les attentes de démarrage, succès comme échec (voir
             // NodeReady) — sinon un lien reçu au lancement attendrait à jamais.
             _nodeReady.TrySetResult(_node is not null);
+        }
+    }
+
+    /// <summary>Amorçage best-effort après <see cref="StartAsync"/> — les échecs
+    /// sont avalés en silence (le champ « Connecter » manuel reste le chemin
+    /// de secours) ; rafraîchit le compteur de pairs une fois terminé.</summary>
+    private async Task BootstrapAsync(ChampiniumNode node)
+    {
+        try
+        {
+            await node.Bootstrap();
+        }
+        catch (Exception)
+        {
+            // best-effort — voir la doc ci-dessus.
+        }
+        await RefreshPeerCountAsync();
+    }
+
+    /// <summary>Relit le nombre de pairs connectés. Best-effort : une erreur
+    /// réseau laisse l'affichage précédent inchangé.</summary>
+    private async Task RefreshPeerCountAsync()
+    {
+        if (_node is null)
+        {
+            return;
+        }
+        try
+        {
+            var n = await _node.ConnectedPeers();
+            SetPeerCount(n);
+        }
+        catch (Exception)
+        {
+            // best-effort — voir la doc de BootstrapAsync.
         }
     }
 
@@ -584,6 +691,7 @@ public sealed class NodeViewModel : INotifyPropertyChanged
         }
 
         Status = $"catalogue: {ExploreGroups.Count} créateur(s), {SubscribedGroups.Count} souscrit(s)";
+        _ = RefreshPeerCountAsync();
     }
 
     private void Fill(ObservableCollection<ChannelGroup> target, IReadOnlyList<FfiCatalogEntry> entries, bool showPin, bool showBlock)

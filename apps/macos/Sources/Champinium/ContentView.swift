@@ -186,6 +186,8 @@ struct ContentView: View {
                 if !model.peerId.isEmpty {
                     Text("PeerId : \(model.peerId)").font(.caption2).foregroundStyle(.tertiary)
                 }
+                Text("réseau : \(model.peerCount) pair(s)").font(.caption2)
+                    .foregroundStyle(.tertiary)
             }
             Spacer()
             Button("Réglages de seed") {
@@ -309,6 +311,20 @@ struct ContentView: View {
             )
             .font(.caption)
             .foregroundStyle(.secondary)
+            Divider()
+            // Même patron que le Toggle de récupération froide ci-dessus :
+            // getter lit l'état peuplé au démarrage, setter seul chemin
+            // déclenchant `setMdns` — pas de write-on-load.
+            Toggle(
+                "Découverte sur le réseau local (mDNS)",
+                isOn: Binding(
+                    get: { model.mdnsEnabled },
+                    set: { newValue in Task { await setMdns(newValue) } }
+                )
+            )
+            Text("Effet au prochain démarrage. Révèle la présence de ce nœud sur le réseau local.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
         .padding()
         .frame(width: 260)
@@ -337,6 +353,14 @@ struct ContentView: View {
             try await model.setColdRetrieval(enabled)
         } catch {
             subscriptionStatus = "récupération froide: erreur"
+        }
+    }
+
+    private func setMdns(_ enabled: Bool) async {
+        do {
+            try await model.setMdns(enabled)
+        } catch {
+            subscriptionStatus = "mDNS: erreur"
         }
     }
 
