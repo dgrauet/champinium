@@ -325,6 +325,20 @@ struct ContentView: View {
             Text("Effet au prochain démarrage. Révèle la présence de ce nœud sur le réseau local.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            Divider()
+            // Même patron que les Toggle ci-dessus : getter lit l'état peuplé
+            // au démarrage, setter seul chemin déclenchant `setSeedWatched` —
+            // pas de write-on-load. Différence avec mDNS : effet immédiat.
+            Toggle(
+                "Conserver et resservir ce que je regarde",
+                isOn: Binding(
+                    get: { model.seedWatched },
+                    set: { newValue in Task { await setSeedWatched(newValue) } }
+                )
+            )
+            Text("Hors abonnement, sous le même quota ; évincé avant les abonnements.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
         .padding()
         .frame(width: 260)
@@ -361,6 +375,14 @@ struct ContentView: View {
             try await model.setMdns(enabled)
         } catch {
             subscriptionStatus = "mDNS: erreur"
+        }
+    }
+
+    private func setSeedWatched(_ enabled: Bool) async {
+        do {
+            try await model.setSeedWatched(enabled)
+        } catch {
+            subscriptionStatus = "seed de ce que je regarde: erreur"
         }
     }
 
@@ -448,6 +470,9 @@ struct ContentView: View {
                 HStack(spacing: 6) {
                     Text("seq \(entry.seq)").font(.caption2).foregroundStyle(.tertiary)
                     Text(seedStatus(for: entry)).font(.caption2).foregroundStyle(.tertiary)
+                    if tab == .explorer, watchedBadge(for: entry) {
+                        Text("· conservé").font(.caption2).foregroundStyle(.tertiary)
+                    }
                 }
             }
             Spacer()
@@ -473,6 +498,12 @@ struct ContentView: View {
             return "· à jour"
         }
         return "· seed en cours (\(entry.seededCount)/\(entry.totalCount))"
+    }
+
+    /// Badge « conservé » en vue Explorer : contenu retenu localement (seed
+    /// de ce que je regarde) sans abonnement au channel.
+    private func watchedBadge(for entry: FfiCatalogEntry) -> Bool {
+        !model.subscriptions.contains(entry.issuer) && entry.seededCount > 0
     }
 
     private func displayName(for entry: FfiCatalogEntry) -> String {

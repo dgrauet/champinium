@@ -80,6 +80,7 @@ final class NodeModel: ObservableObject {
     @Published var storageStats = FfiStorageStats(usedBytes: 0, quotaBytes: 0)
     @Published var coldRetrievalEnabled: Bool = true
     @Published var mdnsEnabled: Bool = true
+    @Published var seedWatched: Bool = false
     @Published var peerCount: UInt32 = 0
     @Published var player: AVPlayer?
     @Published var streamProgress: String = ""
@@ -140,6 +141,7 @@ final class NodeModel: ObservableObject {
             status = "nœud en ligne"
             refreshModeration()
             mdnsEnabled = node.mdnsEnabled()
+            seedWatched = node.seedWatched()
             // Amorçage best-effort : ne bloque jamais le démarrage de l'UI ni
             // n'échoue de façon visible — le champ « Connecter » manuel reste
             // le chemin de secours.
@@ -275,6 +277,14 @@ final class NodeModel: ObservableObject {
         guard let node else { return }
         try node.setMdns(enabled: enabled)
         mdnsEnabled = node.mdnsEnabled()
+    }
+
+    /// Active/désactive la conservation et le reservage de ce que ce nœud
+    /// regarde (hors abonnement). Effet immédiat, contrairement au mDNS.
+    func setSeedWatched(_ enabled: Bool) async throws {
+        guard let node else { return }
+        try node.setSeedWatched(enabled: enabled)
+        seedWatched = node.seedWatched()
     }
 
     /// Épingle un manifeste (exempté d'éviction par le seed proactif).
