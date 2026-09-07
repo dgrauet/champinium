@@ -20,7 +20,7 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
   capacité absente, ils **ouvrent une demande de changement de contrat** (voir
   protocole plus bas) — ils ne contournent pas via du code natif ad hoc.
 
-### Contrat actuel — v14 (`CONTRACT_VERSION = 14`)
+### Contrat actuel — v15 (`CONTRACT_VERSION = 15`)
 
 > v1 → v2 : ajout de `subscribe_denylist(json) -> u64` sur `ChampiniumNode`
 > (modération fédérée activable depuis les fronts). Purement additif.
@@ -163,6 +163,14 @@ La **surface UniFFI** du noyau (fonctions/types annotés `#[uniffi::export]` /
 > explicitement `true`) et `set_mdns(enabled)` (sync — persiste le choix ;
 > **n'a d'effet qu'au prochain démarrage**, le socket multicast n'étant
 > ouvert/fermé qu'à la construction du swarm). Purement additif.
+>
+> v14 → v15 : **persistance de la longue traîne**. `seed_watched() -> bool`
+> (sync — le seed de ce que l'utilisateur regarde, hors abonnement, est-il
+> actif ? défaut faux, persisté) et `set_seed_watched(enabled)` (sync —
+> active/désactive ; effet **immédiat** sur les prochaines lectures ; ce qui
+> est retenu vit sous le **même quota** que les abonnements et en est évincé
+> **en premier**, jamais épinglé, et n'entre à l'index que si l'émetteur est
+> identifié au catalogue). Purement additif.
 
 Fonctions libres (smoke test async, conservées de v0) :
 
@@ -220,6 +228,8 @@ Objet **`ChampiniumNode`** (méthodes) :
 | `add_bootstrap(multiaddr) -> ()` | **async** | ajoute un bootstrap persisté ; sans `/p2p/<peerid>` ou borne atteinte (union dédupliquée) → `InvalidInput` |
 | `mdns_enabled() -> bool` | sync | la découverte mDNS locale est-elle active ? (défaut vrai pour `Node::open` — fronts, CLI — seulement ; faux sinon sauf `.mdns_enabled` explicite) |
 | `set_mdns(enabled) -> ()` | sync | active/désactive mDNS, persisté ; effet au **prochain démarrage** seulement |
+| `seed_watched() -> bool` | sync | le seed de ce que l'utilisateur regarde (hors abonnement) est-il actif ? (défaut faux, persisté) |
+| `set_seed_watched(enabled) -> ()` | sync | active/désactive ; sous le même quota que les abonnements, évincé avant eux, jamais épinglé ; effet immédiat sur les prochaines lectures |
 
 Records `FfiCatalogEntry { issuer, seq, cids, items, channel, seeded_count,
 total_count, pinned }`, `FfiContentItem { cid, title, tags }`,

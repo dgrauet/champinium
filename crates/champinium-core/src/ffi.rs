@@ -472,6 +472,22 @@ impl ChampiniumNode {
         self.inner.set_mdns(enabled)?;
         Ok(())
     }
+
+    /// Le seed de ce que l'utilisateur regarde (hors abonnement) est-il actif ?
+    /// (persisté, désactivé par défaut).
+    pub fn seed_watched(&self) -> bool {
+        self.inner.seed_watched()
+    }
+
+    /// Active/désactive le seed de ce que l'utilisateur regarde. Conserver et
+    /// resservir ce que l'utilisateur regarde hors abonnement : sous le même
+    /// quota que les abonnements, évincé avant eux, jamais épinglé ; effet
+    /// immédiat sur les prochaines lectures ; n'entre à l'index que si
+    /// l'émetteur est identifié au catalogue.
+    pub fn set_seed_watched(&self, enabled: bool) -> Result<(), FfiError> {
+        self.inner.set_seed_watched(enabled)?;
+        Ok(())
+    }
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -935,7 +951,7 @@ mod tests {
             hits[0].provenance.mode,
             FfiProvenanceMode::Generated
         ));
-        assert_eq!(crate::contract_version(), 14);
+        assert_eq!(crate::contract_version(), 15);
     }
 
     /// Le listener enregistré est rappelé quand le catalogue change — c'est le
@@ -1611,7 +1627,7 @@ mod tests {
             node.subscribe_denylist_issuer("pas-un-peerid".into()).await,
             Err(FfiError::InvalidInput { .. })
         ));
-        assert_eq!(crate::contract_version(), 14);
+        assert_eq!(crate::contract_version(), 15);
     }
 
     /// Contrat v14 (ADR 0013) : découverte initiale — un nœud neuf n'a aucun
@@ -1643,6 +1659,10 @@ mod tests {
         node.set_mdns(false).unwrap();
         assert!(!node.mdns_enabled());
 
+        assert!(!node.seed_watched());
+        node.set_seed_watched(true).unwrap();
+        assert!(node.seed_watched());
+
         // Liste de bootstraps vide (nœud neuf, sans ajout) : `Ok(0)`, aucun
         // effet — `Node::bootstrap` documente ce cas (`kademlia.bootstrap()`
         // renvoie alors `NoKnownPeers`, journalisé mais pas propagé).
@@ -1652,7 +1672,7 @@ mod tests {
         assert!(fresh.bootstraps().is_empty());
         assert_eq!(fresh.bootstrap().await.unwrap(), 0);
 
-        assert_eq!(crate::contract_version(), 14);
+        assert_eq!(crate::contract_version(), 15);
     }
 
     async fn ffmpeg_available() -> bool {
