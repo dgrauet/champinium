@@ -9,15 +9,18 @@ use crate::blockstore::Blockstore;
 use crate::error::CoreError;
 use crate::ingest::HlsManifest;
 use crate::p2p::{Fetcher, StorePolicy};
+use crate::seeding::SeededPublication;
 use cid::Cid;
 use futures::future::BoxFuture;
+use libp2p::PeerId;
 use scheduler::{FailureCause, SegmentScheduler, SegmentState, RETRY_DELAY};
 use server::{LocalHttpServer, SegmentError, SegmentSource};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::{broadcast, watch, Notify};
+use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio::task::{JoinHandle, JoinSet};
 
 /// Résultat d'`open_stream` : l'URL à donner telle quelle au lecteur natif.
@@ -66,6 +69,29 @@ pub(crate) struct SessionState {
     /// boucle de seed enregistre alors la publication au `SeedIndex` sous
     /// quota (blocs déjà en cache → passe peu coûteuse).
     seed_wake: broadcast::Sender<()>,
+    /// Émetteur à indexer à la complétion pour une session `Seed` **hors
+    /// abonnement** (« seed de ce que je regarde », spec persistance §3).
+    /// `None` pour un channel souscrit : le round-robin du seed proactif le
+    /// visite déjà, un simple `seed_wake` suffit. `None` aussi quand aucun
+    /// émetteur n'est identifiable (manifeste hors catalogue).
+    issuer_to_index: Option<PeerId>,
+    /// Demande d'indexation immédiate d'une publication précise, adressée à
+    /// `seed_loop` — voir `Node::seed_now`.
+    seed_now: mpsc::Sender<(PeerId, Cid)>,
+    /// Jeton d'exclusion entre la **complétion** (qui veut émettre la demande
+    /// d'indexation) et la **fermeture** (qui veut purger les blocs non
+    /// indexés). `close_stream` arrête d'abord la boucle de récupération
+    /// (`abort_fetch`, attendu) avant de lire l'état ; le jeton couvre la
+    /// complétion qui aurait déjà émis sa demande juste avant cet arrêt.
+    ///
+    /// Qui pose le jeton décide, et une seule des deux issues a lieu : si la
+    /// complétion l'emporte, la fermeture ne purge rien (la demande est en
+    /// vol) ; si la fermeture l'emporte, une complétion tardive n'émet rien
+    /// (les blocs viennent d'être retirés, les réclamer ferait
+    /// re-télécharger une publication que l'utilisateur vient de fermer).
+    /// Une demande qui échoue à partir rend le jeton : elle est perdue pour
+    /// toujours, la purge redevient la bonne issue.
+    seed_claim: AtomicBool,
     /// Poignée faible sur soi-même : `SegmentSource::segment` prend `&self`
     /// mais doit rendre un futur `'static`. Posée juste après la construction
     /// de l'`Arc` (voir [`StreamSession::open`]).
@@ -77,6 +103,21 @@ impl SessionState {
         self.scheduler
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Tente de prendre le jeton `seed_claim`. `true` = la main est à
+    /// l'appelant (personne d'autre n'agira sur cette session).
+    fn claim_seed(&self) -> bool {
+        self.seed_claim
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Rend le jeton : l'action envisagée n'a pas pu aboutir (demande
+    /// d'indexation refusée par un canal saturé), l'autre issue redevient
+    /// possible.
+    fn release_seed(&self) {
+        self.seed_claim.store(false, Ordering::Release);
     }
 
     /// L'`expect` est sûr : le seul appelant est le serveur HTTP, arrêté (et
@@ -225,6 +266,8 @@ impl StreamSession {
         fetcher: Fetcher,
         events: broadcast::Sender<u64>,
         seed_wake: broadcast::Sender<()>,
+        issuer_to_index: Option<PeerId>,
+        seed_now: mpsc::Sender<(PeerId, Cid)>,
     ) -> Result<(Self, StreamSessionInfo), CoreError> {
         let segments = manifest
             .segments
@@ -247,6 +290,9 @@ impl StreamSession {
             changed,
             events,
             seed_wake,
+            issuer_to_index,
+            seed_now,
+            seed_claim: AtomicBool::new(false),
             me: Mutex::new(std::sync::Weak::new()),
         });
         *state
@@ -277,6 +323,86 @@ impl StreamSession {
     pub(crate) fn dir(&self) -> &Path {
         &self.state.dir
     }
+
+    /// Arrête la boucle de récupération et **attend qu'elle soit réellement
+    /// terminée**. À appeler avant [`StreamSession::take_close_action`] : sans
+    /// cela, un segment dont la récupération se termine entre l'énumération
+    /// des blocs à purger et l'`abort` du `Drop` serait écrit au blockstore
+    /// sans figurer dans cette liste — et, le jeton étant déjà pris, la
+    /// branche de complétion ne pourrait plus rien en faire. Il resterait
+    /// orphelin, hors index et hors quota : exactement la classe de fuite que
+    /// la fermeture des sessions regardées supprime.
+    pub(crate) async fn abort_fetch(&mut self) {
+        self.fetch_task.abort();
+        // `Cancelled` (cas nominal) ou panique de la tâche : rien à faire ici,
+        // seule sa terminaison compte.
+        let _ = (&mut self.fetch_task).await;
+    }
+
+    /// Ce que la fermeture de cette session doit faire de ses blocs (spec
+    /// persistance §4), en **prenant le jeton** `seed_claim` au passage.
+    ///
+    /// `None` quand il n'y a rien à décider : session non `Seed`, session
+    /// d'un channel souscrit (`issuer_to_index` vide — le seed proactif
+    /// complètera plus tard), ou demande d'indexation déjà partie (la
+    /// complétion a gagné la course, `seed_loop` en est désormais
+    /// responsable, purge comprise si le quota la refuse).
+    ///
+    /// `Some` sinon : l'appelant a la main et doit trancher selon
+    /// [`WatchedSessionClose::complete`]. À n'appeler qu'une fois, au moment
+    /// de fermer.
+    pub(crate) fn take_close_action(&self) -> Option<WatchedSessionClose> {
+        let issuer = self.state.issuer_to_index?;
+        if self.state.policy != StorePolicy::Seed || !self.state.claim_seed() {
+            return None;
+        }
+        // Seuls les segments RÉELLEMENT récupérés par CETTE session sont
+        // énumérés : purger la liste complète du manifeste effacerait des
+        // blocs que la session n'a jamais téléchargés et qui sont là pour une
+        // autre raison. Ce filtre ne protège en revanche PAS une seconde
+        // session ouverte sur le même manifeste — elle a récupéré les mêmes
+        // segments, donc l'ensemble énuméré ici recouvre le sien. Ce qui
+        // protège réellement des blocs, c'est la garde d'index de seed de
+        // `remove_unshared_blocks` (un bloc référencé par une publication
+        // indexée n'est jamais supprimé) et, en amont, la garde de pin de
+        // `settle_watched_session`.
+        let (complete, segment_cids) = {
+            let s = self.state.lock();
+            let fetched = (0..s.total())
+                .filter(|i| *s.state(*i) == SegmentState::Present)
+                .filter_map(|i| self.state.segments.get(i).map(Cid::to_string))
+                .collect();
+            (s.fetched() == s.total(), fetched)
+        };
+        Some(WatchedSessionClose {
+            issuer,
+            manifest_cid: self.state.manifest_cid,
+            complete,
+            publication: SeededPublication {
+                manifest_cid: self.state.manifest_cid.to_string(),
+                segment_cids,
+                // Nuls : la valeur ne sert qu'à énumérer des CIDs pour
+                // `remove_unshared_blocks`, jamais à entrer dans un index.
+                total_bytes: 0,
+                order: 0,
+            },
+        })
+    }
+}
+
+/// Verdict de fermeture d'une session **regardée** (`Seed` hors abonnement),
+/// rendu par [`StreamSession::take_close_action`].
+pub(crate) struct WatchedSessionClose {
+    pub(crate) issuer: PeerId,
+    pub(crate) manifest_cid: Cid,
+    /// Tous les segments ont été récupérés : la publication mérite d'entrer à
+    /// l'index, la demande d'indexation vaut d'être (ré)émise. Sinon, purge
+    /// directe — une session incomplète n'entrera jamais à l'index toute
+    /// seule et ses blocs grossiraient le magasin hors de toute
+    /// comptabilité de quota.
+    pub(crate) complete: bool,
+    /// Blocs à retirer si la demande d'indexation ne peut pas (ré)partir.
+    pub(crate) publication: SeededPublication,
 }
 
 /// Boucle de récupération d'une session. Ne détient **jamais** de `Node` (un
@@ -355,7 +481,33 @@ async fn fetch_loop(fetcher: Fetcher, state: Arc<SessionState>) {
                 let done = { let s = state.lock(); s.fetched() == s.total() };
                 if done && !completed_notified && state.policy == StorePolicy::Seed {
                     completed_notified = true;
-                    let _ = state.seed_wake.send(());
+                    match state.issuer_to_index {
+                        // Hors abonnement (« ce que je regarde ») : le
+                        // round-robin du seed proactif ne visiterait jamais
+                        // cet émetteur — on nomme la publication à indexer.
+                        // Le jeton départage une fermeture concurrente : si
+                        // elle l'a déjà pris, elle a purgé (ou va le faire),
+                        // réclamer l'indexation ferait re-télécharger.
+                        Some(issuer) if state.claim_seed() => {
+                            if state.seed_now.try_send((issuer, state.manifest_cid)).is_err() {
+                                // Perdue définitivement (canal saturé ou
+                                // fermé) : rendre le jeton, pour que la
+                                // fermeture purge des blocs qui, sinon,
+                                // resteraient au magasin hors index, hors
+                                // quota et jamais réannoncés.
+                                state.release_seed();
+                                tracing::debug!(
+                                    "session {}: demande d'indexation non transmise (canal saturé ou fermé)",
+                                    state.id
+                                );
+                            }
+                        }
+                        Some(_) => {}
+                        // Channel souscrit : le seed proactif s'en charge.
+                        None => {
+                            let _ = state.seed_wake.send(());
+                        }
+                    }
                 }
             }
             _ = state.wake.notified() => {}

@@ -222,6 +222,14 @@ enum Cmd {
         #[arg(long)]
         add: Option<String>,
     },
+    /// Affiche (et éventuellement définit) le seed de ce que l'utilisateur
+    /// regarde, hors abonnement (sous le même quota que les abonnements,
+    /// évincé avant eux, jamais épinglé ; effet immédiat).
+    SeedWatched {
+        /// `on` ou `off`.
+        #[arg(long)]
+        set: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -752,6 +760,23 @@ async fn main() -> Result<()> {
                     println!("{b}");
                 }
             }
+        }
+        Cmd::SeedWatched { set } => {
+            let node = build_node(&cli.data_dir).await?;
+            if let Some(value) = set {
+                let enabled = match value.to_lowercase().as_str() {
+                    "on" => true,
+                    "off" => false,
+                    other => anyhow::bail!("valeur invalide pour --set: {other} (attendu on|off)"),
+                };
+                node.set_seed_watched(enabled)?;
+            }
+            let state = if node.seed_watched() {
+                "activé"
+            } else {
+                "désactivé"
+            };
+            println!("seed de ce que je regarde : {state}");
         }
     }
     Ok(())

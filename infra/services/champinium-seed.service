@@ -14,7 +14,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=%h/.local/bin/champinium-seed --data-dir %h/.local/share/champinium --reprovide-interval 3600
+ExecStart=%h/.local/bin/champinium-seed --data-dir %h/.local/share/champinium
 Restart=on-failure
 RestartSec=10
 

@@ -824,6 +824,11 @@ fn channel_header_row(
             header_text.push_str(&format!(" · seed en cours ({seeded}/{total})"));
         }
     }
+    // Badge « conservé » (vue Explorer uniquement) : contenu retenu
+    // localement (seed de ce que je regarde) sans abonnement au channel.
+    if !subscribed && seeded > 0 {
+        header_text.push_str(" · conservé");
+    }
     let header = Label::new(Some(&header_text));
     header.set_xalign(0.0);
     header.add_css_class("heading");
@@ -1195,6 +1200,22 @@ fn open_seed_settings(ui: &Rc<Ui>, parent: &ApplicationWindow) {
     mdns_row.append(&mdns_label);
     mdns_row.append(&mdns_switch);
 
+    // Seed de ce que je regarde (hors abonnement) — même patron sync que les
+    // réglages ci-dessus (`seed_watched`/`set_seed_watched` sont sync).
+    // Contrairement au mDNS : effet immédiat, pas de « redémarrage requis ».
+    const SEED_WATCHED_HELP: &str =
+        "Hors abonnement, sous le même quota ; évincé avant les abonnements.";
+    let seed_watched_row = GtkBox::new(Orientation::Horizontal, 8);
+    let seed_watched_label = Label::new(Some("Conserver et resservir ce que je regarde"));
+    seed_watched_label.set_xalign(0.0);
+    seed_watched_label.set_hexpand(true);
+    seed_watched_label.set_tooltip_text(Some(SEED_WATCHED_HELP));
+    let seed_watched_switch = Switch::new();
+    seed_watched_switch.set_active(node.seed_watched());
+    seed_watched_switch.set_tooltip_text(Some(SEED_WATCHED_HELP));
+    seed_watched_row.append(&seed_watched_label);
+    seed_watched_row.append(&seed_watched_switch);
+
     let msg_label = Label::new(None);
     msg_label.set_xalign(0.0);
 
@@ -1203,6 +1224,7 @@ fn open_seed_settings(ui: &Rc<Ui>, parent: &ApplicationWindow) {
     content.append(&stats_label);
     content.append(&cold_row);
     content.append(&mdns_row);
+    content.append(&seed_watched_row);
     content.append(&msg_label);
     win.set_child(Some(&content));
 
@@ -1216,6 +1238,22 @@ fn open_seed_settings(ui: &Rc<Ui>, parent: &ApplicationWindow) {
             Ok(()) => glib::Propagation::Proceed,
             Err(e) => {
                 mdns_msg_label.set_text(&describe_core_error(&e, "mDNS"));
+                glib::Propagation::Stop
+            }
+        }
+    });
+
+    let seed_watched_ui = ui.clone();
+    let seed_watched_msg_label = msg_label.clone();
+    seed_watched_switch.connect_state_set(move |_, is_active| {
+        let Some(node) = seed_watched_ui.node.borrow().clone() else {
+            return glib::Propagation::Stop;
+        };
+        match node.set_seed_watched(is_active) {
+            Ok(()) => glib::Propagation::Proceed,
+            Err(e) => {
+                seed_watched_msg_label
+                    .set_text(&describe_core_error(&e, "seed de ce que je regarde"));
                 glib::Propagation::Stop
             }
         }

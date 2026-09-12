@@ -171,6 +171,30 @@ const FOLLOW_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// ([`Node::with_moderation_and_intervals`]), jamais par un setter posé après
 /// le `tokio::spawn`.
 const SEED_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// Intervalle de la maintenance réseau du nœud lui-même : réannonce des
+/// racines détenues ([`Node::reprovide_all`]) et republication des feeds
+/// connus ([`Node::republish_known_feeds`]). Une heure — ces deux passes
+/// existent contre l'expiration des records Kademlia (store de providers
+/// volatile, TTL des records de feed), pas contre un changement local, donc
+/// un rythme lent suffit et évite d'inonder la DHT.
+///
+/// Cette maintenance vivait auparavant **uniquement** dans le démon
+/// `champinium-seed` : un nœud GUI qui redémarrait ne réannonçait donc jamais
+/// ce qu'il seedait, et la longue traîne s'éteignait en silence chez tous les
+/// utilisateurs sans démon installé. Elle appartient désormais au nœud, qui la
+/// démarre à [`Node::listen`] — jamais à la construction : un nœud qui n'écoute
+/// pas n'est joignable par personne, l'annoncer serait un mensonge.
+///
+/// Même leçon que [`FOLLOW_INTERVAL`] : surchargeable au constructeur
+/// ([`Node::with_moderation_and_intervals`]), jamais par un setter posé après
+/// le `tokio::spawn`.
+pub const REPROVIDE_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Attente entre deux vérifications de connectivité tant que la maintenance
+/// n'a aucun pair à qui annoncer (voir [`maintenance_loop`]). Court exprès :
+/// c'est le délai entre la première connexion du nœud et son rattrapage de
+/// démarrage.
+const MAINTENANCE_PEER_RETRY: Duration = Duration::from_secs(2);
 
 /// Demande d'un bloc par CID (octets du CID).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -393,6 +417,18 @@ pub struct Node {
     /// de `catalog_events` : un changement de quota n'est pas un changement de
     /// catalogue.
     seed_wake: tokio::sync::broadcast::Sender<()>,
+    /// Demande d'indexation IMMÉDIATE d'une publication précise
+    /// `(émetteur, manifeste)`, adressée à `seed_loop` — distincte de
+    /// `seed_wake` (« repasse en revue les abonnements ») : ici l'émetteur
+    /// n'est justement PAS souscrit, le round-robin ne le visiterait jamais.
+    /// Émise par une session de lecture `Seed` hors abonnement à sa
+    /// complétion (spec persistance §3, « seed de ce que je regarde »).
+    seed_now: mpsc::Sender<(PeerId, Cid)>,
+    /// Réglage « conserver et resservir ce que je regarde » (spec persistance
+    /// §3), persisté (dotfile `.seed_watched`), **défaut inactif**.
+    /// Contrairement à `mdns_enabled`, l'effet est **immédiat** : il n'est lu
+    /// qu'à l'ouverture d'une session (`open_stream`).
+    seed_watched: Arc<AtomicBool>,
     /// Channels bloqués LOCALEMENT (tâche 3) : préférence strictement privée
     /// de ce nœud, jamais publiée ni signalée sur le réseau (même patron que
     /// `subscriptions`, dotfile `.blocked_channels`). Fusionné avec les clés
@@ -421,6 +457,15 @@ pub struct Node {
     /// lu directement : seul son compteur de références (via `Clone`) importe.
     #[allow(dead_code)]
     alive: Arc<()>,
+    /// Vrai dès que [`Node::listen`] a démarré la boucle de maintenance
+    /// ([`maintenance_loop`]). Partagé par toutes les poignées clonées : deux
+    /// `listen` (sur deux adresses, ou depuis deux clones) ne doivent démarrer
+    /// qu'**une** boucle — sinon chaque appel ajouterait une passe de
+    /// réannonce concurrente sur la même DHT.
+    maintenance_started: Arc<AtomicBool>,
+    /// Intervalle de la boucle de maintenance, fixé au constructeur (voir
+    /// [`REPROVIDE_INTERVAL`]).
+    reprovide_interval: Duration,
     cmd_tx: mpsc::Sender<Command>,
     /// Backend de repli de récupération froide (ADR 0008, CS-a tâche 3) —
     /// `None` par défaut : aucun câblage de production dans cette tâche, seule
@@ -566,6 +611,7 @@ impl Node {
             Moderation::new(),
             FOLLOW_INTERVAL,
             SEED_INTERVAL,
+            REPROVIDE_INTERVAL,
             Some(crate::moderation::project_issuer()?),
         )
         .await
@@ -585,6 +631,7 @@ impl Node {
             Moderation::new(),
             FOLLOW_INTERVAL,
             SEED_INTERVAL,
+            REPROVIDE_INTERVAL,
             Some(crate::moderation::project_issuer()?),
             true,
         )
@@ -607,6 +654,7 @@ impl Node {
             Moderation::new(),
             FOLLOW_INTERVAL,
             SEED_INTERVAL,
+            REPROVIDE_INTERVAL,
             Some(crate::moderation::project_issuer()?),
             false,
         )
@@ -652,20 +700,23 @@ impl Node {
             moderation,
             follow_interval,
             SEED_INTERVAL,
+            REPROVIDE_INTERVAL,
             None,
         )
         .await
     }
 
     /// Comme [`Node::with_moderation`], mais avec `follow_interval` (suivi de
-    /// channel) ET `seed_interval` (seed proactif, lot c) explicites plutôt
-    /// que les constantes de production [`FOLLOW_INTERVAL`]/[`SEED_INTERVAL`]
-    /// (5 min chacune, bien trop long pour un test). Réservé aux tests :
-    /// contrairement à un setter post-construction (qui entrerait en course
-    /// avec la toute première lecture de l'intervalle par la boucle
-    /// correspondante — voir le commentaire sur `FOLLOW_INTERVAL`), les deux
-    /// intervalles sont effectifs **avant** le `tokio::spawn` de leur boucle,
-    /// donc sans course possible.
+    /// channel), `seed_interval` (seed proactif, lot c) ET
+    /// `reprovide_interval` (maintenance réseau) explicites plutôt que les
+    /// constantes de production
+    /// [`FOLLOW_INTERVAL`]/[`SEED_INTERVAL`]/[`REPROVIDE_INTERVAL`] (bien trop
+    /// longues pour un test). Réservé aux tests : contrairement à un setter
+    /// post-construction (qui entrerait en course avec la toute première
+    /// lecture de l'intervalle par la boucle correspondante — voir le
+    /// commentaire sur `FOLLOW_INTERVAL`), les trois intervalles sont
+    /// effectifs **avant** le `tokio::spawn` de leur boucle, donc sans course
+    /// possible.
     ///
     /// `project_issuer` est l'éditeur de denylist non retirable de ce nœud :
     /// `Some(_)` pour [`Node::new`]/[`Node::open`] (clé projet compilée),
@@ -678,6 +729,7 @@ impl Node {
         moderation: Moderation,
         follow_interval: Duration,
         seed_interval: Duration,
+        reprovide_interval: Duration,
         project_issuer: Option<PeerId>,
     ) -> CoreResult<Self> {
         Self::build(
@@ -686,6 +738,7 @@ impl Node {
             moderation,
             follow_interval,
             seed_interval,
+            reprovide_interval,
             project_issuer,
             false,
         )
@@ -699,12 +752,20 @@ impl Node {
     /// les démons `champinium-seed`/`champinium-bootstrap` ainsi que toute la
     /// suite de tests) — un nœud ne démarre un socket multicast que si un
     /// dotfile explicite le demande.
+    // Corps commun privé de six constructeurs : chaque paramètre y est un
+    // réglage que l'un d'eux surcharge (les trois intervalles pour les tests,
+    // l'éditeur projet pour `new`/`open`, mDNS pour `open` vs
+    // `open_isolated`). Les regrouper dans une struct de config déplacerait le
+    // bruit d'un cran sans rien clarifier — la fonction n'est jamais appelée
+    // hors de ce bloc `impl`.
+    #[allow(clippy::too_many_arguments)]
     async fn build(
         keypair: Keypair,
         blockstore: Blockstore,
         moderation: Moderation,
         follow_interval: Duration,
         seed_interval: Duration,
+        reprovide_interval: Duration,
         project_issuer: Option<PeerId>,
         mdns_default: bool,
     ) -> CoreResult<Self> {
@@ -811,6 +872,13 @@ impl Node {
         let seed_quota = Arc::new(Mutex::new(seeding::load_seed_quota(&blockstore)));
         let (seed_events, _) = tokio::sync::broadcast::channel(64);
         let (seed_wake, _) = tokio::sync::broadcast::channel(16);
+        // Demandes d'indexation immédiate (sessions `Seed` hors abonnement).
+        // Canal borné et jamais attendu (`try_send` côté session) : saturer
+        // ne bloque jamais une lecture, au pire une publication regardée
+        // n'entre pas à l'index — dégradation acceptable pour un opt-in.
+        let (seed_now, seed_now_rx) = mpsc::channel(64);
+        // Défaut `false` : retenir hors abonnement consomme le quota.
+        let seed_watched = Arc::new(AtomicBool::new(load_seed_watched(&blockstore)));
 
         let alive = Arc::new(());
 
@@ -852,6 +920,7 @@ impl Node {
                 moderation: moderation.clone(),
                 catalog: catalog.clone(),
                 subscriptions: subscriptions.clone(),
+                blocked_channels: blocked_channels.clone(),
                 seed_index: seed_index.clone(),
                 seed_quota: seed_quota.clone(),
                 seed_events: seed_events.clone(),
@@ -862,6 +931,7 @@ impl Node {
             },
             catalog_events.subscribe(),
             seed_wake.subscribe(),
+            seed_now_rx,
             seed_interval,
         ));
 
@@ -896,11 +966,15 @@ impl Node {
             seed_quota,
             seed_events,
             seed_wake,
+            seed_now,
+            seed_watched,
             blocked_channels,
             denylist_issuers,
             project_issuer,
             moderation_events,
             alive,
+            maintenance_started: Arc::new(AtomicBool::new(false)),
+            reprovide_interval,
             cmd_tx,
             #[cfg(feature = "cold-storage")]
             cold: None,
@@ -1002,10 +1076,52 @@ impl Node {
     }
 
     /// Écoute sur `addr` ; renvoie l'adresse effectivement liée.
+    ///
+    /// Premier `listen` réussi = démarrage de la **maintenance réseau** du
+    /// nœud ([`maintenance_loop`] : réannonce des racines + republication des
+    /// feeds connus, toutes les [`REPROVIDE_INTERVAL`], première passe en
+    /// rattrapage de démarrage dès qu'un premier pair est connecté —
+    /// bootstrap, mDNS ou connexion manuelle). C'est ici et pas à la
+    /// construction : annoncer des racines depuis un nœud qui n'écoute sur
+    /// rien enverrait les pairs vers une adresse injoignable. Une seule boucle
+    /// quels que soient le nombre d'appels et de poignées clonées
+    /// (`maintenance_started`).
     pub async fn listen(&self, addr: Multiaddr) -> CoreResult<Multiaddr> {
         let (tx, rx) = oneshot::channel();
         self.send(Command::Listen { addr, tx }).await?;
-        rx.await.map_err(|_| CoreError::Shutdown)?
+        let bound = rx.await.map_err(|_| CoreError::Shutdown)??;
+        if !self.maintenance_started.swap(true, Ordering::SeqCst) {
+            tokio::spawn(maintenance_loop(
+                Arc::downgrade(&self.alive),
+                self.maintenance_state(),
+                self.reprovide_interval,
+            ));
+        }
+        Ok(bound)
+    }
+
+    /// Vrai si la boucle de maintenance a été démarrée (par un [`Node::listen`]
+    /// réussi). Réservé aux tests : sert à vérifier qu'un nœud qui n'écoute pas
+    /// n'a aucun effet réseau implicite.
+    #[doc(hidden)]
+    pub fn maintenance_started_for_tests(&self) -> bool {
+        self.maintenance_started.load(Ordering::SeqCst)
+    }
+
+    /// Fabrique l'état isolé de la boucle de maintenance (des `Arc` clonés,
+    /// jamais un `Node` — voir le commentaire sur [`Node::alive`]).
+    fn maintenance_state(&self) -> MaintenanceState {
+        MaintenanceState {
+            cmd_tx: self.cmd_tx.clone(),
+            blockstore: self.blockstore.clone(),
+            moderation: self.moderation.clone(),
+            catalog: self.catalog.clone(),
+            subscriptions: self.subscriptions.clone(),
+            seed_index: self.seed_index.clone(),
+            blocked_channels: self.blocked_channels.clone(),
+            denylist_issuers: self.denylist_issuers.clone(),
+            peer_id: self.peer_id,
+        }
     }
 
     /// Adresses d'écoute actuelles.
@@ -1685,17 +1801,38 @@ impl Node {
     /// Ouvre une session de lecture progressive : récupère et parse le
     /// manifeste (→ `Moderated`/`NotFound` sortent ici), démarre serveur et
     /// ordonnanceur, rend l'URL de la playlist VOD. Politique `Seed` si le
-    /// manifeste appartient à un channel souscrit (comme `fetch_hls`),
-    /// `Stream` sinon (cache de session éphémère, rien au blockstore).
+    /// manifeste appartient à un channel souscrit (comme `fetch_hls`) **ou**
+    /// si « seed de ce que je regarde » est actif et que l'émetteur est
+    /// identifiable au catalogue ; `Stream` sinon (cache de session éphémère,
+    /// rien au blockstore).
+    ///
+    /// **Sans émetteur, pas de seed** (spec persistance §3) : un manifeste
+    /// ouvert par CID nu qui n'apparaît dans aucune entrée du catalogue reste
+    /// en `Stream` même si le réglage est actif — l'index de seed est indexé
+    /// par émetteur, une publication sans émetteur n'aurait ni ligne dans
+    /// l'index, ni purge au désabonnement, ni étage d'éviction.
     pub async fn open_stream(&self, manifest_cid: Cid) -> CoreResult<StreamSessionInfo> {
-        let subscribed = self
-            .catalog_subscribed()
-            .into_iter()
-            .any(|e| e.cids.contains(&manifest_cid));
-        let policy = if subscribed {
+        // Émetteur retenu pour ce manifeste : un émetteur SOUSCRIT prime
+        // (voir [`Node::catalog_entry_for_manifest`]) — lister un CID ne
+        // prouve rien, et un tiers ne doit pas pouvoir faire retomber la
+        // lecture d'un abonnement en `Stream` en listant son manifeste.
+        let entry = self.catalog_entry_for_manifest(&manifest_cid);
+        let subscribed = entry
+            .as_ref()
+            .is_some_and(|e| self.subscriptions_snapshot().contains(&e.issuer));
+        // Regardé (hors abonnement) : retenu sous le MÊME quota, mais indexé
+        // par la session elle-même à sa complétion — le round-robin du seed
+        // proactif ne visite que les abonnements.
+        let watched = self.seed_watched() && !subscribed && entry.is_some();
+        let policy = if subscribed || watched {
             StorePolicy::Seed
         } else {
             StorePolicy::Stream
+        };
+        let issuer_to_index = if watched {
+            entry.as_ref().map(|e| e.issuer)
+        } else {
+            None
         };
         let bytes = self.get_with(manifest_cid, policy).await?;
         let manifest = HlsManifest::from_json(&bytes)?;
@@ -1711,6 +1848,8 @@ impl Node {
             self.fetcher(),
             self.stream_events.clone(),
             self.seed_wake.clone(),
+            issuer_to_index,
+            self.seed_now.clone(),
         )
         .await?;
         self.streams
@@ -1723,20 +1862,79 @@ impl Node {
 
     /// Ferme une session (idempotent) : serveur arrêté, boucle annulée,
     /// répertoire de session supprimé.
+    ///
+    /// **Purge des orphelins** (spec persistance §4) : une session `Seed`
+    /// **hors abonnement** (« ce que je regarde ») fermée AVANT sa complétion
+    /// n'entre jamais à l'index de seed — ses blocs déjà récupérés
+    /// grossiraient le magasin hors de toute comptabilité de quota. Ils sont
+    /// donc retirés ici, manifeste compris, sauf ceux qu'une publication
+    /// encore indexée référence (garde de `remove_unshared_blocks`). Une
+    /// session d'un channel **souscrit** garde son comportement : le seed
+    /// proactif complètera la publication plus tard.
     pub async fn close_stream(&self, id: u64) {
         let session = self
             .streams
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&id);
-        if let Some(session) = session {
+        if let Some(mut session) = session {
             let dir = session.dir().to_path_buf();
+            // Avant TOUTE lecture de l'état : une récupération qui se
+            // terminerait pendant l'énumération laisserait un bloc orphelin
+            // (voir `StreamSession::abort_fetch`).
+            session.abort_fetch().await;
+            let action = session.take_close_action();
             drop(session);
+            if let Some(action) = action {
+                self.settle_watched_session(action);
+            }
             if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
                 tracing::debug!("purge du répertoire de session {id}: {e}");
             }
             let _ = self.stream_events.send(id);
         }
+    }
+
+    /// Tranche le sort des blocs d'une session **regardée** qu'on ferme
+    /// (spec persistance §4). L'appelant détient le jeton de la session
+    /// (voir [`StreamSession::take_close_action`]), donc personne d'autre
+    /// n'agira sur ces blocs.
+    ///
+    /// Trois issues, dans cet ordre :
+    /// 1. **Rien** si la publication est déjà indexée (course gagnée par
+    ///    `seed_loop`) ou si son manifeste est **épinglé** — un pin n'a pas
+    ///    besoin d'une ligne d'index pour valoir ([`Node::pin_content`]
+    ///    épingle un manifeste qu'il soit retenu ou non), et « un manifeste
+    ///    épinglé n'est jamais évincé » vaut aussi ici.
+    /// 2. **Réémission** de la demande d'indexation si la session est
+    ///    complète : c'est le cas « je ferme l'app juste après la fin de la
+    ///    vidéo », où la session disparaît avant que `seed_loop` ait traité
+    ///    (ou même reçu) sa demande. Le `Node`, lui, détient l'émetteur du
+    ///    canal et survit à la session.
+    /// 3. **Purge** sinon : session incomplète, ou demande impossible à
+    ///    (ré)émettre — des blocs hors index, hors quota et jamais
+    ///    réannoncés ne doivent pas rester.
+    fn settle_watched_session(&self, action: stream::WatchedSessionClose) {
+        let settled = {
+            let idx = self
+                .seed_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let manifest = &action.publication.manifest_cid;
+            idx.contains_manifest(manifest) || idx.is_pinned(manifest)
+        };
+        if settled {
+            return;
+        }
+        if action.complete
+            && self
+                .seed_now
+                .try_send((action.issuer, action.manifest_cid))
+                .is_ok()
+        {
+            return;
+        }
+        remove_unshared_blocks(&self.blockstore, &self.seed_index, &[action.publication]);
     }
 
     /// État d'une session ; inconnue → `BlockNotFound` (mappé `NotFound`).
@@ -1872,6 +2070,33 @@ impl Node {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entries()
+    }
+
+    /// Entrée de catalogue qui revendique ce manifeste, s'il en existe une —
+    /// c'est ce qui donne un ÉMETTEUR à une publication lue, donc une ligne
+    /// possible dans l'index de seed (spec persistance §3).
+    ///
+    /// **Un émetteur SOUSCRIT prime sur tous les autres.** Lister un CID ne
+    /// prouve pas qu'on le possède (invariant anti-censure du lot d) :
+    /// n'importe quel pair peut publier un feed listant le manifeste d'un
+    /// tiers. Or `Catalog::entries()` dérive d'une `HashMap`, donc son ordre
+    /// n'est pas déterministe : élire « la première entrée trouvée » ferait
+    /// dépendre d'un aléa la politique de stockage d'une lecture
+    /// d'abonnement — un tiers qui liste le manifeste d'un créateur suivi
+    /// suffirait à faire retomber sa lecture en `Stream` une fois sur deux
+    /// (plus rien en cache, plus d'annonce). D'où le tri explicite ci-dessous.
+    fn catalog_entry_for_manifest(&self, manifest_cid: &Cid) -> Option<CatalogEntry> {
+        let candidates: Vec<CatalogEntry> = self
+            .catalog_entries()
+            .into_iter()
+            .filter(|e| e.cids.contains(manifest_cid))
+            .collect();
+        let subs = self.subscriptions_snapshot();
+        candidates
+            .iter()
+            .find(|e| subs.contains(&e.issuer))
+            .cloned()
+            .or_else(|| candidates.into_iter().next())
     }
 
     /// Instantané (non trié) des abonnements — usage interne (exemption de
@@ -2339,23 +2564,12 @@ impl Node {
     /// racine, ADR 0012 — manifestes, blocs nus et blocs non indexés restent
     /// annoncés). Indispensable au démarrage d'un seeder : le store de
     /// providers Kademlia est volatile, donc après un redémarrage les roots
-    /// détenus ne sont plus annoncés tant qu'on ne les republie pas. Renvoie
-    /// le nombre de roots réannoncés.
+    /// détenus ne sont plus annoncés tant qu'on ne les republie pas.
+    /// Best-effort racine par racine : un `provide` en échec est journalisé
+    /// et sauté, pas propagé — renvoie le nombre de roots RÉELLEMENT
+    /// réannoncés (`Ok(0)` si tous ont échoué).
     pub async fn reprovide_all(&self) -> CoreResult<usize> {
-        let segments = self
-            .seed_index
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .all_segment_cids();
-        let mut count = 0usize;
-        for cid in self.blockstore.list()? {
-            if segments.contains(&cid.to_string()) {
-                continue;
-            }
-            self.provide(cid).await?;
-            count += 1;
-        }
-        Ok(count)
+        reprovide_all_inner(&self.maintenance_state()).await
     }
 
     /// Réannonce dans la DHT les feeds SIGNÉS que ce nœud détient
@@ -2383,71 +2597,7 @@ impl Node {
     /// juste envoyé à la boucle réseau) ; renvoie le nombre de feeds pour
     /// lesquels un PUT a été émis.
     pub async fn republish_known_feeds(&self) -> CoreResult<usize> {
-        let subs = self.subscriptions_snapshot();
-        let to_republish: Vec<(PeerId, Vec<u8>)> = {
-            let catalog = self
-                .catalog
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            catalog
-                .issuers()
-                .filter(|issuer| **issuer == self.peer_id || subs.contains(*issuer))
-                .filter(|issuer| {
-                    !is_key_blocked_inner(&self.moderation, &self.blocked_channels, issuer)
-                })
-                .filter_map(|issuer| {
-                    let data = catalog.feed_for(issuer)?.to_json().ok()?.into_bytes();
-                    Some((*issuer, data))
-                })
-                .collect()
-        };
-
-        let mut count = 0usize;
-        for (issuer, data) in to_republish {
-            let (tx, _rx) = oneshot::channel();
-            let _ = self
-                .cmd_tx
-                .send(Command::PutRecord {
-                    key: feed_record_key(&issuer),
-                    value: data,
-                    tx,
-                })
-                .await;
-            count += 1;
-        }
-
-        // Denylists : même problème de durabilité que les feeds (le record
-        // Kademlia d'un éditeur hors ligne s'éteint à son TTL), même remède —
-        // chaque nœud qui suit un éditeur reprovisionne sa liste. Seules les
-        // listes en cache d'un éditeur ENCORE souscrit sont republiées : un
-        // cache orphelin ne doit pas être réinjecté dans le réseau.
-        let subscribed_editors: BTreeSet<PeerId> = self
-            .denylist_issuers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        for list in crate::moderation::load_cached_lists(self.blockstore.root()) {
-            let Ok(issuer) = list.issuer_peer_id() else {
-                continue;
-            };
-            if !subscribed_editors.contains(&issuer) {
-                continue;
-            }
-            let Ok(value) = serde_json::to_vec(&list) else {
-                continue;
-            };
-            let (tx, _rx) = oneshot::channel();
-            let _ = self
-                .cmd_tx
-                .send(Command::PutRecord {
-                    key: denylist_record_key(&issuer),
-                    value,
-                    tx,
-                })
-                .await;
-            count += 1;
-        }
-        Ok(count)
+        republish_known_feeds_inner(&self.maintenance_state()).await
     }
 
     /// Annonce que ce nœud fournit `cid`. **Ne fait rien** si le CID est bloqué :
@@ -2600,6 +2750,26 @@ impl Node {
     pub fn set_mdns(&self, enabled: bool) -> CoreResult<()> {
         self.mdns_enabled.store(enabled, Ordering::Relaxed);
         save_mdns_enabled(&self.blockstore, enabled)
+    }
+
+    /// État courant du réglage « conserver et resservir ce que je regarde »
+    /// (spec persistance §3). **Défaut inactif** : hors abonnement, une
+    /// lecture ne laisse rien au magasin tant que l'utilisateur ne l'a pas
+    /// demandé.
+    pub fn seed_watched(&self) -> bool {
+        self.seed_watched.load(Ordering::Relaxed)
+    }
+
+    /// Active/désactive le seed de ce qui est regardé et persiste le choix
+    /// (dotfile `.seed_watched`). Contrairement à [`Node::set_mdns`], l'effet
+    /// est **immédiat** : le réglage n'est lu qu'à l'ouverture d'une session
+    /// ([`Node::open_stream`]), donc la prochaine lecture l'applique déjà.
+    /// Désactiver n'efface rien de ce qui a déjà été retenu — le quota et
+    /// l'éviction s'en chargent (une publication regardée, non épinglée, part
+    /// avant celles des abonnements).
+    pub fn set_seed_watched(&self, enabled: bool) -> CoreResult<()> {
+        self.seed_watched.store(enabled, Ordering::Relaxed);
+        save_seed_watched(&self.blockstore, enabled)
     }
 
     /// Configure le backend [`ColdStore`] de **repli de récupération** — point
@@ -2782,6 +2952,28 @@ fn load_mdns_enabled(blockstore: &Blockstore) -> Option<bool> {
 /// Persiste le débrayage mDNS.
 fn save_mdns_enabled(blockstore: &Blockstore, enabled: bool) -> CoreResult<()> {
     std::fs::write(mdns_enabled_path(blockstore), enabled.to_string())?;
+    Ok(())
+}
+
+/// Chemin du réglage « seed de ce que je regarde » persisté (spec
+/// persistance §3), à côté des blocs — même patron que `.mdns_enabled`.
+fn seed_watched_path(blockstore: &Blockstore) -> PathBuf {
+    blockstore.root().join(".seed_watched")
+}
+
+/// Charge le réglage « seed de ce que je regarde » — **défaut `false`** :
+/// retenir hors abonnement consomme le quota de l'utilisateur, ça ne
+/// s'active que sur un choix explicite (absent/illisible → désactivé).
+fn load_seed_watched(blockstore: &Blockstore) -> bool {
+    std::fs::read_to_string(seed_watched_path(blockstore))
+        .ok()
+        .and_then(|s| s.trim().parse::<bool>().ok())
+        .unwrap_or(false)
+}
+
+/// Persiste le réglage « seed de ce que je regarde ».
+fn save_seed_watched(blockstore: &Blockstore, enabled: bool) -> CoreResult<()> {
+    std::fs::write(seed_watched_path(blockstore), enabled.to_string())?;
     Ok(())
 }
 
@@ -3586,6 +3778,10 @@ struct SeedLoopState {
     moderation: Arc<RwLock<Moderation>>,
     catalog: Arc<Mutex<Catalog>>,
     subscriptions: Arc<Mutex<BTreeSet<PeerId>>>,
+    /// Channels bloqués localement : seule invalidation possible d'une
+    /// publication **regardée** hors abonnement au point de commit (un
+    /// abonnement, lui, se lit dans `subscriptions`).
+    blocked_channels: Arc<Mutex<BTreeSet<PeerId>>>,
     seed_index: Arc<Mutex<SeedIndex>>,
     seed_quota: Arc<Mutex<u64>>,
     seed_events: tokio::sync::broadcast::Sender<()>,
@@ -3626,6 +3822,16 @@ struct SeedLoopState {
 /// `quota_blocked` par l'appelant, ce qui fixe le résultat de la passe
 /// (premier arrivé, premier servi) jusqu'au prochain évènement catalogue/quota.
 async fn make_room_for(state: &SeedLoopState, extra: u64, candidate_replication: usize) -> bool {
+    // Étage d'éviction (spec persistance §5) : les publications d'émetteurs
+    // non souscrits partent avant celles des abonnements. Relu à chaque appel
+    // — un désabonnement en cours de passe doit compter tout de suite.
+    let subscribed: HashSet<String> = state
+        .subscriptions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .map(PeerId::to_string)
+        .collect();
     let quota = *state
         .seed_quota
         .lock()
@@ -3649,7 +3855,7 @@ async fn make_room_for(state: &SeedLoopState, extra: u64, candidate_replication:
                 .seed_index
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            eviction_order(&idx, &HashMap::new())
+            eviction_order(&idx, &HashMap::new(), &subscribed)
                 .into_iter()
                 .map(|p| p.manifest_cid.clone())
                 .collect()
@@ -3675,7 +3881,7 @@ async fn make_room_for(state: &SeedLoopState, extra: u64, candidate_replication:
                 .seed_index
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            eviction_order(&idx, &replication)
+            eviction_order(&idx, &replication, &subscribed)
                 .first()
                 .map(|p| p.manifest_cid.clone())
         };
@@ -3723,19 +3929,33 @@ fn evict_publication(state: &SeedLoopState, manifest_cid: &str) {
 /// magasin — pas d'accumulation silencieuse hors comptabilité.
 /// Décision du point de commit du seed proactif, isolée en fonction PURE pour
 /// être testable sans simuler la course TOCTOU (finding revue finale lot d) :
-/// une publication fraîchement seedée n'est committée à l'index QUE si son
-/// émetteur est toujours abonné ET n'est pas banni par denylist. Le ban prime
-/// sur l'abonnement (`subscribe_denylist` ne désabonne pas — sans ce «&& !banni»
-/// une publication d'une clé bannie en cours de seed survivrait à la purge) ;
-/// le blocage local est déjà couvert par l'abonnement (`block_channel` désabonne).
-fn seed_still_wanted(subscribed: bool, key_banned: bool) -> bool {
-    subscribed && !key_banned
+/// une publication fraîchement seedée n'est committée à l'index QUE si
+/// l'intention qui la justifiait tient toujours (`wanted_by_intent`) ET que
+/// son émetteur n'est pas banni par denylist. Le ban prime sur l'intention
+/// (`subscribe_denylist` ne désabonne pas — sans ce «&& !banni» une
+/// publication d'une clé bannie en cours de seed survivrait à la purge).
+///
+/// `wanted_by_intent` dépend de l'origine, calculé par l'appelant : pour le
+/// seed proactif c'est « toujours abonné » (le blocage local est couvert,
+/// `block_channel` désabonne) ; pour une publication **regardée** hors
+/// abonnement (spec persistance §3) c'est « pas bloqué localement », l'unique
+/// signal d'invalidation dont dispose ce chemin.
+fn seed_still_wanted(wanted_by_intent: bool, key_banned: bool) -> bool {
+    wanted_by_intent && !key_banned
 }
 
+/// Corps du seed d'une publication (voir la doc de [`seed_still_wanted`]).
+///
+/// `watched` distingue les deux origines : `false` = passe du seed proactif
+/// sur un channel **souscrit** ; `true` = publication **regardée** hors
+/// abonnement (spec persistance §3), dont la légitimité ne vient pas d'un
+/// abonnement mais de la lecture elle-même — le point de commit ci-dessous en
+/// tient compte.
 async fn seed_publication(
     state: &SeedLoopState,
     issuer: PeerId,
     manifest_cid: Cid,
+    watched: bool,
 ) -> CoreResult<()> {
     // Réplication du candidat lui-même, mesurée UNE fois et réutilisée pour
     // tout le reste de cette tentative (manifeste + chaque segment) — le
@@ -3749,7 +3969,7 @@ async fn seed_publication(
         // Même le manifeste ne rentre pas et rien n'est évictable (ou rien
         // d'assez répliqué pour justifier une éviction) : on ne tente même
         // pas la récupération réseau.
-        mark_quota_blocked(state, manifest_cid);
+        skip_for_quota(state, manifest_cid, watched);
         return Ok(());
     }
     let manifest_bytes = get_with_inner(
@@ -3781,13 +4001,21 @@ async fn seed_publication(
                 return Err(CoreError::Cid(e));
             }
         };
-        if !state.blockstore.has(&cid)
-            && !make_room_for(state, fetched_bytes, candidate_replication).await
-        {
+        // Quota vérifié pour CHAQUE segment, qu'il soit déjà local ou non :
+        // une publication **regardée** a tous ses blocs en place (la session
+        // les a récupérés en `Seed`), donc une garde `!has(&cid)` ici
+        // court-circuiterait tout contrôle et laisserait le quota dépassé de
+        // la taille d'une publication entière. Ce n'est pas un contrôle
+        // gratuit sur le chemin proactif non plus : un segment déjà présent
+        // pèse le même poids une fois la publication indexée. Seule la
+        // récupération RÉSEAU reste conditionnée à l'absence du bloc, et
+        // `get_with_inner` s'en charge lui-même (il rend les octets locaux
+        // sans toucher au réseau quand le bloc est déjà là).
+        if !make_room_for(state, fetched_bytes, candidate_replication).await {
             // Plus de place et rien à évincer : publication sautée, on
             // nettoie ce qui a été récupéré pour elle jusqu'ici.
             remove_unindexed_fetch(state, &fetched_cids);
-            mark_quota_blocked(state, manifest_cid);
+            skip_for_quota(state, manifest_cid, watched);
             return Ok(());
         }
         match get_with_inner(
@@ -3836,11 +4064,22 @@ async fn seed_publication(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .is_blocked_key(&issuer);
     let committed = {
-        let subs = state
-            .subscriptions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !seed_still_wanted(subs.contains(&issuer), key_banned) {
+        // Origine `watched` : l'émetteur n'est PAS souscrit par définition —
+        // ce qui invaliderait la publication ici est un blocage décidé
+        // pendant la récupération. `is_key_blocked_inner` est le helper
+        // unique de cette règle (blocage local ET ban de clé fusionnés), le
+        // même qu'aux autres checkpoints : le dupliquer ici ferait un
+        // troisième endroit à maintenir si la règle évolue.
+        let wanted_by_intent = if watched {
+            !is_key_blocked_inner(&state.moderation, &state.blocked_channels, &issuer)
+        } else {
+            state
+                .subscriptions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&issuer)
+        };
+        if !seed_still_wanted(wanted_by_intent, key_banned) {
             false
         } else {
             let mut idx = state
@@ -3867,7 +4106,8 @@ async fn seed_publication(
         }
     };
     if !committed {
-        // L'émetteur n'est plus suivi : la tentative est abandonnée et ses
+        // L'émetteur n'est plus voulu (désabonné, bloqué ou banni) : la
+        // tentative est abandonnée et ses
         // blocs non indexés sont retirés (ceux partagés avec une publication
         // indexée survivent via la garde `all_cids` de `remove_unindexed_fetch`).
         remove_unindexed_fetch(state, &fetched_cids);
@@ -3875,6 +4115,20 @@ async fn seed_publication(
     }
     let _ = state.seed_events.send(());
     Ok(())
+}
+
+/// Publication sautée faute de place évictable. Seul le chemin PROACTIF
+/// mémorise le manifeste dans `quota_blocked` : c'est `seed_channel` qui
+/// consulte cet ensemble, à chaque passe de round-robin, pour ne pas
+/// re-fetcher-puis-annuler la même publication condamnée. Une publication
+/// **regardée** n'est jamais retentée d'elle-même (elle n'arrive que par une
+/// demande nommée de session) — l'y inscrire ne servirait à rien et ferait
+/// grossir un ensemble non borné pour rien ; c'est
+/// [`seed_watched_publication`] qui purge ses blocs.
+fn skip_for_quota(state: &SeedLoopState, manifest_cid: Cid, watched: bool) {
+    if !watched {
+        mark_quota_blocked(state, manifest_cid);
+    }
 }
 
 /// Mémorise qu'une publication a été sautée faute de place évictable, pour
@@ -3945,7 +4199,7 @@ async fn seed_channel(state: &SeedLoopState, issuer: PeerId) {
         if known_blocked {
             continue;
         }
-        if let Err(e) = seed_publication(state, issuer, manifest_cid).await {
+        if let Err(e) = seed_publication(state, issuer, manifest_cid, false).await {
             tracing::debug!("seed proactif: échec pour {manifest_cid} ({issuer}): {e}");
         }
     }
@@ -3981,11 +4235,15 @@ async fn seed_pass(state: &SeedLoopState, round_robin: usize) -> usize {
 /// `Node::set_seed_quota`). Comme `follow_loop` : la toute première passe a
 /// lieu AVANT toute attente (rattrapage au démarrage), et la boucle ne tient
 /// qu'un [`Weak`] marqueur de vivacité — jamais un `Node` fort.
+/// La branche `seed_now` sert le « seed de ce que je regarde » (spec
+/// persistance §3) : une publication NOMMÉE, d'un émetteur non souscrit, que
+/// le round-robin ne visiterait jamais.
 async fn seed_loop(
     alive: Weak<()>,
     state: SeedLoopState,
     mut catalog_events: tokio::sync::broadcast::Receiver<()>,
     mut seed_wake: tokio::sync::broadcast::Receiver<()>,
+    mut seed_now: mpsc::Receiver<(PeerId, Cid)>,
     seed_interval: Duration,
 ) {
     let mut round_robin: usize = 0;
@@ -4008,6 +4266,286 @@ async fn seed_loop(
             _ = seed_wake.recv() => {
                 state.quota_blocked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
             }
+            Some((issuer, manifest_cid)) = seed_now.recv() => {
+                seed_watched_publication(&state, issuer, manifest_cid).await;
+            }
+        }
+    }
+}
+
+/// Indexe une publication **regardée** hors abonnement, à la complétion de sa
+/// session de lecture (spec persistance §3). Les blocs sont déjà locaux (la
+/// session les a récupérés en `Seed`) : `seed_publication` n'y ajoute que la
+/// comptabilité de quota — et l'éviction si le quota est déjà plein.
+///
+/// **Purge des orphelins** : si la publication n'est PAS entrée à l'index
+/// (quota infranchissable, émetteur bloqué/banni entre-temps), ses blocs
+/// resteraient au magasin hors de toute comptabilité. `seed_publication` ne
+/// nettoie que ce qu'elle a elle-même récupéré ; ici les blocs viennent de la
+/// SESSION, d'où la purge de secours ci-dessous.
+async fn seed_watched_publication(state: &SeedLoopState, issuer: PeerId, manifest_cid: Cid) {
+    // Segments capturés AVANT toute tentative, et c'est essentiel : quand
+    // `seed_publication` abandonne en cours de boucle (quota franchi au
+    // segment `i`, CID illisible, refus de modération), elle retire les blocs
+    // qu'elle avait engagés — **manifeste compris**. Relire le manifeste
+    // après coup ne rendrait donc plus rien, et les segments `i..n`, locaux
+    // depuis la session et jamais touchés par ce rollback, resteraient au
+    // magasin pour toujours : hors index, hors quota, jamais réannoncés.
+    // Le manifeste est local par construction sur ce chemin (la session l'a
+    // récupéré en `Seed`), la lecture ne coûte rien.
+    let segment_cids: Vec<String> = state
+        .blockstore
+        .get(&manifest_cid)
+        .ok()
+        .and_then(|bytes| HlsManifest::from_json(&bytes).ok())
+        .map(|m| m.segments.iter().map(|s| s.cid.clone()).collect())
+        .unwrap_or_default();
+
+    if let Err(e) = seed_publication(state, issuer, manifest_cid, true).await {
+        tracing::debug!("indexation de la publication regardée {manifest_cid}: {e}");
+    }
+    // Épinglé = jamais évincé (invariant du lot c), même sans ligne d'index :
+    // `pin_content` épingle un manifeste qu'il soit retenu ou non.
+    let settled = {
+        let idx = state
+            .seed_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let manifest = manifest_cid.to_string();
+        idx.contains_manifest(&manifest) || idx.is_pinned(&manifest)
+    };
+    if settled {
+        return;
+    }
+    // `remove_unshared_blocks` épargne ce qu'une publication encore indexée
+    // référence, et retire le bloc du manifeste lui-même (déjà parti, le cas
+    // échéant — la suppression est idempotente).
+    remove_unshared_blocks(
+        &state.blockstore,
+        &state.seed_index,
+        &[SeededPublication {
+            manifest_cid: manifest_cid.to_string(),
+            segment_cids,
+            total_bytes: 0,
+            order: 0,
+        }],
+    );
+}
+
+/// Tout ce qu'il faut pour réannoncer les racines et republier les feeds
+/// **sans** détenir une poignée `Node`. Même raison d'être que
+/// [`SeedLoopState`] et [`ModerationState`] : une tâche de fond qui clonerait
+/// un `Node` retiendrait son `cmd_tx` fort et la boucle d'évènements ne
+/// s'arrêterait jamais (voir le commentaire sur `Node::alive`). `Node` en
+/// fabrique un à la demande (`Node::maintenance_state`) et les méthodes
+/// publiques [`Node::reprovide_all`]/[`Node::republish_known_feeds`] délèguent
+/// ici : la boucle de fond et l'appel manuel exécutent le même code.
+struct MaintenanceState {
+    cmd_tx: mpsc::Sender<Command>,
+    blockstore: Blockstore,
+    moderation: Arc<RwLock<Moderation>>,
+    catalog: Arc<Mutex<Catalog>>,
+    subscriptions: Arc<Mutex<BTreeSet<PeerId>>>,
+    seed_index: Arc<Mutex<SeedIndex>>,
+    blocked_channels: Arc<Mutex<BTreeSet<PeerId>>>,
+    denylist_issuers: Arc<Mutex<BTreeSet<PeerId>>>,
+    peer_id: PeerId,
+}
+
+/// Corps de [`Node::reprovide_all`] — voir sa doc pour le comportement.
+async fn reprovide_all_inner(state: &MaintenanceState) -> CoreResult<usize> {
+    let segments = state
+        .seed_index
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .all_segment_cids();
+    let mut count = 0usize;
+    for cid in state.blockstore.list()? {
+        if segments.contains(&cid.to_string()) {
+            continue;
+        }
+        // Best-effort racine par racine : un `provide` en échec (store plein,
+        // `MaxProvidedKeys`, swarm arrêté) ne doit pas annuler la réannonce de
+        // toutes les racines suivantes. Le compteur rendu est donc celui des
+        // racines RÉELLEMENT annoncées.
+        match provide_inner(&state.cmd_tx, &state.moderation, cid).await {
+            Ok(()) => count += 1,
+            // Un bloc modéré resté au magasin n'est jamais annoncé — c'est le
+            // comportement attendu, pas une panne : `debug!` pour ne pas
+            // répéter un `warn!` à chaque passe horaire.
+            Err(CoreError::Moderated(m)) => {
+                tracing::debug!("maintenance : {cid} non réannoncé (modéré : {m})")
+            }
+            Err(e) => tracing::warn!("maintenance : réannonce de {cid} échouée: {e}"),
+        }
+    }
+    Ok(count)
+}
+
+/// Corps de [`Node::republish_known_feeds`] — voir sa doc pour le comportement.
+async fn republish_known_feeds_inner(state: &MaintenanceState) -> CoreResult<usize> {
+    let subs: BTreeSet<PeerId> = state
+        .subscriptions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let to_republish: Vec<(PeerId, Vec<u8>)> = {
+        let catalog = state
+            .catalog
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        catalog
+            .issuers()
+            .filter(|issuer| **issuer == state.peer_id || subs.contains(*issuer))
+            .filter(|issuer| {
+                !is_key_blocked_inner(&state.moderation, &state.blocked_channels, issuer)
+            })
+            .filter_map(|issuer| {
+                let data = catalog.feed_for(issuer)?.to_json().ok()?.into_bytes();
+                Some((*issuer, data))
+            })
+            .collect()
+    };
+
+    let mut count = 0usize;
+    for (issuer, data) in to_republish {
+        let (tx, _rx) = oneshot::channel();
+        // Même best-effort que `reprovide_all_inner` : un envoi refusé (boucle
+        // d'évènements arrêtée) n'interrompt pas la passe et ne se compte pas.
+        if state
+            .cmd_tx
+            .send(Command::PutRecord {
+                key: feed_record_key(&issuer),
+                value: data,
+                tx,
+            })
+            .await
+            .is_ok()
+        {
+            count += 1;
+        }
+    }
+
+    // Denylists : même problème de durabilité que les feeds (le record
+    // Kademlia d'un éditeur hors ligne s'éteint à son TTL), même remède —
+    // chaque nœud qui suit un éditeur reprovisionne sa liste. Seules les
+    // listes en cache d'un éditeur ENCORE souscrit sont republiées : un
+    // cache orphelin ne doit pas être réinjecté dans le réseau.
+    let subscribed_editors: BTreeSet<PeerId> = state
+        .denylist_issuers
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    for list in crate::moderation::load_cached_lists(state.blockstore.root()) {
+        let Ok(issuer) = list.issuer_peer_id() else {
+            continue;
+        };
+        if !subscribed_editors.contains(&issuer) {
+            continue;
+        }
+        let Ok(value) = serde_json::to_vec(&list) else {
+            continue;
+        };
+        let (tx, _rx) = oneshot::channel();
+        if state
+            .cmd_tx
+            .send(Command::PutRecord {
+                key: denylist_record_key(&issuer),
+                value,
+                tx,
+            })
+            .await
+            .is_ok()
+        {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Boucle de maintenance réseau du nœud : réannonce des racines détenues
+/// ([`reprovide_all_inner`]) puis republication des feeds et denylists connus
+/// ([`republish_known_feeds_inner`]), toutes les `reprovide_interval`.
+///
+/// Démarrée par le premier [`Node::listen`] réussi, jamais à la construction.
+/// Comme `follow_loop` et `seed_loop` : la toute première passe a lieu AVANT
+/// toute attente (rattrapage au démarrage — le store de providers Kademlia est
+/// volatile, donc au redémarrage plus rien n'est annoncé tant qu'on n'a pas
+/// republié), et la boucle ne tient qu'un [`Weak`] marqueur de vivacité,
+/// jamais un `Node` fort qui empêcherait la boucle d'évènements de s'arrêter.
+///
+/// **Aucune passe sans pair connecté.** Tous les porteurs réels appellent
+/// `listen` AVANT de joindre le réseau (le démon compose ses `--bootstrap`
+/// ensuite, les fronts font `openNode → listen → connect`) : une passe lancée
+/// tout de suite trouverait une table de routage vide, stockerait ses provider
+/// records localement sans que rien n'atteigne le réseau, et journaliserait un
+/// succès mensonger — le vrai rattrapage n'aurait lieu qu'à la passe suivante,
+/// une heure plus tard. La boucle attend donc un premier pair par courtes
+/// tentatives ; la première passe réelle a lieu dès que le nœud a sa première
+/// connexion (bootstrap, mDNS ou connexion manuelle).
+///
+/// Best-effort : l'échec d'une passe (réseau indisponible) est seulement
+/// tracé — la passe suivante réessaiera. Les succès sont tracés en `info!` :
+/// pour `champinium-seed`, démon sans interface, le journal est la SEULE façon
+/// de constater que la maintenance tourne encore.
+async fn maintenance_loop(alive: Weak<()>, state: MaintenanceState, reprovide_interval: Duration) {
+    loop {
+        if alive.upgrade().is_none() {
+            return;
+        }
+        // Un `cmd_tx` mort (boucle d'évènements arrêtée) rend 0 : on retombe
+        // sur l'attente courte, et le `upgrade()` du tour suivant sort.
+        let peers = {
+            let (tx, rx) = oneshot::channel();
+            match state.cmd_tx.send(Command::ConnectedPeers { tx }).await {
+                Ok(()) => rx.await.unwrap_or(0),
+                Err(_) => 0,
+            }
+        };
+        if peers == 0 {
+            tracing::debug!("maintenance : aucun pair connecté, nouvel essai dans 2 s");
+            if !sleep_while_alive(&alive, MAINTENANCE_PEER_RETRY).await {
+                return;
+            }
+            continue;
+        }
+        match reprovide_all_inner(&state).await {
+            Ok(n) => tracing::info!("maintenance : {n} racine(s) réannoncée(s)"),
+            Err(e) => tracing::warn!("maintenance : réannonce des racines échouée: {e}"),
+        }
+        match republish_known_feeds_inner(&state).await {
+            Ok(n) => tracing::info!("maintenance : {n} record(s) republié(s)"),
+            Err(e) => tracing::warn!("maintenance : republication échouée: {e}"),
+        }
+        if !sleep_while_alive(&alive, reprovide_interval).await {
+            return;
+        }
+    }
+}
+
+/// Granularité de [`sleep_while_alive`] : un nœud tombé est constaté au pire
+/// une seconde plus tard.
+const ALIVE_CHECK_GRANULARITY: Duration = Duration::from_secs(1);
+
+/// Attend `total` en re-vérifiant la vivacité toutes les
+/// [`ALIVE_CHECK_GRANULARITY`] ; renvoie `false` dès que la dernière poignée
+/// `Node` est tombée (l'appelant doit alors sortir de sa boucle).
+///
+/// Un `sleep(total)` nu suffirait à la correction, mais pas à la promptitude
+/// de l'arrêt : la boucle détient un `cmd_tx` fort, et la boucle d'évènements
+/// ne s'arrête que quand tous les émetteurs sont tombés. Avec une attente nue,
+/// le swarm, ses sockets d'écoute et le blockstore d'un nœud abandonné
+/// survivraient jusqu'à une heure ([`REPROVIDE_INTERVAL`]).
+async fn sleep_while_alive(alive: &Weak<()>, total: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + total;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return alive.upgrade().is_some();
+        }
+        tokio::time::sleep((deadline - now).min(ALIVE_CHECK_GRANULARITY)).await;
+        if alive.upgrade().is_none() {
+            return false;
         }
     }
 }
@@ -4807,6 +5345,160 @@ mod tests {
         })
         .await
         .expect("A doit joindre B par bootstrap");
+    }
+
+    /// Sans démon `champinium-seed` : un nœud qui redémarre et écoute
+    /// réannonce tout seul les racines qu'il détient. C'est la maintenance
+    /// intégrée au nœud (`maintenance_loop`, démarrée par `listen`, première
+    /// passe dès qu'un premier pair est connecté) — avant elle, un
+    /// utilisateur sans démon voyait son contenu disparaître de la DHT à
+    /// chaque redémarrage. Joué à l'intervalle de PRODUCTION : c'est la
+    /// première passe qui doit suffire, pas une passe ultérieure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn maintenance_reprovides_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Node::open_isolated(&dir.path().join("a")).await.unwrap();
+        let a_addr = a
+            .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        let cid = a.add(b"maintenance-block").await.unwrap();
+
+        // B récupère le bloc en politique Seed (il en devient détenteur), puis
+        // les deux poignées tombent et B repart d'un blockstore froid.
+        let b_dir = dir.path().join("b");
+        let b = Node::open_isolated(&b_dir).await.unwrap();
+        b.listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        let a_full: Multiaddr = format!("{a_addr}/p2p/{}", a.peer_id()).parse().unwrap();
+        b.connect(a_full).await.unwrap();
+        // Attente de convergence (jamais un sleep fixe seul) : la table de
+        // routage de B doit connaître A avant que la requête de fournisseurs
+        // puisse aboutir.
+        let seeded = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Ok(bytes) = b.get_with(cid, StorePolicy::Seed).await {
+                    return bytes;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .expect("B doit récupérer le bloc depuis A");
+        assert_eq!(seeded, b"maintenance-block");
+        // Ce qui rend l'assertion finale concluante n'est PAS l'extinction des
+        // swarms de A et B (lâcher les poignées ne les arrête pas
+        // immédiatement) mais l'ISOLEMENT DE ROUTAGE : C ne connaîtra que le B
+        // redémarré, lequel repart d'une table de routage vide (`connect` ne
+        // persiste pas de bootstrap) et ne peut donc relayer aucun provider
+        // record hérité de A. Et l'assertion vise le PeerId de B, que seul B
+        // peut annoncer.
+        drop(b);
+        drop(a);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Redémarrage de B avec l'intervalle de maintenance de PRODUCTION
+        // (`REPROVIDE_INTERVAL` = 1 h) : ce que ce test doit prouver, c'est
+        // que la PREMIÈRE passe suffit. Un intervalle court le ferait passer
+        // sur une passe ultérieure et masquerait exactement la régression
+        // visée (une première passe lancée avant toute connexion, sur une
+        // table de routage vide, dont rien n'atteint le réseau). Aucun appel
+        // manuel à `reprovide_all` : seuls `listen` puis l'arrivée d'un
+        // premier pair doivent suffire.
+        let keypair = crate::identity::load_or_generate(b_dir.join("node.key")).unwrap();
+        let blockstore = Blockstore::open(b_dir.join("blocks")).unwrap();
+        let b = Node::with_moderation_and_intervals(
+            keypair,
+            blockstore,
+            Moderation::empty(),
+            FOLLOW_INTERVAL,
+            SEED_INTERVAL,
+            REPROVIDE_INTERVAL,
+            None,
+        )
+        .await
+        .unwrap();
+        let b_addr = b
+            .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+
+        let c = Node::open_isolated(&dir.path().join("c")).await.unwrap();
+        c.listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+        // C se connecte à B : c'est CETTE connexion qui débloque la première
+        // passe de maintenance de B (la boucle attend un pair, elle ne parle
+        // pas dans le vide).
+        let b_full: Multiaddr = format!("{b_addr}/p2p/{}", b.peer_id()).parse().unwrap();
+        c.connect(b_full).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if c.get_providers(cid)
+                    .await
+                    .map(|p| p.contains(&b.peer_id()))
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .expect("B doit réannoncer sans démon, dès son premier pair connecté");
+        assert_eq!(c.get(cid).await.unwrap(), b"maintenance-block");
+    }
+
+    /// Un nœud ouvert mais qui n'écoute pas n'annonce rien : la maintenance
+    /// n'est pas un effet de bord de la construction. Annoncer des racines
+    /// depuis un nœud injoignable enverrait les pairs dans le vide.
+    ///
+    /// Vérifié sous sa forme OBSERVABLE (un pair connecté ne voit pas N comme
+    /// fournisseur), pas seulement par le drapeau interne : un spawn ajouté
+    /// ailleurs et qui oublierait de poser le drapeau passerait à travers la
+    /// seule assertion de drapeau.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn maintenance_not_started_without_listen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // P écoute et sert de témoin : c'est lui qu'on interrogera.
+        let p = Node::open_isolated(&dir.path().join("p")).await.unwrap();
+        let p_addr = p
+            .listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .await
+            .unwrap();
+
+        // N détient un bloc mais n'appelle JAMAIS `listen` — il compose
+        // seulement vers P (une connexion sortante suffit à ce que la DHT de P
+        // puisse recevoir une annonce, si N en émettait une).
+        let n = Node::open_isolated(&dir.path().join("n")).await.unwrap();
+        let cid = n.add(b"x").await.unwrap();
+        let p_full: Multiaddr = format!("{p_addr}/p2p/{}", p.peer_id()).parse().unwrap();
+        n.connect(p_full).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if p.connected_peers().await.unwrap_or(0) >= 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("P doit voir la connexion entrante de N");
+
+        // Laisse largement le temps à une éventuelle passe de maintenance de
+        // s'exécuter et de se propager, puis constate l'absence d'annonce.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !p.get_providers(cid)
+                .await
+                .unwrap_or_default()
+                .contains(&n.peer_id()),
+            "un nœud qui n'écoute pas ne doit s'annoncer fournisseur de rien"
+        );
+        assert!(!n.maintenance_started_for_tests());
     }
 
     /// Le point de commit du seed ne retient une publication que si l'émetteur
@@ -5677,6 +6369,82 @@ mod tests {
         drop(node);
         let node = Node::open(dir.path()).await.unwrap();
         assert!(!node.mdns_enabled());
+    }
+
+    /// Deux feeds listent le MÊME manifeste, un seul émetteur est souscrit :
+    /// `catalog_entry_for_manifest` doit élire le souscrit, quel que soit
+    /// l'ordre d'itération (non déterministe) de la `HashMap` du catalogue.
+    /// Sans cette préférence, un tiers qui liste le manifeste d'un créateur
+    /// suivi ferait retomber sa lecture en `Stream` au hasard.
+    ///
+    /// **Déterminisme** : un SEUL nœud, donc une seule `HashMap` de catalogue,
+    /// donc un seul ordre d'itération — inconnu, mais fixe pour la durée du
+    /// test. L'abonnement bascule d'un émetteur à l'autre sur ce catalogue
+    /// inchangé : quel que soit cet ordre, l'une des deux assertions porte
+    /// forcément sur un émetteur qui n'est PAS en tête, celle que l'ancien
+    /// « prendre la première entrée venue » échouerait. Le test détecte donc
+    /// la régression à coup sûr, pas trois fois sur quatre.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_entry_for_manifest_prefers_a_subscribed_issuer() {
+        let dir = tempfile::tempdir().unwrap();
+        let kp_x = Keypair::generate_ed25519();
+        let kp_y = Keypair::generate_ed25519();
+        let x = identity::peer_id(&kp_x);
+        let y = identity::peer_id(&kp_y);
+
+        // Un manifeste quelconque, revendiqué par les deux feeds.
+        let manifest_cid = crate::content::cid_for(b"manifeste revendique par deux emetteurs");
+
+        let bs = Blockstore::open(dir.path().join("cat")).unwrap();
+        let node = Node::with_moderation(Keypair::generate_ed25519(), bs, Moderation::empty())
+            .await
+            .unwrap();
+        for kp in [&kp_x, &kp_y] {
+            let feed = Feed::build_signed(kp, 1, &[manifest_cid]).unwrap();
+            node.apply_feed_for_tests(feed).unwrap();
+        }
+        assert_eq!(
+            node.catalog_entries().len(),
+            2,
+            "les deux feeds doivent être au catalogue"
+        );
+
+        node.subscribe(x).unwrap();
+        assert_eq!(
+            node.catalog_entry_for_manifest(&manifest_cid)
+                .expect("une entrée revendique ce manifeste")
+                .issuer,
+            x,
+            "l'émetteur SOUSCRIT doit être élu, jamais celui qui liste le CID sans être suivi"
+        );
+
+        // Même catalogue, même ordre : seul l'abonnement change de camp.
+        node.unsubscribe(x).unwrap();
+        node.subscribe(y).unwrap();
+        assert_eq!(
+            node.catalog_entry_for_manifest(&manifest_cid)
+                .expect("une entrée revendique ce manifeste")
+                .issuer,
+            y,
+            "l'élection doit suivre l'abonnement, pas l'ordre d'itération du catalogue"
+        );
+    }
+
+    /// Le réglage « seed de ce que je regarde » (spec persistance §3) est
+    /// lisible/modifiable et **persisté** (dotfile `.seed_watched`), **défaut
+    /// inactif** — retenir hors abonnement consomme le quota, ça se demande.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn seed_watched_setting_persists_and_defaults_to_false() {
+        let dir = tempfile::tempdir().unwrap();
+        // `open_isolated` : ce test n'a aucun besoin de mDNS, et un socket
+        // multicast le couplerait aux autres nœuds de la suite.
+        let node = Node::open_isolated(dir.path()).await.unwrap();
+        assert!(!node.seed_watched());
+        node.set_seed_watched(true).unwrap();
+        assert!(node.seed_watched(), "effet immédiat, pas au redémarrage");
+        drop(node);
+        let node = Node::open_isolated(dir.path()).await.unwrap();
+        assert!(node.seed_watched());
     }
 
     /// Deux nœuds sur la même machine, AUCUN dial : mDNS les met en relation.

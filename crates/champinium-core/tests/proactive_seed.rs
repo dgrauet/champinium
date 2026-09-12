@@ -26,9 +26,22 @@ const CONVERGE: Duration = Duration::from_secs(30);
 async fn node(dir: &Path, name: &str) -> Node {
     let kp = load_or_generate(dir.join(format!("{name}.key"))).unwrap();
     let bs = Blockstore::open(dir.join(name)).unwrap();
-    Node::with_moderation_and_intervals(kp, bs, Moderation::empty(), FAST, FAST, None)
-        .await
-        .unwrap()
+    Node::with_moderation_and_intervals(
+        kp,
+        bs,
+        Moderation::empty(),
+        FAST,
+        FAST,
+        // Maintenance laissée à sa valeur de PRODUCTION : ces tests ne
+        // mesurent pas la réannonce, et une passe rapide en boucle
+        // brouillerait leurs comptages de fournisseurs. La première passe
+        // (au premier pair connecté) reste inoffensive : blockstore vide au
+        // démarrage.
+        champinium_core::p2p::REPROVIDE_INTERVAL,
+        None,
+    )
+    .await
+    .unwrap()
 }
 
 /// Comme [`node`], mais avec un quota de seed minuscule persisté AVANT la
@@ -38,9 +51,22 @@ async fn node_with_quota(dir: &Path, name: &str, quota_bytes: u64) -> Node {
     let kp = load_or_generate(dir.join(format!("{name}.key"))).unwrap();
     let bs = Blockstore::open(dir.join(name)).unwrap();
     seeding::save_seed_quota(&bs, quota_bytes).unwrap();
-    Node::with_moderation_and_intervals(kp, bs, Moderation::empty(), FAST, FAST, None)
-        .await
-        .unwrap()
+    Node::with_moderation_and_intervals(
+        kp,
+        bs,
+        Moderation::empty(),
+        FAST,
+        FAST,
+        // Maintenance laissée à sa valeur de PRODUCTION : ces tests ne
+        // mesurent pas la réannonce, et une passe rapide en boucle
+        // brouillerait leurs comptages de fournisseurs. La première passe
+        // (au premier pair connecté) reste inoffensive : blockstore vide au
+        // démarrage.
+        champinium_core::p2p::REPROVIDE_INTERVAL,
+        None,
+    )
+    .await
+    .unwrap()
 }
 
 /// Publie (localement, `add`) un manifeste HLS à un segment depuis `creator`

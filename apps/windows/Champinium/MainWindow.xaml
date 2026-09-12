@@ -74,6 +74,11 @@
                                 <TextBlock Text="{Binding SeedStatusText}"
                                            Style="{StaticResource CaptionTextBlockStyle}"
                                            Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
+                                <!-- Badge « conservé » (Explorer uniquement, vide sinon) : contenu
+                                     retenu localement (seed de ce que je regarde) sans abonnement. -->
+                                <TextBlock Text="{Binding WatchedBadgeText}"
+                                           Style="{StaticResource CaptionTextBlockStyle}"
+                                           Foreground="{ThemeResource TextFillColorTertiaryBrush}" />
                             </StackPanel>
                         </StackPanel>
                         <Button Grid.Column="1" Content="{Binding SubscribeLabel}"
@@ -195,6 +200,15 @@
                             <ToggleSwitch Header="Découverte sur le réseau local (mDNS)"
                                           IsOn="{Binding MdnsEnabled, Mode=TwoWay}" />
                             <TextBlock Text="Effet au prochain démarrage. Révèle la présence de ce nœud sur le réseau local."
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource TextFillColorTertiaryBrush}"
+                                       TextWrapping="Wrap" />
+                            <!-- Seed de ce que je regarde (hors abonnement) : même patron
+                                 que les Toggle ci-dessus (SeedWatched/SetSeedWatched sont
+                                 SYNC côté VM). Différence avec mDNS : effet immédiat. -->
+                            <ToggleSwitch Header="Conserver et resservir ce que je regarde"
+                                          IsOn="{Binding SeedWatched, Mode=TwoWay}" />
+                            <TextBlock Text="Hors abonnement, sous le même quota ; évincé avant les abonnements."
                                        Style="{StaticResource CaptionTextBlockStyle}"
                                        Foreground="{ThemeResource TextFillColorTertiaryBrush}"
                                        TextWrapping="Wrap" />

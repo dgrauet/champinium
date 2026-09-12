@@ -1,27 +1,27 @@
 //! champinium-seed — démon de seeding en arrière-plan (hors UI).
 //!
 //! Depuis le retrait de seed-what-you-consume (spec channels lot c), le démon
-//! ne fait plus que **resservir ce qu'il détient déjà** : au démarrage et
-//! périodiquement, il **réannonce** dans la DHT (provider records) les ROOTS
-//! qu'il détient (blockstore moins les segments indexés par une publication —
-//! annonce par racine, ADR 0012 : un segment n'est plus annoncé
-//! individuellement) ET **republie** les feeds SIGNÉS qu'il détient légitimement (le
-//! sien s'il a publié, ceux de ses abonnements — voir
-//! `Node::republish_known_feeds`). Il ne PUBLIE (crée/incrémente `seq`)
-//! toujours PAS de feed — ça reste le rôle du nœud créateur, pas du démon de
-//! seeding — mais il réannonce dans la DHT ceux déjà signés qu'il détient,
-//! condition nécessaire à leur durabilité (ADR 0007) : sans réannonce, le
-//! record `/champinium/feed/<peerid>` expire au TTL du `MemoryStore`
-//! Kademlia dès que le créateur passe hors ligne, quel que soit le nombre
-//! d'abonnés qui l'ont pourtant dans leur catalogue. Conçu pour tourner sous
-//! launchd (macOS), un service Windows, ou un systemd user service (Linux) —
-//! voir `infra/services/`.
+//! ne fait que **resservir ce qu'il détient déjà**. La maintenance elle-même —
+//! **réannonce** dans la DHT des ROOTS détenus (blockstore moins les segments
+//! indexés par une publication : annonce par racine, ADR 0012) et
+//! **republication** des feeds SIGNÉS détenus légitimement (le sien s'il a
+//! publié, ceux de ses abonnements) — appartient désormais au **nœud**
+//! lui-même : `Node::listen` démarre `maintenance_loop`, quel que soit le
+//! porteur du nœud (front GUI, CLI ou ce démon). Avant ce déplacement, un
+//! utilisateur sans démon installé ne réannonçait jamais rien après un
+//! redémarrage, et son contenu s'éteignait au TTL des records Kademlia.
+//!
+//! Le démon garde donc une seule raison d'être : **servir quand l'application
+//! est fermée**. L'app seede tant qu'elle est ouverte ; le démon, le reste du
+//! temps. Il ne PUBLIE (crée/incrémente `seq`) toujours PAS de feed — ça reste
+//! le rôle du nœud créateur. Conçu pour tourner sous launchd (macOS), un
+//! service Windows, ou un systemd user service (Linux) — voir
+//! `infra/services/`.
 //!
 //! La modération par défaut reste active : un seeder ne ressert jamais un contenu
 //! matché (les checkpoints du noyau s'appliquent au service comme au reste).
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use champinium_core::identity::load_or_generate;
@@ -44,9 +44,15 @@ struct Cli {
     /// Pairs de bootstrap `/ip4/.../tcp/.../p2p/<peerid>` (répétable).
     #[arg(long)]
     bootstrap: Vec<String>,
-    /// Intervalle de réannonce, en secondes.
-    #[arg(long, default_value = "3600")]
-    reprovide_interval: u64,
+    /// **Obsolète et sans effet** : la maintenance est celle du nœud
+    /// (ADR 0014), son intervalle n'est plus réglable depuis le démon.
+    /// L'option n'est acceptée que pour qu'un fichier de service déjà
+    /// déployé continue de démarrer après une mise à jour du binaire — sans
+    /// elle, `clap` refuserait l'argument inconnu et systemd bouclerait sur
+    /// un démon qui ne démarre plus. Masquée de l'aide : rien ne doit
+    /// inciter à l'écrire.
+    #[arg(long, hide = true)]
+    reprovide_interval: Option<u64>,
 }
 
 #[tokio::main]
@@ -54,11 +60,20 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "champinium_seed=info,champinium_core=warn".into()),
+                // `champinium_core=info` et non `warn` : la maintenance est
+                // désormais tracée par le NOYAU (`maintenance_loop`), pas par
+                // ce binaire — la filtrer reviendrait à rendre le démon muet
+                // sur la seule chose qu'il fait.
+                .unwrap_or_else(|_| "champinium_seed=info,champinium_core=info".into()),
         )
         .init();
 
     let cli = Cli::parse();
+    if cli.reprovide_interval.is_some() {
+        tracing::warn!(
+            "--reprovide-interval est obsolète et ignoré : la maintenance est celle du nœud (ADR 0014)"
+        );
+    }
     let keypair = load_or_generate(cli.data_dir.join("node.key"))?;
     let blockstore = Blockstore::open(cli.data_dir.join("blocks"))?;
     let node = Node::new(keypair, blockstore).await?;
@@ -84,33 +99,11 @@ async fn main() -> Result<()> {
         Err(e) => tracing::warn!("bootstrap échoué: {e}"),
     }
 
-    let interval = Duration::from_secs(cli.reprovide_interval.max(1));
-    loop {
-        reseed(&node).await;
-        tokio::select! {
-            _ = tokio::time::sleep(interval) => {}
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("arrêt du seeder");
-                return Ok(());
-            }
-        }
-    }
-}
-
-/// Réannonce les ROOTS détenus (provider records — blockstore moins les
-/// segments indexés par une publication, annonce par racine, ADR 0012) PUIS
-/// republie les feeds signés détenus légitimement (le sien + ses
-/// abonnements — voir `Node::republish_known_feeds`). La PUBLICATION d'un
-/// feed (créer/incrémenter `seq`) n'appartient PAS au démon — c'est le nœud
-/// créateur qui publie ce qu'il crée ; le démon de seeding ne fait que
-/// resservir/réannoncer ce qu'il détient déjà, feeds compris.
-async fn reseed(node: &Node) {
-    match node.reprovide_all().await {
-        Ok(n) => tracing::info!("réannonce de {n} root(s)"),
-        Err(e) => tracing::warn!("réannonce échouée: {e}"),
-    }
-    match node.republish_known_feeds().await {
-        Ok(n) => tracing::info!("republication de {n} feed(s)"),
-        Err(e) => tracing::warn!("republication de feeds échouée: {e}"),
-    }
+    // La maintenance périodique tourne déjà dans le nœud (démarrée par le
+    // `listen` ci-dessus, première passe dès le premier pair connecté) : le
+    // démon n'a plus qu'à
+    // rester en vie pour la porter jusqu'à l'arrêt.
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("arrêt du seeder");
+    Ok(())
 }
