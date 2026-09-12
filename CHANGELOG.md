@@ -6,6 +6,29 @@ versionnage : [SemVer](https://semver.org/lang/fr/). À partir de la 0.2.0, ce
 fichier est maintenu automatiquement par release-please (voir
 [ADR-0005](docs/adr/0005-release-please.md)).
 
+## [0.10.0](https://github.com/dgrauet/champinium/compare/v0.9.0...v0.10.0) (2026-09-12)
+
+
+### ⚠ BREAKING CHANGES
+
+* API Rust — `Node::report_count(s)` renvoient `ReportTally` au lieu d'un `usize`, `report_counts_by_channel` un `(PeerId, ReportTally, u64)`, et `ReportBook::count`/`counts` sont remplacées par `tally`/`tallies`. Contrat FFI inchangé (v15) : les signalements ne sont pas exposés aux fronts.
+* persistance de la longue traîne — seed de ce que je regarde, maintenance intégrée (contrat v15, ADR 0014) ([#83](https://github.com/dgrauet/champinium/issues/83))
+* découverte initiale — bootstraps embarqués, mDNS, DNS (contrat v14, ADR 0013) ([#82](https://github.com/dgrauet/champinium/issues/82))
+* DHT dédiée et annonce par racine (ADR 0012) ([#79](https://github.com/dgrauet/champinium/issues/79))
+* modération réputationnelle — listes signées distribuées par la DHT (contrat v13, ADR 0011) ([#78](https://github.com/dgrauet/champinium/issues/78))
+* provenance déclarée — feed v4, contrat v12, ADR 0010 ([#77](https://github.com/dgrauet/champinium/issues/77))
+* lecture progressive HLS par serveur local (contrat v11, ADR 0009) ([#75](https://github.com/dgrauet/champinium/issues/75))
+
+### Features
+
+* découverte initiale — bootstraps embarqués, mDNS, DNS (contrat v14, ADR 0013) ([#82](https://github.com/dgrauet/champinium/issues/82)) ([d72d08e](https://github.com/dgrauet/champinium/commit/d72d08e5aac4f9f9a50a5896a9998123604a858e))
+* DHT dédiée et annonce par racine (ADR 0012) ([#79](https://github.com/dgrauet/champinium/issues/79)) ([d85752d](https://github.com/dgrauet/champinium/commit/d85752da53c0cdddd645752ac1db8c89ee5b533a))
+* lecture progressive HLS par serveur local (contrat v11, ADR 0009) ([#75](https://github.com/dgrauet/champinium/issues/75)) ([33c61bd](https://github.com/dgrauet/champinium/commit/33c61bdeb69110cf59fb4061e192c44a1be0b473))
+* modération réputationnelle — listes signées distribuées par la DHT (contrat v13, ADR 0011) ([#78](https://github.com/dgrauet/champinium/issues/78)) ([a3a33fd](https://github.com/dgrauet/champinium/commit/a3a33fdd91c1947212274aec63027b19e4c08a2f))
+* persistance de la longue traîne — seed de ce que je regarde, maintenance intégrée (contrat v15, ADR 0014) ([#83](https://github.com/dgrauet/champinium/issues/83)) ([6f3f3f0](https://github.com/dgrauet/champinium/commit/6f3f3f0ef2ed7bdbd0870116e46c973541d87777))
+* provenance déclarée — feed v4, contrat v12, ADR 0010 ([#77](https://github.com/dgrauet/champinium/issues/77)) ([71dd54e](https://github.com/dgrauet/champinium/commit/71dd54e9136ae228be4cd62f8ac999cfbc27b7c4))
+* signalements pondérés par les clés de confiance (ADR 0015) ([#84](https://github.com/dgrauet/champinium/issues/84)) ([9c8eeb0](https://github.com/dgrauet/champinium/commit/9c8eeb06289aa473dcbc892c903d190441cc8649))
+
 ## [0.9.0](https://github.com/dgrauet/champinium/compare/v0.8.0...v0.9.0) (2026-07-24)
 
 
