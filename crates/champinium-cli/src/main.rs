@@ -204,7 +204,9 @@ enum Cmd {
         /// Inclut les signalements qu'aucune clé de confiance (éditeur de
         /// denylist souscrit) n'a émis. Par défaut ils sont masqués : une
         /// identité Ed25519 est gratuite, un compteur « autres » seul ne dit
-        /// rien.
+        /// rien. C'est aussi le seul moyen de voir les signalements émis par
+        /// ce nœud lui-même : sa propre clé n'est pas un éditeur de denylist
+        /// souscrit, ses refus tombent donc à l'étage « autres ».
         #[arg(long)]
         all: bool,
     },
@@ -606,16 +608,19 @@ async fn main() -> Result<()> {
         }
         Cmd::Reports { by_channel, all } => {
             let node = build_node(&cli.data_dir).await?;
-            // Tri commun : la confiance d'abord, les autres en second critère.
-            // Filtre par défaut : au moins une clé de confiance a signalé.
+            // Filtre d'abord (par défaut : au moins une clé de confiance a
+            // signalé), tri ensuite : la confiance d'abord, les autres en
+            // second critère, puis l'identifiant pour un ordre stable d'un
+            // appel à l'autre (les agrégats sortent de `HashMap`).
             if by_channel {
                 let mut rows = node.report_counts_by_channel();
+                rows.retain(|(_, tally, _)| all || tally.trusted >= 1);
                 rows.sort_by(|a, b| {
                     b.1.trusted
                         .cmp(&a.1.trusted)
                         .then(b.1.others.cmp(&a.1.others))
+                        .then_with(|| a.0.to_string().cmp(&b.0.to_string()))
                 });
-                rows.retain(|(_, tally, _)| all || tally.trusted >= 1);
                 if rows.is_empty() {
                     println!(
                         "{}",
@@ -634,12 +639,13 @@ async fn main() -> Result<()> {
                 }
             } else {
                 let mut rows = node.report_counts();
+                rows.retain(|(_, tally)| all || tally.trusted >= 1);
                 rows.sort_by(|a, b| {
                     b.1.trusted
                         .cmp(&a.1.trusted)
                         .then(b.1.others.cmp(&a.1.others))
+                        .then_with(|| a.0.to_string().cmp(&b.0.to_string()))
                 });
-                rows.retain(|(_, tally)| all || tally.trusted >= 1);
                 if rows.is_empty() {
                     println!("{}", empty_reports_message(all, "aucun signalement"));
                 } else {

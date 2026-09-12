@@ -429,6 +429,38 @@ mod tests {
         );
     }
 
+    /// Bornes de l'étage de confiance : la borne de CIDs s'applique bien (un
+    /// CID NOUVEAU est refusé quand l'étage est plein), mais il n'y a **pas**
+    /// de borne par CID — un rapporteur de confiance supplémentaire entre
+    /// toujours sur un CID déjà suivi, même livre plein.
+    #[test]
+    fn trusted_tier_refuses_new_cids_when_full_but_still_accepts_reporters() {
+        let first = Keypair::generate_ed25519();
+        let second = Keypair::generate_ed25519();
+        let mut book = ReportBook::with_trusted(
+            [first.public().to_peer_id(), second.public().to_peer_id()].into(),
+        );
+        for i in 0..MAX_TRUSTED_REPORTED_CIDS {
+            assert!(book
+                .apply(&signed(&first, &cid_for(format!("trusted-{i}").as_bytes())))
+                .unwrap());
+        }
+
+        let fresh = cid_for(b"trusted-fresh");
+        assert!(
+            !book.apply(&signed(&first, &fresh)).unwrap(),
+            "étage de confiance plein : un CID nouveau est refusé"
+        );
+        assert_eq!(book.tally(&fresh).trusted, 0);
+
+        let known = cid_for(b"trusted-0");
+        assert!(
+            book.apply(&signed(&second, &known)).unwrap(),
+            "pas de borne par CID : un rapporteur de plus entre sur un CID déjà suivi"
+        );
+        assert_eq!(book.tally(&known).trusted, 2);
+    }
+
     #[test]
     fn retrust_moves_reporters_between_tiers_without_duplicates() {
         let kp = Keypair::generate_ed25519();
