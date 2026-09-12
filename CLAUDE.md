@@ -342,7 +342,8 @@ sur deux machines physiques.
   propre TTL). L'éviction de quota (lot c) n'appelle **pas** `stop_providing`
   (stabilité de l'amortisseur) — la modération, si. **Signalements par channel**
   (`report_counts_by_channel`, lecture seule) : jointure locale rapports×catalogue
-  → `(rapporteurs distincts cumulés, CIDs distincts signalés)` par émetteur, aide
+  → `(ReportTally cumulé — de confiance / autres, CIDs distincts signalés — CIDs
+  contestés non attribués, ADR 0015)` par émetteur, aide
   les éditeurs de denylists à repérer un candidat `key_entries`, **aucun effet
   automatique**. `fetch_hls(Seed)` entre désormais au SeedIndex. **Contrat FFI
   v8** (`block_channel`/`unblock_channel`/`blocked_channels`). CLI : `block

@@ -41,8 +41,10 @@ socle de confiance pour les signalements.
    nombre de clés de confiance est petit et choisi par l'utilisateur, il ne
    peut pas noyer un CID donné. L'étage « autres » garde les bornes
    historiques (`DEFAULT_MAX_REPORTED_CIDS = 10 000`,
-   `DEFAULT_MAX_REPORTERS_PER_CID = 1 000`). Un rapport de confiance n'est
-   donc jamais refusé parce que l'étage « autres » est plein, ni l'inverse.
+   `DEFAULT_MAX_REPORTERS_PER_CID = 1 000`). Chez le nœud qui a souscrit le
+   rapporteur, un rapport de confiance n'est donc jamais refusé parce que
+   l'étage « autres » est plein, ni l'inverse — cette garantie est **locale**,
+   voir « Limites ».
 3. **Reclassement à chaud.** À `subscribe_denylist_issuer` /
    `unsubscribe_denylist_issuer` (et au chemin `subscribe_denylist` qui
    inscrit lui aussi un éditeur dans les issuers souscrits),
@@ -57,7 +59,8 @@ socle de confiance pour les signalements.
    `report_counts() -> Vec<(Cid, ReportTally)>`,
    `report_counts_by_channel() -> Vec<(PeerId, ReportTally, u64)>` (le
    cumul additionne les rapporteurs par CID de l'émetteur — un volume de
-   signalements, pas un nombre de personnes). CLI `reports [--by-channel]
+   signalements, pas un nombre de personnes ; un CID revendiqué par
+   plusieurs émetteurs n'est attribué à aucun, voir « Limites »). CLI `reports [--by-channel]
    [--all]` affiche « N de confiance / M autres », trie par `trusted`
    décroissant puis `others` décroissant, et ne liste **par défaut** que les
    CIDs avec `trusted ≥ 1` — un compteur « autres » seul n'est pas affiché
@@ -81,8 +84,14 @@ socle de confiance pour les signalements.
 
 ## Conséquences
 
-- **Deux bornes indépendantes** au lieu d'une : l'étage de confiance ne peut
-  jamais être évincé par l'étage « autres » et réciproquement.
+- **Deux bornes indépendantes** au lieu d'une : dans le livre d'un nœud
+  donné, l'étage de confiance ne peut jamais être évincé par l'étage
+  « autres » et réciproquement.
+- **Les signalements émis par le nœud lui-même tombent à l'étage « autres »** :
+  sa propre clé n'est pas un éditeur de denylist qu'il aurait souscrit. Avec
+  le filtre par défaut (`trusted ≥ 1`), un opérateur qui inspecte sa machine
+  après un blocage ne voit donc pas ses propres refus sans `reports --all` ;
+  l'aide de ce drapeau le dit.
 - **L'ensemble de confiance est celui déjà choisi pour la modération**
   (ADR 0011), pas un nouveau registre — un utilisateur qui suit déjà des
   éditeurs de denylist bénéficie immédiatement de signalements filtrés sans
@@ -115,6 +124,37 @@ socle de confiance pour les signalements.
   `ReportBook`, mais signifie qu'un nœud qui vient de redémarrer part avec
   un décompte à zéro même pour des rapporteurs de confiance déjà vus avant
   l'arrêt.
+- **L'étage de confiance protège la lecture LOCALE, pas la propagation.**
+  La garantie « un rapport de confiance n'est jamais refusé parce que
+  l'étage “autres” est plein » ne vaut que chez le nœud qui a choisi de
+  souscrire ce rapporteur. Sur un pair tiers quelconque du mesh, qui n'a
+  aucune raison de suivre le même éditeur, ce rapport tombe à l'étage
+  « autres » ; si un attaquant y a déjà déposé 10 000 CIDs jetables,
+  l'insertion est refusée, le rapport n'est ni agrégé ni relayé
+  (`MessageAcceptance::Ignore` — comportement antérieur à cet ADR et correct :
+  ni relais, ni pénalité de score). La seconde attaque du contexte (remplir
+  le livre) est donc neutralisée **à la lecture chez les nœuds concernés**,
+  pas dans la propagation : le remplissage reste un moyen d'étouffer des
+  signalements légitimes à l'échelle du réseau.
+- **Un seul éditeur souscrit devenu hostile peut saturer l'étage de confiance
+  pour les autres.** La borne `MAX_TRUSTED_REPORTED_CIDS` est **globale** à
+  l'étage, pas par éditeur : un éditeur souscrit peut signaler à lui seul
+  10 000 CIDs arbitraires et, l'étage étant en refus-quand-plein sans
+  éviction, empêcher tout autre éditeur de confiance d'y faire entrer un CID
+  nouveau — jusqu'au désabonnement, qui libère ses entrées via `retrust`. Le
+  pouvoir de nuisance reste inférieur à ce que le même éditeur peut déjà
+  faire via ses `key_entries`. Une borne par éditeur serait l'alternative si
+  le besoin apparaît.
+- **Un CID revendiqué par plusieurs émetteurs n'est attribué à aucun.**
+  `report_counts_by_channel` joint les rapports au catalogue local, or lister
+  un CID dans son feed signé ne prouve rien sur sa propriété — c'est
+  l'invariant anti-censure du lot (d) / [ADR 0011](0011-reputational-moderation.md).
+  Désigner un gagnant arbitraire permettrait à un publieur hostile de voler
+  les signalements d'un tiers, et donc de **blanchir** un channel réellement
+  problématique. La colonne « de confiance » par channel ne compte donc que
+  les CIDs revendiqués par un **seul** émetteur ; les CIDs contestés, comme
+  ceux absents du catalogue local, restent comptés au seul agrégat global
+  par CID.
 - **Aucun mécanisme n'empêche un éditeur de denylist de rapporter de mauvaise
   foi** un CID qui n'est pas le sien — la nuance anti-censure de l'ADR 0011
   (aucune liste de CIDs dérivée des feeds) protège le contenu lui-même, pas

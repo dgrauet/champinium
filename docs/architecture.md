@@ -663,8 +663,13 @@ Autour, trois mécanismes d'écosystème :
   Les identités Ed25519 étant gratuites, un compteur unique serait
   trivialement gonflable par sybil ; l'étage de confiance a sa propre borne
   de CIDs suivis (pas de plafond par CID — l'ensemble de confiance est petit
-  et choisi par l'utilisateur) et n'est jamais affamé par l'étage « autres »,
-  ni l'inverse. `subscribe_denylist_issuer`/`unsubscribe_denylist_issuer`
+  et choisi par l'utilisateur) et, **chez le nœud qui a souscrit le
+  rapporteur**, n'est jamais affamé par l'étage « autres » ni l'inverse. La
+  garantie s'arrête là : sur un pair tiers qui ne suit pas le même éditeur, ce
+  rapport tombe à l'étage « autres » et, cet étage saturé, n'est ni agrégé ni
+  relayé (`Ignore`) — l'étage de confiance protège la **lecture locale**, pas
+  la **propagation** (voir les limites de l'ADR 0015).
+  `subscribe_denylist_issuer`/`unsubscribe_denylist_issuer`
   reclassent à chaud (`retrust`) les rapporteurs déjà connus entre étages —
   un éditeur souscrit devenu hostile reste compté « de confiance » tant
   qu'il reste souscrit, s'en désabonner le reclasse immédiatement. Le livre
@@ -682,10 +687,16 @@ Autour, trois mécanismes d'écosystème :
   cumulé, nombre de CIDs distincts signalés qui lui sont attribués)`. Aide un
   éditeur de denylist à repérer un émetteur globalement problématique
   (candidat à un `key_entries`), la colonne `trusted` du cumul étant la seule
-  résistante aux clés jetables. **Aucun effet automatique**, et limite
-  assumée : un CID signalé absent du catalogue local (émetteur jamais vu)
-  n'est pas attribué et reste compté au seul agrégat global. CLI :
-  `reports --by-channel [--all]`.
+  résistante aux clés jetables. **Aucun effet automatique**, et deux limites
+  assumées : un CID signalé absent du catalogue local (émetteur jamais vu)
+  n'est pas attribué, et un **CID revendiqué par plusieurs émetteurs n'est
+  attribué à aucun** — lister un CID dans son feed ne prouve pas qu'on en est
+  le publieur (invariant anti-censure du lot d), désigner un gagnant
+  permettrait à un publieur hostile de voler les signalements d'un tiers et de
+  blanchir son propre channel. Dans les deux cas le CID reste compté au seul
+  agrégat global par CID. CLI : `reports --by-channel [--all]` — `--all` est
+  aussi le seul moyen de voir les signalements émis par ce nœud lui-même (sa
+  clé n'est pas un éditeur souscrit, ses refus tombent en « autres »).
 - **Peer scoring gossipsub** : émettre des feeds/rapports invalides dégrade le
   score du pair → ses messages ne sont plus relayés → graylist. Avec le
   catalogue borné à 1024 émetteurs (refus-quand-plein, pas d'éviction), c'est
