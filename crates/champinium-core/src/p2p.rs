@@ -20,7 +20,7 @@ use crate::feed::{ChannelMeta, Feed, FeedEntry};
 use crate::identity;
 use crate::ingest::{self, HlsManifest, HlsSegment};
 use crate::moderation::{Applied, Denylist, Moderation};
-use crate::report::{Report, ReportBook};
+use crate::report::{Report, ReportBook, ReportTally};
 use crate::seeding::{self, eviction_order, SeedIndex, SeededPublication};
 use crate::stream::{self, StreamSession, StreamSessionInfo, StreamStatus};
 use cid::Cid;
@@ -795,7 +795,6 @@ impl Node {
 
         let moderation = Arc::new(RwLock::new(moderation));
         let catalog = Arc::new(Mutex::new(Catalog::new()));
-        let reports = Arc::new(Mutex::new(ReportBook::default()));
         // Abonnements locaux persistés (spec channels §2) : rechargés avant le
         // démarrage de la boucle de suivi pour que le passage initial les couvre.
         let subscriptions = Arc::new(Mutex::new(load_subscriptions(&blockstore)));
@@ -835,6 +834,13 @@ impl Node {
                 }
             }
         }
+        // Livre de signalements construit APRÈS les éditeurs souscrits : ses
+        // clés de confiance sont exactement cet ensemble (éditeur projet
+        // compris), sinon le premier rapport reçu d'un éditeur souscrit
+        // tomberait à l'étage « autres » jusqu'au prochain `retrust`.
+        let reports = Arc::new(Mutex::new(ReportBook::with_trusted(
+            issuers.iter().copied().collect(),
+        )));
         let denylist_issuers = Arc::new(Mutex::new(issuers));
         let (moderation_events, _) = tokio::sync::broadcast::channel(64);
 
@@ -986,58 +992,82 @@ impl Node {
         })
     }
 
-    /// Nombre de rapporteurs **distincts** ayant signalé ce CID (agrégat local,
-    /// borné). Matière première pour un éditeur de denylist — aucun effet
-    /// automatique sur le contenu.
-    pub fn report_count(&self, cid: &Cid) -> usize {
+    /// Rapporteurs **distincts** ayant signalé ce CID (agrégat local, borné),
+    /// séparés en rapporteurs **de confiance** (éditeurs de denylist souscrits)
+    /// et autres. Matière première pour un éditeur de denylist — aucun effet
+    /// automatique sur le contenu. Seule la colonne « de confiance » résiste
+    /// aux identités jetables.
+    pub fn report_count(&self, cid: &Cid) -> ReportTally {
         self.reports
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .count(cid)
+            .tally(cid)
     }
 
-    /// CIDs signalés avec leur nombre de rapporteurs distincts.
-    pub fn report_counts(&self) -> Vec<(Cid, usize)> {
+    /// CIDs signalés avec leur tally de rapporteurs distincts par étage.
+    pub fn report_counts(&self) -> Vec<(Cid, ReportTally)> {
         self.reports
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .counts()
+            .tallies()
     }
 
     /// Signalements agrégés **par émetteur** (spec channels lot d, tâche 4) :
     /// jointure locale entre l'agrégat de rapports existant
     /// ([`Node::report_counts`]) et le mapping CID→émetteur du catalogue
     /// reconstruit localement. Pour chaque émetteur retenu :
-    /// `(rapporteurs distincts cumulés sur tous ses CIDs signalés, nombre de
-    /// CIDs distincts signalés qui lui sont attribués)`.
+    /// `(tally cumulé sur tous ses CIDs signalés — somme des rapporteurs de
+    /// confiance et somme des autres —, nombre de CIDs distincts signalés qui
+    /// lui sont attribués)`.
     ///
-    /// **Limite assumée** : un CID signalé qui n'apparaît dans AUCUNE entrée
-    /// du catalogue local (émetteur pas vu par ce nœud, ou entrée expirée)
-    /// n'apparaît PAS dans ce résultat — il reste compté uniquement côté
-    /// [`Node::report_counts`] (agrégat global, sans attribution). Lecture
-    /// seule, aucun effet réseau.
-    pub fn report_counts_by_channel(&self) -> Vec<(PeerId, u64, u64)> {
-        let cid_issuer: HashMap<Cid, PeerId> = self
-            .catalog_entries()
-            .into_iter()
-            .flat_map(|entry| {
-                let issuer = entry.issuer;
-                entry.cids.into_iter().map(move |cid| (cid, issuer))
-            })
-            .collect();
+    /// Le cumul additionne des rapporteurs par CID : un même rapporteur
+    /// signalant deux CIDs du même émetteur compte deux fois (c'est un volume
+    /// de signalements, pas un nombre de personnes).
+    ///
+    /// **Limites assumées** (deux, de même nature : lister un CID dans un feed
+    /// signé ne prouve RIEN sur sa propriété — c'est l'invariant anti-censure
+    /// du lot (d) / ADR 0011, qui a justifié de ne dériver aucune liste de
+    /// CIDs des feeds côté modération) :
+    /// - un CID signalé qui n'apparaît dans AUCUNE entrée du catalogue local
+    ///   (émetteur pas vu par ce nœud, ou entrée expirée) n'est PAS attribué ;
+    /// - un CID **revendiqué par plusieurs émetteurs** n'est attribué à
+    ///   AUCUN d'eux. Il n'existe aucun moyen honnête de désigner un gagnant :
+    ///   en choisir un arbitrairement (au hasard de l'itération) permettrait à
+    ///   un publieur hostile de **voler** les signalements d'un tiers en
+    ///   listant ses CIDs dans son propre feed — et donc de **blanchir** un
+    ///   channel réellement problématique au moment précis où la colonne
+    ///   `trusted` sert à décider d'un `key_entries`.
+    ///
+    /// Dans les deux cas le CID reste compté côté [`Node::report_counts`]
+    /// (agrégat global, sans attribution). Lecture seule, aucun effet réseau.
+    pub fn report_counts_by_channel(&self) -> Vec<(PeerId, ReportTally, u64)> {
+        // Tous les revendiquants de chaque CID, pas un seul : voir la limite
+        // « CID contesté » ci-dessus.
+        let mut claimants: HashMap<Cid, Vec<PeerId>> = HashMap::new();
+        for entry in self.catalog_entries() {
+            for cid in entry.cids {
+                let issuers = claimants.entry(cid).or_default();
+                if !issuers.contains(&entry.issuer) {
+                    issuers.push(entry.issuer);
+                }
+            }
+        }
 
-        let mut by_channel: HashMap<PeerId, (u64, u64)> = HashMap::new();
+        let mut by_channel: HashMap<PeerId, (ReportTally, u64)> = HashMap::new();
         for (cid, reporters) in self.report_counts() {
-            let Some(issuer) = cid_issuer.get(&cid) else {
+            // Un seul revendiquant → attribution ; zéro (hors catalogue) ou
+            // plusieurs (contesté) → non attribué.
+            let Some([issuer]) = claimants.get(&cid).map(Vec::as_slice) else {
                 continue;
             };
-            let tally = by_channel.entry(*issuer).or_insert((0, 0));
-            tally.0 += reporters as u64;
-            tally.1 += 1;
+            let entry = by_channel.entry(*issuer).or_default();
+            entry.0.trusted += reporters.trusted;
+            entry.0.others += reporters.others;
+            entry.1 += 1;
         }
         by_channel
             .into_iter()
-            .map(|(issuer, (reporters, cids))| (issuer, reporters, cids))
+            .map(|(issuer, (tally, cids))| (issuer, tally, cids))
             .collect()
     }
 
@@ -1265,14 +1295,20 @@ impl Node {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             mod_guard.apply_list(list)?
         };
-        {
+        let saved = {
             let mut issuers = self
                 .denylist_issuers
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             issuers.insert(issuer);
-            save_denylist_issuers(&self.blockstore, &issuers)?;
-        }
+            save_denylist_issuers(&self.blockstore, &issuers)
+        };
+        // Ce chemin souscrit lui aussi à l'éditeur : même reclassement que
+        // `subscribe_denylist_issuer`. Reclassement AVANT de propager une
+        // éventuelle erreur d'écriture : l'ensemble en mémoire a déjà changé,
+        // le livre ne doit jamais rester désaccordé de lui.
+        self.retrust_reports();
+        saved?;
         // La purge reste inconditionnelle (comportement historique : elle
         // rattrape aussi les blocages posés par une souscription antérieure
         // dont le catalogue vient d'être peuplé), mais cache et tic ne sont
@@ -1350,14 +1386,20 @@ impl Node {
     /// échoue. Souscrire, c'est suivre la clé : les mises à jour ultérieures
     /// de sa liste sont appliquées automatiquement, sans nouvelle release.
     pub fn subscribe_denylist_issuer(&self, issuer: PeerId) -> CoreResult<()> {
-        {
+        let saved = {
             let mut issuers = self
                 .denylist_issuers
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             issuers.insert(issuer);
-            save_denylist_issuers(&self.blockstore, &issuers)?;
-        }
+            save_denylist_issuers(&self.blockstore, &issuers)
+        };
+        // Cette clé devient une clé de confiance : ses signalements déjà reçus
+        // remontent à l'étage « de confiance ». Reclassement AVANT de propager
+        // une éventuelle erreur d'écriture : l'ensemble en mémoire a déjà
+        // changé, le livre ne doit jamais rester désaccordé de lui.
+        self.retrust_reports();
+        saved?;
         // La liste des éditeurs a changé : un front qui affiche « mes listes »
         // doit se rafraîchir tout de suite, sans attendre la première liste
         // effectivement récupérée (qui émettra son propre tic).
@@ -1386,14 +1428,20 @@ impl Node {
                 "l'éditeur projet ne peut pas être retiré".into(),
             ));
         }
-        {
+        let saved = {
             let mut issuers = self
                 .denylist_issuers
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             issuers.remove(&issuer);
-            save_denylist_issuers(&self.blockstore, &issuers)?;
-        }
+            save_denylist_issuers(&self.blockstore, &issuers)
+        };
+        // Cette clé n'est plus de confiance : ses signalements redescendent à
+        // l'étage « autres » (sous les bornes de cet étage). Reclassement
+        // AVANT de propager une éventuelle erreur d'écriture : l'ensemble en
+        // mémoire a déjà changé, le livre ne doit jamais rester désaccordé.
+        self.retrust_reports();
+        saved?;
         crate::moderation::remove_cached_list(self.blockstore.root(), &issuer);
         self.moderation
             .write()
@@ -1404,6 +1452,18 @@ impl Node {
         // éditeurs suivis a changé et les fronts l'affichent.
         let _ = self.moderation_events.send(());
         Ok(())
+    }
+
+    /// Reclasse les rapporteurs déjà agrégés après un changement de la liste
+    /// des éditeurs souscrits : les clés de confiance du livre de signalements
+    /// sont exactement les éditeurs souscrits. Purement local, aucun réseau,
+    /// et le verrou des rapports n'est jamais tenu à travers un `await`.
+    fn retrust_reports(&self) {
+        let keys: HashSet<PeerId> = self.denylist_issuers().into_iter().collect();
+        self.reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retrust(&keys);
     }
 
     /// Éditeurs de denylist souscrits, **projet d'abord** puis triés
@@ -5860,7 +5920,17 @@ mod tests {
 
         let by_channel = node.report_counts_by_channel();
         assert_eq!(by_channel.len(), 1);
-        assert_eq!(by_channel[0], (issuer, 2, 2));
+        assert_eq!(
+            by_channel[0],
+            (
+                issuer,
+                ReportTally {
+                    trusted: 0,
+                    others: 2
+                },
+                2
+            )
+        );
 
         // CID hors catalogue : compté globalement, absent du join par channel.
         let unknown_cid = cid_for(b"report-unknown");
@@ -5875,6 +5945,56 @@ mod tests {
             .report_counts()
             .iter()
             .any(|(cid, _)| *cid == unknown_cid));
+    }
+
+    /// Attribution sans collision : lister un CID dans son feed ne prouve pas
+    /// qu'on en est le publieur (invariant anti-censure du lot d / ADR 0011).
+    /// Un CID revendiqué par DEUX émetteurs n'est donc attribué à aucun des
+    /// deux — sinon un publieur hostile volerait (ou blanchirait) les
+    /// signalements d'un tiers en recopiant ses CIDs. Un CID revendiqué par un
+    /// seul émetteur reste attribué normalement.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn contested_cid_is_attributed_to_no_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = spawn_node(dir.path(), "n").await;
+
+        let honest_kp = Keypair::generate_ed25519();
+        let hostile_kp = Keypair::generate_ed25519();
+        let honest = honest_kp.public().to_peer_id();
+        let contested = cid_for(b"contested");
+        let own = cid_for(b"own");
+
+        // L'honnête liste les deux CIDs, l'hostile recopie le premier.
+        node.apply_feed_for_tests(Feed::build_signed(&honest_kp, 1, &[contested, own]).unwrap())
+            .unwrap();
+        node.apply_feed_for_tests(Feed::build_signed(&hostile_kp, 1, &[contested]).unwrap())
+            .unwrap();
+
+        let reporter1 = Keypair::generate_ed25519();
+        let reporter2 = Keypair::generate_ed25519();
+        {
+            let mut book = node.reports.lock().unwrap();
+            book.apply(&Report::build_signed(&reporter1, &contested, "denylist").unwrap())
+                .unwrap();
+            book.apply(&Report::build_signed(&reporter2, &contested, "denylist").unwrap())
+                .unwrap();
+            book.apply(&Report::build_signed(&reporter1, &own, "denylist").unwrap())
+                .unwrap();
+        }
+
+        let by_channel = node.report_counts_by_channel();
+        assert_eq!(
+            by_channel,
+            vec![(
+                honest,
+                ReportTally {
+                    trusted: 0,
+                    others: 1
+                },
+                1
+            )],
+            "seul le CID non contesté est attribué, et à son unique revendiquant"
+        );
     }
 
     /// Régression : avec la validation applicative activée (les messages ne

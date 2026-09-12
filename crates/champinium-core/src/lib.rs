@@ -45,7 +45,7 @@ pub use ingest::HlsManifest;
 pub use moderation::{Denylist, Moderation};
 pub use p2p::Node;
 pub use relay::{start_relay, RelayHandle};
-pub use report::Report;
+pub use report::{Report, ReportTally};
 pub use seeding::{SeedIndex, SeededPublication};
 pub use stream::{StreamSessionInfo, StreamStatus};
 
