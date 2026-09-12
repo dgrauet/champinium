@@ -4370,6 +4370,12 @@ async fn reprovide_all_inner(state: &MaintenanceState) -> CoreResult<usize> {
         // racines RÉELLEMENT annoncées.
         match provide_inner(&state.cmd_tx, &state.moderation, cid).await {
             Ok(()) => count += 1,
+            // Un bloc modéré resté au magasin n'est jamais annoncé — c'est le
+            // comportement attendu, pas une panne : `debug!` pour ne pas
+            // répéter un `warn!` à chaque passe horaire.
+            Err(CoreError::Moderated(m)) => {
+                tracing::debug!("maintenance : {cid} non réannoncé (modéré : {m})")
+            }
             Err(e) => tracing::warn!("maintenance : réannonce de {cid} échouée: {e}"),
         }
     }
