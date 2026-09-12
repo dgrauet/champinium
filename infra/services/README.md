@@ -21,6 +21,17 @@ champinium-seed --data-dir <dir> [--listen <multiaddr>] \
 
 Chaque OS l'enveloppe dans son gestionnaire de service natif.
 
+## Migration depuis un fichier de service antérieur à l'ADR 0014
+
+Les fichiers de service fournis ici ne passent plus `--reprovide-interval`
+(la maintenance périodique appartient désormais au nœud, pas au démon). Un
+fichier de service **déjà déployé** qui passe encore cette option continue
+de démarrer sans erreur : l'option reste acceptée en ligne de commande, mais
+n'a plus aucun effet (un avertissement l'indique dans le journal du démon).
+Retirez-la de votre fichier de service à l'occasion d'une prochaine
+maintenance — rien ne presse, elle ne casse rien tant qu'elle reste en
+place.
+
 ## macOS — launchd
 
 Fichier : [`com.champinium.seed.plist`](com.champinium.seed.plist).

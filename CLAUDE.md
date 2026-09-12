@@ -78,9 +78,11 @@ La suppression centrale est impossible par construction → modération côté n
    éviction à deux étages) + seed opt-in de ce que je regarde, hors abonnement
    (`seed_watched`, ADR 0014) + pins (contenu propre auto-épinglé, plus tout
    manifeste épinglé manuellement) ; maintenance (réannonce des racines +
-   republication des feeds) **intégrée au nœud**, démarrée dès `listen` quel
-   que soit son porteur (front, CLI, démon) — un nœud GUI redémarré resert ce
-   qu'il détient sans qu'aucun démon tourne (ADR 0014) ; cold storage optionnel
+   republication des feeds) **intégrée au nœud**, démarrée au premier
+   `listen` quel que soit son porteur (front, CLI, démon), première passe dès
+   qu'un premier pair est connecté (bootstrap, mDNS ou connexion manuelle) —
+   jamais de passe ni de log de succès sans pair — un nœud GUI redémarré
+   resert ce qu'il détient sans qu'aucun démon tourne (ADR 0014) ; cold storage optionnel
    Arweave (ADR 0008) livré côté cœur+CLI (CS-a) derrière la feature opt-in
    `cold-storage` **en repli de récupération CID-vérifié seul** (archivage
    différé, voir « État actuel ») — voir « État actuel ».
@@ -196,9 +198,12 @@ sur deux machines physiques.
   sont exclus, seules les racines sont annoncées). À l'origine portée par le
   seul démon `champinium-seed` (réannonce + republication périodiques,
   hors UI) ; **depuis l'ADR 0014, cette maintenance appartient au nœud
-  lui-même** (`maintenance_loop`, démarrée dès `listen`, quel que soit son
-  porteur) — le démon, simplifié, sert désormais surtout quand l'application
-  est fermée. Fichiers de service par OS dans `infra/services/` (launchd /
+  lui-même** (`maintenance_loop`, démarrée au premier `listen`, première
+  passe dès qu'un premier pair est connecté, quel que soit son porteur) — le
+  démon, simplifié, sert désormais surtout quand l'application est fermée
+  (il accepte encore, inerte et déprécié, l'ancien flag
+  `--reprovide-interval` pour ne pas casser un fichier de service déjà
+  déployé). Fichiers de service par OS dans `infra/services/` (launchd /
   systemd user / Windows). Testé : `reprovide_makes_stored_blocks_discoverable`.
 - **Feed records DHT (PUT/GET) ✔** : `publish_feed` PUT le feed signé dans la
   Kademlia sous `/champinium/feed/<peerid>` ; `Node::fetch_feed` GET + vérifie
@@ -384,8 +389,9 @@ sur deux machines physiques.
   [`docs/packaging.md`](docs/packaging.md).
 - **Durabilité du record de feed ✔** : `Node::republish_known_feeds` (même
   boucle que `reprovide_all` — **la boucle de maintenance du nœud**,
-  `maintenance_loop`, démarrée dès `listen` depuis l'ADR 0014, portée à
-  l'origine par le seul démon `champinium-seed`) re-PUT dans la DHT le
+  `maintenance_loop`, démarrée au premier `listen` depuis l'ADR 0014,
+  première passe dès qu'un premier pair est connecté, portée à l'origine par
+  le seul démon `champinium-seed`) re-PUT dans la DHT le
   feed signé du nœud lui-même et ceux de ses **abonnements** — corrige un
   écart où le record `/champinium/feed/<peerid>` d'un créateur hors ligne
   n'était jamais réannoncé (contrairement à ce que l'ADR 0007 supposait déjà
@@ -488,11 +494,16 @@ sur deux machines physiques.
 - **Persistance de la longue traîne ✔ (ADR 0014)** : **maintenance intégrée
   au nœud** — `maintenance_loop` (réannonce `reprovide_all` + republication
   `republish_known_feeds`) démarre au premier `listen` réussi, quel que soit
-  le porteur (front, CLI, démon), passe immédiate puis toutes les
-  `REPROVIDE_INTERVAL` (1 h, injectable pour les tests) ; `Node::open`/`new`
-  restent sans effet réseau implicite. **`champinium-seed` simplifié** :
-  ouvre/écoute/bootstrap puis attend `ctrl_c`, la maintenance périodique
-  n'est plus la sienne — sa seule raison d'être restante est de servir
+  le porteur (front, CLI, démon), **première passe dès qu'un premier pair
+  est connecté** (bootstrap, mDNS ou connexion manuelle — jamais de passe ni
+  de log de succès sans pair, une table de routage vide n'atteindrait
+  personne), puis toutes les `REPROVIDE_INTERVAL` (1 h, injectable pour les
+  tests) ; `Node::open`/`new` restent sans effet réseau implicite.
+  **`champinium-seed` simplifié** : ouvre/écoute/bootstrap puis attend
+  `ctrl_c`, la maintenance périodique n'est plus la sienne (il accepte
+  encore, inerte et déprécié, l'ancien flag `--reprovide-interval` pour
+  qu'un fichier de service déjà déployé continue de démarrer) — sa seule
+  raison d'être restante est de servir
   quand l'application est fermée. **Seed de ce que je regarde, opt-in**
   (dotfile `.seed_watched`, défaut `false`, effet immédiat) : hors
   abonnement, `open_stream` d'un manifeste dont l'émetteur est identifiable

@@ -46,14 +46,25 @@ longue traîne sans réintroduire de réplication non sollicitée.
    restent sans effet réseau implicite (les tests unitaires créent des
    nœuds sans réseau sans en subir d'effet de bord). Intervalle injectable
    via `with_moderation_and_intervals` (nouveau paramètre
-   `reprovide_interval`, comme `seed_interval`) pour les tests.
+   `reprovide_interval`, comme `seed_interval`) pour les tests. **La
+   première passe réelle attend un premier pair connecté** (courtes
+   tentatives toutes les 2 s tant qu'aucun pair n'est joignable) : tous les
+   porteurs réels appellent `listen` avant de joindre le réseau
+   (`--bootstrap`/`bootstrap()` pour le démon, `openNode → listen →
+   connect` pour les fronts), donc une passe lancée immédiatement trouverait
+   une table de routage vide, stockerait ses provider records localement
+   sans qu'ils atteignent quiconque, et journaliserait un succès mensonger.
+   Aucune passe ni aucun log de succès sans pair connecté.
 2. **Démon simplifié.** `champinium-seed` ouvre, écoute, bootstrap, puis
    attend `ctrl_c` — la maintenance périodique est désormais celle du nœud.
-   Le flag `--reprovide-interval` est **retiré** (les fichiers de service ne
-   le passent plus). Le démon garde sa seule raison d'être : **servir quand
-   l'application est fermée**. `infra/services/README.md` le formule ainsi :
-   « l'app seede tant qu'elle est ouverte ; le démon, quand elle est
-   fermée ».
+   Le flag `--reprovide-interval` est **retiré des fichiers de service**
+   fournis, mais reste **accepté et inerte** en ligne de commande (masqué de
+   l'aide, `warn!` de dépréciation) : un fichier de service déjà déployé qui
+   passe encore l'option continue de démarrer après une mise à jour du
+   binaire, au lieu de boucler en échec sous systemd. Le démon garde sa
+   seule raison d'être : **servir quand l'application est fermée**.
+   `infra/services/README.md` le formule ainsi : « l'app seede tant qu'elle
+   est ouverte ; le démon, quand elle est fermée ».
 3. **Seed de ce que je regarde, opt-in.** Dotfile `.seed_watched` (défaut
    `false`), `Node::seed_watched() -> bool` / `set_seed_watched(bool)`
    (synchrones, effet immédiat, persisté). Activé, `open_stream` d'un
@@ -112,8 +123,10 @@ lecture change, pas la construction du swarm). Voir
 
 - **Un nœud GUI redémarré resert ce qu'il détient sans qu'un démon tourne** :
   la maintenance vit dans le nœud, démarrée par `listen`, quel que soit son
-  porteur (front, CLI, démon). C'était l'écart le plus net avec ce que
-  l'ADR 0007 supposait déjà acquis.
+  porteur (front, CLI, démon), **première passe réelle dès qu'un premier
+  pair est connecté** (bootstrap, mDNS ou connexion manuelle) — jamais
+  immédiatement sur une table de routage vide. C'était l'écart le plus net
+  avec ce que l'ADR 0007 supposait déjà acquis.
 - **Toute commande CLI ou binaire qui appelle `listen` déclenche une passe de
   réannonce immédiate de son propre blockstore** — `champinium-cli serve`,
   `champinium-bootstrap`, `champinium-seed`, ou toute commande one-shot qui
@@ -169,6 +182,11 @@ lecture change, pas la construction du swarm). Voir
   (décision 4) couvre le cas « l'utilisateur ferme la lecture avant la fin » ;
   elle ne couvre pas un kill brutal du process entre la complétion des
   segments et l'entrée effective au `SeedIndex` (fenêtre étroite, entre la
-  fin du transfert et le traitement de `seed_now` par `seed_loop`). Dette
-  assumée : un balayage d'orphelins au démarrage du blockstore est une tâche
-  dédiée à venir, hors du périmètre de cet ADR.
+  fin du transfert et le traitement de `seed_now` par `seed_loop`). Même
+  dette pour un désabonnement survenant pendant une session `Seed` de
+  l'émetteur retiré : `open_stream` avait mis cette session hors index
+  (`issuer_to_index = None`, comportement des abonnements, décision 4), donc
+  sa fermeture ne purge rien et les segments déjà récupérés restent au
+  magasin, hors index et hors quota, jusqu'au prochain seed ou à un futur
+  balayage. Dette assumée : un balayage d'orphelins au démarrage du
+  blockstore est une tâche dédiée à venir, hors du périmètre de cet ADR.

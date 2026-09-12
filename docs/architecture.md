@@ -430,13 +430,19 @@ le seed proactif des abonnés et les pins, pas sur la lecture.
   n'est plus le rôle du démon `champinium-seed` : c'est une boucle du
   **nœud** lui-même, démarrée au **premier `listen` réussi** (flag
   `maintenance_started`, une seule fois par nœud, quel que soit son
-  porteur), qui fait une première passe immédiate puis une passe toutes les
-  `REPROVIDE_INTERVAL` (1 h, injectable pour les tests). Avant ce
-  déplacement, un nœud ouvert par un front (FFI ou GTK) sans démon installé
-  ne réannonçait jamais rien après un redémarrage : ce qu'il seedait devenait
-  introuvable jusqu'au TTL des records Kademlia. `Node::open`/`new` restent
-  sans effet réseau implicite (pas d'appel à `listen`) — la construction d'un
-  `Node` reste inerte pour les tests unitaires.
+  porteur), puis une passe toutes les `REPROVIDE_INTERVAL` (1 h, injectable
+  pour les tests). La **première passe réelle** n'a lieu que dès qu'un
+  premier pair est connecté (bootstrap, mDNS ou connexion manuelle, courtes
+  tentatives toutes les 2 s tant qu'aucun pair n'est joignable) : tous les
+  porteurs réels appellent `listen` avant de joindre le réseau, donc une
+  passe lancée immédiatement trouverait une table de routage vide et
+  n'atteindrait personne — aucune passe ni aucun log de succès sans pair
+  connecté. Avant ce déplacement, un nœud ouvert par un front (FFI ou GTK)
+  sans démon installé ne réannonçait jamais rien après un redémarrage : ce
+  qu'il seedait devenait introuvable jusqu'au TTL des records Kademlia.
+  `Node::open`/`new` restent sans effet réseau implicite (pas d'appel à
+  `listen`) — la construction d'un `Node` reste inerte pour les tests
+  unitaires.
 - **`champinium-seed`** (démon, fichiers de service dans
   [`infra/services/`](../infra/services)) est donc **simplifié** : il ouvre,
   écoute, bootstrap, puis attend `ctrl_c` — la maintenance périodique tourne

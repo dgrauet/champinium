@@ -168,7 +168,7 @@ Sur les deux mêmes machines, valider la distribution réseau d'une denylist :
 | 4bis | Démarrage avant la fin | la vidéo démarre en quelques secondes, avant la fin du téléchargement ; « segments : x/y » progresse |
 | 4ter | Seek vers la fin | sauter à la fin de la vidéo redémarre en quelques secondes |
 | 5 | B seede | case « Conserver et resservir ce que je regarde » activée, `fetch-hls` depuis B réussit **avec A éteint** |
-| 5bis | Maintenance sans démon | B redémarre son app (sans `champinium-seed`) : elle resert toujours le contenu conservé — la réannonce des racines démarre dès `listen` (ADR 0014) |
+| 5bis *(bonus)* | Maintenance sans démon | B redémarre son app (sans `champinium-seed`) et se reconnecte (bootstrap, mDNS ou coller l'adresse de A) : elle resert toujours le contenu conservé une fois ce premier pair joint — la réannonce des racines démarre au premier `listen`, mais sa première passe réelle attend un pair connecté, jamais immédiate sur une table de routage vide (ADR 0014) |
 | 6 | Modération visible *(bonus)* | un CID couvert par une denylist souscrite affiche « contenu bloqué par la modération » (pas une erreur technique) |
 
 ## CLI
@@ -204,6 +204,9 @@ Ctrl-C ferme la session (`close_stream`) et purge le cache de lecture.
   (répertoire de données durable par OS) : la démo est rejouable sans repartir
   de zéro.
 
-Résultat attendu : les 5–6 (ou 7) cases cochées → le critère MVP est validé
-**en GUI sur matériel réel**, dernière réserve de la Phase 3 levée (à noter
-dans `CLAUDE.md` et le spec après la session).
+Résultat attendu : les 5 lignes 1 à 5 cochées (obligatoires) → le critère MVP
+est validé **en GUI sur matériel réel**, dernière réserve de la Phase 3
+levée (à noter dans `CLAUDE.md` et le spec après la session). Les lignes
+5bis et 6 sont des bonus qui approfondissent respectivement la persistance
+sans démon (ADR 0014) et la visibilité de la modération — utiles à rejouer,
+non requis pour clore le critère.
