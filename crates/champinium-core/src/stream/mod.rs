@@ -323,6 +323,21 @@ impl StreamSession {
         &self.state.dir
     }
 
+    /// Arrête la boucle de récupération et **attend qu'elle soit réellement
+    /// terminée**. À appeler avant [`StreamSession::take_close_action`] : sans
+    /// cela, un segment dont la récupération se termine entre l'énumération
+    /// des blocs à purger et l'`abort` du `Drop` serait écrit au blockstore
+    /// sans figurer dans cette liste — et, le jeton étant déjà pris, la
+    /// branche de complétion ne pourrait plus rien en faire. Il resterait
+    /// orphelin, hors index et hors quota : exactement la classe de fuite que
+    /// la fermeture des sessions regardées supprime.
+    pub(crate) async fn abort_fetch(&mut self) {
+        self.fetch_task.abort();
+        // `Cancelled` (cas nominal) ou panique de la tâche : rien à faire ici,
+        // seule sa terminaison compte.
+        let _ = (&mut self.fetch_task).await;
+    }
+
     /// Ce que la fermeture de cette session doit faire de ses blocs (spec
     /// persistance §4), en **prenant le jeton** `seed_claim` au passage.
     ///
@@ -340,11 +355,14 @@ impl StreamSession {
         if self.state.policy != StorePolicy::Seed || !self.state.claim_seed() {
             return None;
         }
-        // Seuls les segments RÉELLEMENT récupérés sont énumérés : purger la
-        // liste complète du manifeste effacerait des blocs présents pour une
-        // autre raison — une seconde session de lecture du même manifeste
-        // (qui perdrait son cache et retéléchargerait), ou un bloc ajouté par
-        // ailleurs.
+        // Seuls les segments RÉELLEMENT récupérés par CETTE session sont
+        // énumérés : purger la liste complète du manifeste effacerait des
+        // blocs que la session n'a jamais téléchargés et qui sont là pour une
+        // autre raison. Ce filtre ne protège en revanche PAS une seconde
+        // session ouverte sur le même manifeste — elle a récupéré les mêmes
+        // segments, donc l'ensemble énuméré ici recouvre le sien. Ce qui
+        // protège réellement des blocs, ce sont les gardes de
+        // `remove_unshared_blocks` : index de seed et pins.
         let (complete, segment_cids) = {
             let s = self.state.lock();
             let fetched = (0..s.total())

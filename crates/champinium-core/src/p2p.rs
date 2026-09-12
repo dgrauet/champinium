@@ -190,6 +190,12 @@ const SEED_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// le `tokio::spawn`.
 pub const REPROVIDE_INTERVAL: Duration = Duration::from_secs(3600);
 
+/// Attente entre deux vérifications de connectivité tant que la maintenance
+/// n'a aucun pair à qui annoncer (voir [`maintenance_loop`]). Court exprès :
+/// c'est le délai entre la première connexion du nœud et son rattrapage de
+/// démarrage.
+const MAINTENANCE_PEER_RETRY: Duration = Duration::from_secs(2);
+
 /// Demande d'un bloc par CID (octets du CID).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockRequest(pub Vec<u8>);
@@ -1073,8 +1079,9 @@ impl Node {
     ///
     /// Premier `listen` réussi = démarrage de la **maintenance réseau** du
     /// nœud ([`maintenance_loop`] : réannonce des racines + republication des
-    /// feeds connus, toutes les [`REPROVIDE_INTERVAL`], première passe
-    /// immédiate en rattrapage de démarrage). C'est ici et pas à la
+    /// feeds connus, toutes les [`REPROVIDE_INTERVAL`], première passe en
+    /// rattrapage de démarrage dès qu'un premier pair est connecté —
+    /// bootstrap, mDNS ou connexion manuelle). C'est ici et pas à la
     /// construction : annoncer des racines depuis un nœud qui n'écoute sur
     /// rien enverrait les pairs vers une adresse injoignable. Une seule boucle
     /// quels que soient le nombre d'appels et de poignées clonées
@@ -1870,8 +1877,12 @@ impl Node {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&id);
-        if let Some(session) = session {
+        if let Some(mut session) = session {
             let dir = session.dir().to_path_buf();
+            // Avant TOUTE lecture de l'état : une récupération qui se
+            // terminerait pendant l'énumération laisserait un bloc orphelin
+            // (voir `StreamSession::abort_fetch`).
+            session.abort_fetch().await;
             let action = session.take_close_action();
             drop(session);
             if let Some(action) = action {
@@ -4351,8 +4362,14 @@ async fn reprovide_all_inner(state: &MaintenanceState) -> CoreResult<usize> {
         if segments.contains(&cid.to_string()) {
             continue;
         }
-        provide_inner(&state.cmd_tx, &state.moderation, cid).await?;
-        count += 1;
+        // Best-effort racine par racine : un `provide` en échec (store plein,
+        // `MaxProvidedKeys`, swarm arrêté) ne doit pas annuler la réannonce de
+        // toutes les racines suivantes. Le compteur rendu est donc celui des
+        // racines RÉELLEMENT annoncées.
+        match provide_inner(&state.cmd_tx, &state.moderation, cid).await {
+            Ok(()) => count += 1,
+            Err(e) => tracing::warn!("maintenance : réannonce de {cid} échouée: {e}"),
+        }
     }
     Ok(count)
 }
@@ -4385,15 +4402,20 @@ async fn republish_known_feeds_inner(state: &MaintenanceState) -> CoreResult<usi
     let mut count = 0usize;
     for (issuer, data) in to_republish {
         let (tx, _rx) = oneshot::channel();
-        let _ = state
+        // Même best-effort que `reprovide_all_inner` : un envoi refusé (boucle
+        // d'évènements arrêtée) n'interrompt pas la passe et ne se compte pas.
+        if state
             .cmd_tx
             .send(Command::PutRecord {
                 key: feed_record_key(&issuer),
                 value: data,
                 tx,
             })
-            .await;
-        count += 1;
+            .await
+            .is_ok()
+        {
+            count += 1;
+        }
     }
 
     // Denylists : même problème de durabilité que les feeds (le record
@@ -4417,15 +4439,18 @@ async fn republish_known_feeds_inner(state: &MaintenanceState) -> CoreResult<usi
             continue;
         };
         let (tx, _rx) = oneshot::channel();
-        let _ = state
+        if state
             .cmd_tx
             .send(Command::PutRecord {
                 key: denylist_record_key(&issuer),
                 value,
                 tx,
             })
-            .await;
-        count += 1;
+            .await
+            .is_ok()
+        {
+            count += 1;
+        }
     }
     Ok(count)
 }
@@ -4441,14 +4466,40 @@ async fn republish_known_feeds_inner(state: &MaintenanceState) -> CoreResult<usi
 /// republié), et la boucle ne tient qu'un [`Weak`] marqueur de vivacité,
 /// jamais un `Node` fort qui empêcherait la boucle d'évènements de s'arrêter.
 ///
-/// Best-effort : l'échec d'une passe (réseau indisponible, aucun pair connu)
-/// est seulement tracé — la passe suivante réessaiera. Les succès sont tracés
-/// en `info!` : pour `champinium-seed`, démon sans interface, le journal est
-/// la SEULE façon de constater que la maintenance tourne encore.
+/// **Aucune passe sans pair connecté.** Tous les porteurs réels appellent
+/// `listen` AVANT de joindre le réseau (le démon compose ses `--bootstrap`
+/// ensuite, les fronts font `openNode → listen → connect`) : une passe lancée
+/// tout de suite trouverait une table de routage vide, stockerait ses provider
+/// records localement sans que rien n'atteigne le réseau, et journaliserait un
+/// succès mensonger — le vrai rattrapage n'aurait lieu qu'à la passe suivante,
+/// une heure plus tard. La boucle attend donc un premier pair par courtes
+/// tentatives ; la première passe réelle a lieu dès que le nœud a sa première
+/// connexion (bootstrap, mDNS ou connexion manuelle).
+///
+/// Best-effort : l'échec d'une passe (réseau indisponible) est seulement
+/// tracé — la passe suivante réessaiera. Les succès sont tracés en `info!` :
+/// pour `champinium-seed`, démon sans interface, le journal est la SEULE façon
+/// de constater que la maintenance tourne encore.
 async fn maintenance_loop(alive: Weak<()>, state: MaintenanceState, reprovide_interval: Duration) {
     loop {
         if alive.upgrade().is_none() {
             return;
+        }
+        // Un `cmd_tx` mort (boucle d'évènements arrêtée) rend 0 : on retombe
+        // sur l'attente courte, et le `upgrade()` du tour suivant sort.
+        let peers = {
+            let (tx, rx) = oneshot::channel();
+            match state.cmd_tx.send(Command::ConnectedPeers { tx }).await {
+                Ok(()) => rx.await.unwrap_or(0),
+                Err(_) => 0,
+            }
+        };
+        if peers == 0 {
+            tracing::debug!("maintenance : aucun pair connecté, nouvel essai dans 2 s");
+            if !sleep_while_alive(&alive, MAINTENANCE_PEER_RETRY).await {
+                return;
+            }
+            continue;
         }
         match reprovide_all_inner(&state).await {
             Ok(n) => tracing::info!("maintenance : {n} racine(s) réannoncée(s)"),
@@ -5290,9 +5341,11 @@ mod tests {
 
     /// Sans démon `champinium-seed` : un nœud qui redémarre et écoute
     /// réannonce tout seul les racines qu'il détient. C'est la maintenance
-    /// intégrée au nœud (`maintenance_loop`, démarrée par `listen`) — avant
-    /// elle, un utilisateur sans démon voyait son contenu disparaître de la
-    /// DHT à chaque redémarrage.
+    /// intégrée au nœud (`maintenance_loop`, démarrée par `listen`, première
+    /// passe dès qu'un premier pair est connecté) — avant elle, un
+    /// utilisateur sans démon voyait son contenu disparaître de la DHT à
+    /// chaque redémarrage. Joué à l'intervalle de PRODUCTION : c'est la
+    /// première passe qui doit suffire, pas une passe ultérieure.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn maintenance_reprovides_after_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -5337,8 +5390,14 @@ mod tests {
         drop(a);
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        // Redémarrage de B, avec un intervalle de maintenance court. Aucun
-        // appel manuel à `reprovide_all` : seul `listen` doit suffire.
+        // Redémarrage de B avec l'intervalle de maintenance de PRODUCTION
+        // (`REPROVIDE_INTERVAL` = 1 h) : ce que ce test doit prouver, c'est
+        // que la PREMIÈRE passe suffit. Un intervalle court le ferait passer
+        // sur une passe ultérieure et masquerait exactement la régression
+        // visée (une première passe lancée avant toute connexion, sur une
+        // table de routage vide, dont rien n'atteint le réseau). Aucun appel
+        // manuel à `reprovide_all` : seuls `listen` puis l'arrivée d'un
+        // premier pair doivent suffire.
         let keypair = crate::identity::load_or_generate(b_dir.join("node.key")).unwrap();
         let blockstore = Blockstore::open(b_dir.join("blocks")).unwrap();
         let b = Node::with_moderation_and_intervals(
@@ -5347,7 +5406,7 @@ mod tests {
             Moderation::empty(),
             FOLLOW_INTERVAL,
             SEED_INTERVAL,
-            Duration::from_millis(200),
+            REPROVIDE_INTERVAL,
             None,
         )
         .await
@@ -5361,6 +5420,9 @@ mod tests {
         c.listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())
             .await
             .unwrap();
+        // C se connecte à B : c'est CETTE connexion qui débloque la première
+        // passe de maintenance de B (la boucle attend un pair, elle ne parle
+        // pas dans le vide).
         let b_full: Multiaddr = format!("{b_addr}/p2p/{}", b.peer_id()).parse().unwrap();
         c.connect(b_full).await.unwrap();
 
@@ -5377,7 +5439,7 @@ mod tests {
             }
         })
         .await
-        .expect("B doit réannoncer sans démon");
+        .expect("B doit réannoncer sans démon, dès son premier pair connecté");
         assert_eq!(c.get(cid).await.unwrap(), b"maintenance-block");
     }
 
@@ -6366,12 +6428,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn seed_watched_setting_persists_and_defaults_to_false() {
         let dir = tempfile::tempdir().unwrap();
-        let node = Node::open(dir.path()).await.unwrap();
+        // `open_isolated` : ce test n'a aucun besoin de mDNS, et un socket
+        // multicast le couplerait aux autres nœuds de la suite.
+        let node = Node::open_isolated(dir.path()).await.unwrap();
         assert!(!node.seed_watched());
         node.set_seed_watched(true).unwrap();
         assert!(node.seed_watched(), "effet immédiat, pas au redémarrage");
         drop(node);
-        let node = Node::open(dir.path()).await.unwrap();
+        let node = Node::open_isolated(dir.path()).await.unwrap();
         assert!(node.seed_watched());
     }
 
