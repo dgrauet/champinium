@@ -246,10 +246,16 @@ sur deux machines physiques.
 **Phase 5 — en cours.**
 - **Signalement P2P ✔** : quand le checkpoint #2 refuse un CID, le nœud émet un
   rapport signé `champinium-report/v1` sur le topic `champinium/reports/v1`
-  (best-effort). Les pairs vérifient et agrègent (borné : 10 000 CIDs, 1 000
-  rapporteurs/CID) le nombre de rapporteurs **distincts** par CID — matière pour
-  les éditeurs de denylists, **aucun effet automatique**. Topic couvert par la
-  validation applicative + peer scoring. `Node::report_count(s)`.
+  (best-effort). Les pairs vérifient et agrègent le nombre de rapporteurs
+  **distincts** par CID en **deux étages** ([ADR 0015](docs/adr/0015-trusted-reports.md)) :
+  les rapporteurs **de confiance** (PeerId parmi les éditeurs de denylist
+  souscrits, borné à 10 000 CIDs suivis, pas de plafond par CID) et **tous
+  les autres** (bornes historiques : 10 000 CIDs, 1 000 rapporteurs/CID) —
+  matière pour les éditeurs de denylists, **aucun effet automatique**. Topic
+  couvert par la validation applicative + peer scoring.
+  `Node::report_count(s)`/`report_counts_by_channel` renvoient un
+  `ReportTally { trusted, others }` par CID/émetteur ; CLI `reports
+  [--by-channel] [--all]`.
 - **Réplication mesurée ✔** : `Node::replication_factor(cid)` (fournisseurs
   DHT), CLI `replication <cid> --peer …`. Testé à l'époque (avant le retrait de
   seed-what-you-consume, lot (c) channels) : 1 → 2 après un `get` simple ; ce
@@ -523,6 +529,28 @@ sur deux machines physiques.
   [--set on|off]`. Les trois fronts : case « Conserver et resservir ce que
   je regarde » (réglages de seed, même patron que la case mDNS) + badge
   « conservé » sur une entrée non souscrite avec `seeded_count > 0`.
+- **Signalements pondérés par les clés de confiance ✔ (ADR 0015)** :
+  `ReportBook` sépare les rapporteurs **de confiance** (dont le PeerId figure
+  parmi les éditeurs de denylist souscrits, ADR 0011) des **autres** — les
+  identités Ed25519 étant gratuites, un compteur unique de rapporteurs
+  distincts serait trivialement gonflable par sybil. Bornes séparées : étage
+  de confiance plafonné en CIDs suivis (`MAX_TRUSTED_REPORTED_CIDS = 10 000`,
+  aucun plafond par CID — l'ensemble de confiance est petit et choisi par
+  l'utilisateur), étage « autres » avec les bornes historiques
+  (10 000 CIDs, 1 000 rapporteurs/CID). **Reclassement à chaud**
+  (`ReportBook::retrust`) à `subscribe_denylist_issuer` /
+  `unsubscribe_denylist_issuer` (et au chemin `subscribe_denylist`) : le
+  livre naît déjà accordé à l'ensemble d'éditeurs souscrits persisté, et se
+  reclasse immédiatement si cet ensemble change — un éditeur souscrit devenu
+  hostile reste « de confiance » tant qu'il reste souscrit, s'en désabonner
+  reclasse ses rapports déjà connus vers « autres ». Le livre reste
+  **local, subjectif et non persisté** (reconstruit par gossip à chaque
+  redémarrage). **Pas de FFI ni d'affichage dans les fronts par conception**
+  (contrat v15 inchangé) — le signalement reste un outil d'éditeur de
+  denylist. CLI `reports [--by-channel] [--all]` : par défaut, seuls les
+  CIDs/émetteurs avec au moins un rapporteur de confiance sont listés (un
+  compteur « autres » seul n'apparaît pas sans `--all`), triés par `trusted`
+  décroissant puis `others`.
 - **Packaging Linux — Flatpak ✔ (fonctionnel, palier gratuit)** : manifeste
   [`packaging/flatpak/org.champinium.Champinium.yml`](packaging/flatpak/org.champinium.Champinium.yml)
   (app-id `org.champinium.Champinium`, runtime GNOME 48, rustc via rustup au
@@ -595,7 +623,7 @@ du record de feed ✔ (`republish_known_feeds`) ; IPNS #21 close, voir ADR 0007 
 lecture progressive ✔ (ADR 0009) ; provenance déclarée ✔ (ADR 0010) ;
 modération réputationnelle ✔ (ADR 0011) ; hygiène DHT ✔ (ADR 0012) ;
 découverte initiale ✔ (ADR 0013) ; persistance de la longue traîne ✔
-(ADR 0014)).
+(ADR 0014) ; signalements pondérés ✔ (ADR 0015)).
 Voir le spec.
 
 **Dernière release : voir `.release-please-manifest.json` / CHANGELOG** —

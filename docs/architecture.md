@@ -69,7 +69,7 @@ un front est un bug). Carte des modules :
 | [`feed`](../crates/champinium-core/src/feed.rs) | feed signé d'un créateur, versionné par `seq` (LWW) ; **v3** = métadonnées titre/tags par entrée + identité de channel (nom/description/avatar) signées, v1/v2 supprimés |
 | [`catalog`](../crates/champinium-core/src/catalog.rs) | CRDT maison : map last-writer-wins par émetteur, bornée (1024 émetteurs, sauf émetteurs souscrits — §6) ; recherche locale |
 | [`moderation`](../crates/champinium-core/src/moderation.rs) | ancre de confiance compilée (`deny/project.issuer`, non désactivable) + denylists signées **distribuées par le réseau** (fédéré, format **v3** = CIDs **et** clés `key_entries`, `seq` signé, LWW, ADR 0011) ; blocage local privé de channel côté `Node` (§7) |
-| [`report`](../crates/champinium-core/src/report.rs) | signalement P2P : rapport signé + agrégateur borné de rapporteurs distincts |
+| [`report`](../crates/champinium-core/src/report.rs) | signalement P2P : rapport signé + agrégateur borné de rapporteurs distincts, **à deux étages** (de confiance = éditeurs de denylist souscrits / autres, bornes séparées, ADR 0015) |
 | [`ingest`](../crates/champinium-core/src/ingest.rs) | orchestration ffmpeg → segments HLS alignés keyframes → manifeste `champinium-hls/v1` |
 | [`stream`](../crates/champinium-core/src/stream) | lecture progressive : session HLS servie sur 127.0.0.1 (`scheduler` pur, `server` HTTP), `open_stream`/`close_stream`/`stream_status` |
 | [`p2p`](../crates/champinium-core/src/p2p.rs) | le cœur : `Node`, la boucle d'évènements libp2p, tous les flux (§4, §6), le suivi actif des abonnements |
@@ -655,17 +655,37 @@ ban de denylist par clé et le blocage local) va au-delà du catalogue :
 
 Autour, trois mécanismes d'écosystème :
 
-- **Signalement par CID** : les pairs agrègent les rapports par CID (rapporteurs
-  **distincts**, agrégat borné) — matière première pour les éditeurs de
-  denylists, **aucun effet automatique** sur le contenu.
+- **Signalement par CID, pondéré par les clés de confiance** ([ADR 0015](adr/0015-trusted-reports.md)) :
+  les pairs agrègent les rapports par CID (rapporteurs **distincts**, agrégat
+  borné), **séparés en deux étages** — les rapporteurs **de confiance** (dont
+  le PeerId figure parmi les éditeurs de denylist souscrits, ADR 0011) d'un
+  côté, tous les **autres** de l'autre (`ReportTally { trusted, others }`).
+  Les identités Ed25519 étant gratuites, un compteur unique serait
+  trivialement gonflable par sybil ; l'étage de confiance a sa propre borne
+  de CIDs suivis (pas de plafond par CID — l'ensemble de confiance est petit
+  et choisi par l'utilisateur) et n'est jamais affamé par l'étage « autres »,
+  ni l'inverse. `subscribe_denylist_issuer`/`unsubscribe_denylist_issuer`
+  reclassent à chaud (`retrust`) les rapporteurs déjà connus entre étages —
+  un éditeur souscrit devenu hostile reste compté « de confiance » tant
+  qu'il reste souscrit, s'en désabonner le reclasse immédiatement. Le livre
+  reste **local, subjectif et non persisté** (chaque nœud a son propre
+  ensemble de confiance, reconstruit par gossip après chaque redémarrage).
+  **Aucun effet automatique** sur le contenu, **aucune exposition FFI ni
+  affichage dans les fronts par conception** — c'est un outil réservé aux
+  éditeurs de denylist. CLI `reports [--all]` : par défaut, seuls les CIDs
+  avec au moins un rapporteur de confiance sont listés (un compteur
+  « autres » seul n'apparaît pas sans `--all`), triés par `trusted`
+  décroissant puis `others`.
 - **Signalement par channel** (`report_counts_by_channel`, lot d) : jointure
   **locale, lecture seule** entre l'agrégat de rapports par CID et le mapping
-  CID→émetteur du catalogue reconstruit — pour chaque émetteur, `(rapporteurs
-  distincts cumulés, nombre de CIDs distincts signalés qui lui sont attribués)`.
-  Aide un éditeur de denylist à repérer un émetteur globalement problématique
-  (candidat à un `key_entries`). **Aucun effet automatique**, et limite assumée :
-  un CID signalé absent du catalogue local (émetteur jamais vu) n'est pas
-  attribué et reste compté au seul agrégat global. CLI : `reports --by-channel`.
+  CID→émetteur du catalogue reconstruit — pour chaque émetteur, `(ReportTally
+  cumulé, nombre de CIDs distincts signalés qui lui sont attribués)`. Aide un
+  éditeur de denylist à repérer un émetteur globalement problématique
+  (candidat à un `key_entries`), la colonne `trusted` du cumul étant la seule
+  résistante aux clés jetables. **Aucun effet automatique**, et limite
+  assumée : un CID signalé absent du catalogue local (émetteur jamais vu)
+  n'est pas attribué et reste compté au seul agrégat global. CLI :
+  `reports --by-channel [--all]`.
 - **Peer scoring gossipsub** : émettre des feeds/rapports invalides dégrade le
   score du pair → ses messages ne sont plus relayés → graylist. Avec le
   catalogue borné à 1024 émetteurs (refus-quand-plein, pas d'éviction), c'est
@@ -858,6 +878,7 @@ qui compte vit dans le réseau, chaque nœud n'en garde qu'une vue.
 | Hygiène DHT | DHT Champinium **séparée** de la DHT IPFS publique (protocole dédié `/champinium/kad/1.0.0`) ; annonce par **racine** seule (manifestes, blocs nus, CIDs de feed/tag) — un segment sans indice de racine n'est plus découvrable seul (`get --root`) — **implémenté**, contrat FFI inchangé | §4, §6, [ADR 0012](adr/0012-dedicated-dht-and-root-providing.md) |
 | Découverte initiale | bootstraps compilés (liste vide tant qu'aucun n'est publié) ∪ persistés, `Node::bootstrap()` appelé par les fronts/démons après `listen` ; mDNS débrayable ; transport DNS (`/dns4/`, `/dns6/`, `/dnsaddr/`) — **implémenté** (contrat FFI v14) | §2, §4, [ADR 0013](adr/0013-bootstrap-discovery.md) |
 | Persistance de la longue traîne | maintenance (réannonce + republication) intégrée au nœud, démarrée au premier `listen` (le démon `champinium-seed` sert seulement app fermée) ; seed de ce que je regarde opt-in (`.seed_watched`, hors abonnement) ; éviction à deux étages (non souscrit avant souscrit) ; pas de réplication toutes-directions — **implémenté** (contrat FFI v15) | risque #1, §6, §6 bis, [ADR 0014](adr/0014-long-tail-persistence.md) |
+| Signalements pondérés | `ReportBook` à deux étages (rapporteurs de confiance = éditeurs de denylist souscrits, bornes séparées, pas de plafond par CID côté confiance), reclassement à chaud à l'(dés)abonnement d'un éditeur, livre non persisté, aucune exposition FFI/fronts par conception — **implémenté** (contrat FFI inchangé, v15) | §7, [ADR 0015](adr/0015-trusted-reports.md) |
 
 ## 12. Carte des documents
 
@@ -868,7 +889,8 @@ qui compte vit dans le réseau, chaque nœud n'en garde qu'une vue.
   de blocs (0006), IPNS (0007), stockage froid Arweave (0008), lecture
   progressive par serveur HLS local (0009), provenance déclarée (0010),
   modération réputationnelle (0011), DHT dédiée et annonce par racine (0012),
-  découverte initiale (0013), persistance de la longue traîne (0014)…
+  découverte initiale (0013), persistance de la longue traîne (0014),
+  signalements pondérés par les clés de confiance (0015)…
 - [`docs/mvp-demo.md`](mvp-demo.md) / [`docs/gui-demo.md`](gui-demo.md) —
   démos de bout en bout (CLI validée ; GUI deux machines à dérouler).
 - [`docs/deploy-bootstrap-relay.md`](deploy-bootstrap-relay.md) — opérer
