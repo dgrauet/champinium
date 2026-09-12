@@ -80,8 +80,9 @@ pub(crate) struct SessionState {
     seed_now: mpsc::Sender<(PeerId, Cid)>,
     /// Jeton d'exclusion entre la **complétion** (qui veut émettre la demande
     /// d'indexation) et la **fermeture** (qui veut purger les blocs non
-    /// indexés) — les deux peuvent survenir simultanément, `close_stream`
-    /// lisant l'état avant que `fetch_task.abort()` ait pris effet.
+    /// indexés). `close_stream` arrête d'abord la boucle de récupération
+    /// (`abort_fetch`, attendu) avant de lire l'état ; le jeton couvre la
+    /// complétion qui aurait déjà émis sa demande juste avant cet arrêt.
     ///
     /// Qui pose le jeton décide, et une seule des deux issues a lieu : si la
     /// complétion l'emporte, la fermeture ne purge rien (la demande est en
@@ -361,8 +362,10 @@ impl StreamSession {
         // autre raison. Ce filtre ne protège en revanche PAS une seconde
         // session ouverte sur le même manifeste — elle a récupéré les mêmes
         // segments, donc l'ensemble énuméré ici recouvre le sien. Ce qui
-        // protège réellement des blocs, ce sont les gardes de
-        // `remove_unshared_blocks` : index de seed et pins.
+        // protège réellement des blocs, c'est la garde d'index de seed de
+        // `remove_unshared_blocks` (un bloc référencé par une publication
+        // indexée n'est jamais supprimé) et, en amont, la garde de pin de
+        // `settle_watched_session`.
         let (complete, segment_cids) = {
             let s = self.state.lock();
             let fetched = (0..s.total())

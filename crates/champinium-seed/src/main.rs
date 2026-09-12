@@ -100,7 +100,8 @@ async fn main() -> Result<()> {
     }
 
     // La maintenance périodique tourne déjà dans le nœud (démarrée par le
-    // `listen` ci-dessus, première passe immédiate) : le démon n'a plus qu'à
+    // `listen` ci-dessus, première passe dès le premier pair connecté) : le
+    // démon n'a plus qu'à
     // rester en vie pour la porter jusqu'à l'arrêt.
     tokio::signal::ctrl_c().await?;
     tracing::info!("arrêt du seeder");

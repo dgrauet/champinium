@@ -127,12 +127,14 @@ lecture change, pas la construction du swarm). Voir
   pair est connecté** (bootstrap, mDNS ou connexion manuelle) — jamais
   immédiatement sur une table de routage vide. C'était l'écart le plus net
   avec ce que l'ADR 0007 supposait déjà acquis.
-- **Toute commande CLI ou binaire qui appelle `listen` déclenche une passe de
-  réannonce immédiate de son propre blockstore** — `champinium-cli serve`,
-  `champinium-bootstrap`, `champinium-seed`, ou toute commande one-shot qui
-  ouvre puis écoute. C'est voulu : la maintenance ne distingue pas les
-  porteurs du nœud, et une commande de debug qui écoute brièvement réannonce
-  ce qu'elle détient exactement comme un front GUI le ferait.
+- **Toute commande CLI ou binaire qui appelle `listen` porte la boucle de
+  maintenance et réannonce son propre blockstore dès son premier pair
+  connecté** — `champinium-cli serve`, `champinium-bootstrap`,
+  `champinium-seed`, ou toute commande one-shot qui ouvre puis écoute. C'est
+  voulu : la maintenance ne distingue pas les porteurs du nœud, et une
+  commande de debug qui écoute et se connecte réannonce ce qu'elle détient
+  exactement comme un front GUI le ferait ; une commande éphémère qui ne se
+  connecte à personne ne réannonce rien.
 - **Le seed de ce que je regarde partage le quota des abonnements** plutôt
   que d'en ouvrir un séparé — un seul budget à comprendre pour
   l'utilisateur — mais **cède toujours la place** : l'éviction à deux étages

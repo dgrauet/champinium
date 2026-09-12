@@ -34,8 +34,9 @@ async fn node(dir: &Path, name: &str) -> Node {
         FAST,
         // Maintenance laissée à sa valeur de PRODUCTION : ces tests ne
         // mesurent pas la réannonce, et une passe rapide en boucle
-        // brouillerait leurs comptages de fournisseurs. La passe immédiate au
-        // `listen` reste inoffensive (blockstore vide au démarrage).
+        // brouillerait leurs comptages de fournisseurs. La première passe
+        // (au premier pair connecté) reste inoffensive : blockstore vide au
+        // démarrage.
         champinium_core::p2p::REPROVIDE_INTERVAL,
         None,
     )
@@ -58,8 +59,9 @@ async fn node_with_quota(dir: &Path, name: &str, quota_bytes: u64) -> Node {
         FAST,
         // Maintenance laissée à sa valeur de PRODUCTION : ces tests ne
         // mesurent pas la réannonce, et une passe rapide en boucle
-        // brouillerait leurs comptages de fournisseurs. La passe immédiate au
-        // `listen` reste inoffensive (blockstore vide au démarrage).
+        // brouillerait leurs comptages de fournisseurs. La première passe
+        // (au premier pair connecté) reste inoffensive : blockstore vide au
+        // démarrage.
         champinium_core::p2p::REPROVIDE_INTERVAL,
         None,
     )

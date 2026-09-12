@@ -2564,8 +2564,10 @@ impl Node {
     /// racine, ADR 0012 — manifestes, blocs nus et blocs non indexés restent
     /// annoncés). Indispensable au démarrage d'un seeder : le store de
     /// providers Kademlia est volatile, donc après un redémarrage les roots
-    /// détenus ne sont plus annoncés tant qu'on ne les republie pas. Renvoie
-    /// le nombre de roots réannoncés.
+    /// détenus ne sont plus annoncés tant qu'on ne les republie pas.
+    /// Best-effort racine par racine : un `provide` en échec est journalisé
+    /// et sauté, pas propagé — renvoie le nombre de roots RÉELLEMENT
+    /// réannoncés (`Ok(0)` si tous ont échoué).
     pub async fn reprovide_all(&self) -> CoreResult<usize> {
         reprovide_all_inner(&self.maintenance_state()).await
     }
