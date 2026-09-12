@@ -201,6 +201,12 @@ enum Cmd {
         /// au lieu des compteurs globaux par CID.
         #[arg(long)]
         by_channel: bool,
+        /// Inclut les signalements qu'aucune clé de confiance (éditeur de
+        /// denylist souscrit) n'a émis. Par défaut ils sont masqués : une
+        /// identité Ed25519 est gratuite, un compteur « autres » seul ne dit
+        /// rien.
+        #[arg(long)]
+        all: bool,
     },
     /// Affiche (et éventuellement définit) le débrayage du repli de
     /// récupération froid.
@@ -598,24 +604,50 @@ async fn main() -> Result<()> {
             node.unpin(manifest_cid)?;
             println!("épinglage retiré: {manifest_cid}");
         }
-        Cmd::Reports { by_channel } => {
+        Cmd::Reports { by_channel, all } => {
             let node = build_node(&cli.data_dir).await?;
+            // Tri commun : la confiance d'abord, les autres en second critère.
+            // Filtre par défaut : au moins une clé de confiance a signalé.
             if by_channel {
-                let by_channel = node.report_counts_by_channel();
-                if by_channel.is_empty() {
-                    println!("aucun signalement attribuable à un émetteur connu");
+                let mut rows = node.report_counts_by_channel();
+                rows.sort_by(|a, b| {
+                    b.1.trusted
+                        .cmp(&a.1.trusted)
+                        .then(b.1.others.cmp(&a.1.others))
+                });
+                rows.retain(|(_, tally, _)| all || tally.trusted >= 1);
+                if rows.is_empty() {
+                    println!(
+                        "{}",
+                        empty_reports_message(
+                            all,
+                            "aucun signalement attribuable à un émetteur connu"
+                        )
+                    );
                 } else {
-                    for (issuer, reporters, cids) in by_channel {
-                        println!("{issuer}: {reporters} rapporteur(s) distinct(s) / {cids} CID(s) signalé(s)");
+                    for (issuer, tally, cids) in rows {
+                        println!(
+                            "{issuer}: {} de confiance / {} autre(s) sur {cids} CID(s)",
+                            tally.trusted, tally.others
+                        );
                     }
                 }
             } else {
-                let counts = node.report_counts();
-                if counts.is_empty() {
-                    println!("aucun signalement");
+                let mut rows = node.report_counts();
+                rows.sort_by(|a, b| {
+                    b.1.trusted
+                        .cmp(&a.1.trusted)
+                        .then(b.1.others.cmp(&a.1.others))
+                });
+                rows.retain(|(_, tally)| all || tally.trusted >= 1);
+                if rows.is_empty() {
+                    println!("{}", empty_reports_message(all, "aucun signalement"));
                 } else {
-                    for (cid, reporters) in counts {
-                        println!("{cid}: {reporters} rapporteur(s) distinct(s)");
+                    for (cid, tally) in rows {
+                        println!(
+                            "{cid}: {} de confiance / {} autre(s)",
+                            tally.trusted, tally.others
+                        );
                     }
                 }
             }
@@ -880,6 +912,16 @@ fn spawn_feed_republisher_with(node: Node, entries: Vec<champinium_core::feed::F
             let _ = node.publish_feed_with(&entries).await;
         }
     });
+}
+
+/// Message d'une liste de signalements vide : distingue « rien du tout » (avec
+/// `--all`) de « rien qu'une clé de confiance ait signalé » (par défaut).
+fn empty_reports_message(all: bool, nothing_at_all: &'static str) -> &'static str {
+    if all {
+        nothing_at_all
+    } else {
+        "aucun signalement d'une clé de confiance (voir --all)"
+    }
 }
 
 fn parse_provenance_mode(s: &str) -> Result<champinium_core::feed::ProvenanceMode, String> {

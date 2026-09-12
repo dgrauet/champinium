@@ -20,7 +20,7 @@ use crate::feed::{ChannelMeta, Feed, FeedEntry};
 use crate::identity;
 use crate::ingest::{self, HlsManifest, HlsSegment};
 use crate::moderation::{Applied, Denylist, Moderation};
-use crate::report::{Report, ReportBook};
+use crate::report::{Report, ReportBook, ReportTally};
 use crate::seeding::{self, eviction_order, SeedIndex, SeededPublication};
 use crate::stream::{self, StreamSession, StreamSessionInfo, StreamStatus};
 use cid::Cid;
@@ -795,7 +795,6 @@ impl Node {
 
         let moderation = Arc::new(RwLock::new(moderation));
         let catalog = Arc::new(Mutex::new(Catalog::new()));
-        let reports = Arc::new(Mutex::new(ReportBook::default()));
         // Abonnements locaux persistés (spec channels §2) : rechargés avant le
         // démarrage de la boucle de suivi pour que le passage initial les couvre.
         let subscriptions = Arc::new(Mutex::new(load_subscriptions(&blockstore)));
@@ -835,6 +834,13 @@ impl Node {
                 }
             }
         }
+        // Livre de signalements construit APRÈS les éditeurs souscrits : ses
+        // clés de confiance sont exactement cet ensemble (éditeur projet
+        // compris), sinon le premier rapport reçu d'un éditeur souscrit
+        // tomberait à l'étage « autres » jusqu'au prochain `retrust`.
+        let reports = Arc::new(Mutex::new(ReportBook::with_trusted(
+            issuers.iter().copied().collect(),
+        )));
         let denylist_issuers = Arc::new(Mutex::new(issuers));
         let (moderation_events, _) = tokio::sync::broadcast::channel(64);
 
@@ -986,37 +992,44 @@ impl Node {
         })
     }
 
-    /// Nombre de rapporteurs **distincts** ayant signalé ce CID (agrégat local,
-    /// borné). Matière première pour un éditeur de denylist — aucun effet
-    /// automatique sur le contenu.
-    pub fn report_count(&self, cid: &Cid) -> usize {
+    /// Rapporteurs **distincts** ayant signalé ce CID (agrégat local, borné),
+    /// séparés en rapporteurs **de confiance** (éditeurs de denylist souscrits)
+    /// et autres. Matière première pour un éditeur de denylist — aucun effet
+    /// automatique sur le contenu. Seule la colonne « de confiance » résiste
+    /// aux identités jetables.
+    pub fn report_count(&self, cid: &Cid) -> ReportTally {
         self.reports
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .count(cid)
+            .tally(cid)
     }
 
-    /// CIDs signalés avec leur nombre de rapporteurs distincts.
-    pub fn report_counts(&self) -> Vec<(Cid, usize)> {
+    /// CIDs signalés avec leur tally de rapporteurs distincts par étage.
+    pub fn report_counts(&self) -> Vec<(Cid, ReportTally)> {
         self.reports
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .counts()
+            .tallies()
     }
 
     /// Signalements agrégés **par émetteur** (spec channels lot d, tâche 4) :
     /// jointure locale entre l'agrégat de rapports existant
     /// ([`Node::report_counts`]) et le mapping CID→émetteur du catalogue
     /// reconstruit localement. Pour chaque émetteur retenu :
-    /// `(rapporteurs distincts cumulés sur tous ses CIDs signalés, nombre de
-    /// CIDs distincts signalés qui lui sont attribués)`.
+    /// `(tally cumulé sur tous ses CIDs signalés — somme des rapporteurs de
+    /// confiance et somme des autres —, nombre de CIDs distincts signalés qui
+    /// lui sont attribués)`.
+    ///
+    /// Le cumul additionne des rapporteurs par CID : un même rapporteur
+    /// signalant deux CIDs du même émetteur compte deux fois (c'est un volume
+    /// de signalements, pas un nombre de personnes).
     ///
     /// **Limite assumée** : un CID signalé qui n'apparaît dans AUCUNE entrée
     /// du catalogue local (émetteur pas vu par ce nœud, ou entrée expirée)
     /// n'apparaît PAS dans ce résultat — il reste compté uniquement côté
     /// [`Node::report_counts`] (agrégat global, sans attribution). Lecture
     /// seule, aucun effet réseau.
-    pub fn report_counts_by_channel(&self) -> Vec<(PeerId, u64, u64)> {
+    pub fn report_counts_by_channel(&self) -> Vec<(PeerId, ReportTally, u64)> {
         let cid_issuer: HashMap<Cid, PeerId> = self
             .catalog_entries()
             .into_iter()
@@ -1026,18 +1039,19 @@ impl Node {
             })
             .collect();
 
-        let mut by_channel: HashMap<PeerId, (u64, u64)> = HashMap::new();
+        let mut by_channel: HashMap<PeerId, (ReportTally, u64)> = HashMap::new();
         for (cid, reporters) in self.report_counts() {
             let Some(issuer) = cid_issuer.get(&cid) else {
                 continue;
             };
-            let tally = by_channel.entry(*issuer).or_insert((0, 0));
-            tally.0 += reporters as u64;
-            tally.1 += 1;
+            let entry = by_channel.entry(*issuer).or_default();
+            entry.0.trusted += reporters.trusted;
+            entry.0.others += reporters.others;
+            entry.1 += 1;
         }
         by_channel
             .into_iter()
-            .map(|(issuer, (reporters, cids))| (issuer, reporters, cids))
+            .map(|(issuer, (tally, cids))| (issuer, tally, cids))
             .collect()
     }
 
@@ -1273,6 +1287,9 @@ impl Node {
             issuers.insert(issuer);
             save_denylist_issuers(&self.blockstore, &issuers)?;
         }
+        // Ce chemin souscrit lui aussi à l'éditeur : même reclassement que
+        // `subscribe_denylist_issuer`.
+        self.retrust_reports();
         // La purge reste inconditionnelle (comportement historique : elle
         // rattrape aussi les blocages posés par une souscription antérieure
         // dont le catalogue vient d'être peuplé), mais cache et tic ne sont
@@ -1358,6 +1375,9 @@ impl Node {
             issuers.insert(issuer);
             save_denylist_issuers(&self.blockstore, &issuers)?;
         }
+        // Cette clé devient une clé de confiance : ses signalements déjà reçus
+        // remontent à l'étage « de confiance ».
+        self.retrust_reports();
         // La liste des éditeurs a changé : un front qui affiche « mes listes »
         // doit se rafraîchir tout de suite, sans attendre la première liste
         // effectivement récupérée (qui émettra son propre tic).
@@ -1394,6 +1414,9 @@ impl Node {
             issuers.remove(&issuer);
             save_denylist_issuers(&self.blockstore, &issuers)?;
         }
+        // Cette clé n'est plus de confiance : ses signalements redescendent à
+        // l'étage « autres » (sous les bornes de cet étage).
+        self.retrust_reports();
         crate::moderation::remove_cached_list(self.blockstore.root(), &issuer);
         self.moderation
             .write()
@@ -1404,6 +1427,18 @@ impl Node {
         // éditeurs suivis a changé et les fronts l'affichent.
         let _ = self.moderation_events.send(());
         Ok(())
+    }
+
+    /// Reclasse les rapporteurs déjà agrégés après un changement de la liste
+    /// des éditeurs souscrits : les clés de confiance du livre de signalements
+    /// sont exactement les éditeurs souscrits. Purement local, aucun réseau,
+    /// et le verrou des rapports n'est jamais tenu à travers un `await`.
+    fn retrust_reports(&self) {
+        let keys: HashSet<PeerId> = self.denylist_issuers().into_iter().collect();
+        self.reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retrust(&keys);
     }
 
     /// Éditeurs de denylist souscrits, **projet d'abord** puis triés
@@ -5860,7 +5895,17 @@ mod tests {
 
         let by_channel = node.report_counts_by_channel();
         assert_eq!(by_channel.len(), 1);
-        assert_eq!(by_channel[0], (issuer, 2, 2));
+        assert_eq!(
+            by_channel[0],
+            (
+                issuer,
+                ReportTally {
+                    trusted: 0,
+                    others: 2
+                },
+                2
+            )
+        );
 
         // CID hors catalogue : compté globalement, absent du join par channel.
         let unknown_cid = cid_for(b"report-unknown");
