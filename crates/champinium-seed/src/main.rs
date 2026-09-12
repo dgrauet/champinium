@@ -44,6 +44,15 @@ struct Cli {
     /// Pairs de bootstrap `/ip4/.../tcp/.../p2p/<peerid>` (répétable).
     #[arg(long)]
     bootstrap: Vec<String>,
+    /// **Obsolète et sans effet** : la maintenance est celle du nœud
+    /// (ADR 0014), son intervalle n'est plus réglable depuis le démon.
+    /// L'option n'est acceptée que pour qu'un fichier de service déjà
+    /// déployé continue de démarrer après une mise à jour du binaire — sans
+    /// elle, `clap` refuserait l'argument inconnu et systemd bouclerait sur
+    /// un démon qui ne démarre plus. Masquée de l'aide : rien ne doit
+    /// inciter à l'écrire.
+    #[arg(long, hide = true)]
+    reprovide_interval: Option<u64>,
 }
 
 #[tokio::main]
@@ -60,6 +69,11 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if cli.reprovide_interval.is_some() {
+        tracing::warn!(
+            "--reprovide-interval est obsolète et ignoré : la maintenance est celle du nœud (ADR 0014)"
+        );
+    }
     let keypair = load_or_generate(cli.data_dir.join("node.key"))?;
     let blockstore = Blockstore::open(cli.data_dir.join("blocks"))?;
     let node = Node::new(keypair, blockstore).await?;
