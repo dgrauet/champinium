@@ -50,7 +50,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes = "1"
 # Jeton d'URL de session (128 bits aléatoires).
-rand = "0.9"
+rand = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
 # Désacharnement (« type erasure ») pour le trait `ColdStore` : nécessaire pour
 # rester dyn-compatible malgré des méthodes async (edition 2021 — les async fn
